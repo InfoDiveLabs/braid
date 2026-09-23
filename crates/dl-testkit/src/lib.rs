@@ -11,5 +11,5 @@ pub mod scenario;
 
 pub use faults::{Fault, FaultyFile};
 pub use origin::Origin;
-pub use relay::Relay;
+pub use relay::{Lane, Relay};
 pub use scenario::{SEED, Scenario};

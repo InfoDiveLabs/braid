@@ -83,9 +83,149 @@ pub struct PairOutcome {
     pub key: String,
 }
 
+use dl_core::error::{Error, Result};
+use std::time::Duration;
+
+/// Long enough for a phone whose radio is asleep to answer, short enough that
+/// a device which has left the network does not hold up a settings page.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// A person has to pick the phone up and look at it.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Ask what is listening there.
+///
+/// Unauthenticated on purpose: this is the call that decides whether an
+/// address is a relay at all, and a desktop has to be able to make it before
+/// it has any credentials.
+pub async fn hello(address: &str) -> Result<Hello> {
+    get(address, "/braid/hello", None).await
+}
+
+/// Ask what it is offering right now.
+///
+/// The key is optional because a phone may choose to describe itself to a
+/// desktop it has not paired with. If it does not, its refusal arrives as a
+/// transport error and the caller shows the relay as present but silent
+/// rather than gone.
+pub async fn status(address: &str, key: Option<&str>) -> Result<Status> {
+    get(address, "/braid/status", key).await
+}
+
+/// Ask to be allowed to use this phone.
+///
+/// A real phone shows the name and waits for someone to tap accept, so this
+/// call may sit for as long as a person takes to look at their screen.
+pub async fn pair(address: &str, desktop: &str) -> Result<PairOutcome> {
+    let client = control_client(PAIR_TIMEOUT)?;
+    let response = client
+        .post(format!("http://{address}/braid/pair"))
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::to_string(&PairRequest { desktop: desktop.to_string() })
+                .expect("a string field serialises"),
+        )
+        .send()
+        .await
+        .map_err(|e| Error::Transport(format!("reaching {address}: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(Error::Transport(format!("{address} refused to pair: {}", response.status())));
+    }
+    let body =
+        response.text().await.map_err(|e| Error::Transport(format!("reading {address}: {e}")))?;
+    serde_json::from_str(&body)
+        .map_err(|e| Error::Transport(format!("{address} sent no usable key: {e}")))
+}
+
+/// A client for talking *to* a relay rather than through one.
+///
+/// `no_proxy` matters: a desktop with a system proxy configured would
+/// otherwise ask that proxy to fetch the phone, which is both wrong and
+/// usually unreachable.
+fn control_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .build()
+        .map_err(|e| Error::Transport(format!("building the control client: {e}")))
+}
+
+async fn get<T: for<'de> Deserialize<'de>>(
+    address: &str,
+    path: &str,
+    key: Option<&str>,
+) -> Result<T> {
+    let client = control_client(CONTROL_TIMEOUT)?;
+    let mut request = client.get(format!("http://{address}{path}"));
+    if let Some(key) = key {
+        request = request.header("X-Braid-Key", key);
+    }
+
+    let response =
+        request.send().await.map_err(|e| Error::Transport(format!("reaching {address}: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(Error::Transport(format!("{address} answered {}", response.status())));
+    }
+
+    let body =
+        response.text().await.map_err(|e| Error::Transport(format!("reading {address}: {e}")))?;
+    serde_json::from_str(&body)
+        .map_err(|e| Error::Transport(format!("{address} is not a relay we understand: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hello_reads_a_phone_that_is_there() {
+        let relay = dl_testkit::Relay::spawn_phone("Pixel", Vec::new()).await.unwrap();
+        let found = hello(&relay.addr().to_string()).await.expect("a relay answers");
+        assert_eq!(found.name, "Pixel");
+        assert_eq!(found.version, PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn hello_fails_on_something_that_is_not_a_relay() {
+        // A port with nothing behind it. Discovery turns up addresses that are
+        // routers and printers, and this is what tells them apart.
+        assert!(hello("127.0.0.1:9").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn hello_fails_on_a_proxy_that_is_not_a_companion() {
+        // A plain forward proxy answers 404 here. Treating it as a relay would
+        // put a lane in the sidebar that can never serve.
+        let relay = dl_testkit::Relay::spawn().await.unwrap();
+        assert!(hello(&relay.addr().to_string()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn status_reads_the_offered_lanes() {
+        let lanes = vec![
+            dl_testkit::Lane::new("cell", "cellular", "Mobile data")
+                .leaving_from("203.0.113.7")
+                .saying("2 GB left"),
+            dl_testkit::Lane::new("wifi", "wifi", "Home"),
+        ];
+        let relay = dl_testkit::Relay::spawn_phone("Pixel", lanes).await.unwrap();
+        let status = status(&relay.addr().to_string(), None).await.unwrap();
+        assert_eq!(status.lanes.len(), 2);
+        assert_eq!(status.lanes[0].kind, LaneKind::Cellular);
+        assert_eq!(status.lanes[0].egress.as_deref(), Some("203.0.113.7"));
+        assert_eq!(status.lanes[0].note.as_deref(), Some("2 GB left"));
+        // A lane that says nothing about itself is still a lane.
+        assert_eq!(status.lanes[1].note, None);
+    }
+
+    #[tokio::test]
+    async fn pairing_returns_a_key_we_can_keep() {
+        let relay = dl_testkit::Relay::spawn_phone("Pixel", Vec::new()).await.unwrap();
+        let outcome = pair(&relay.addr().to_string(), "Studio").await.unwrap();
+        assert!(!outcome.key.is_empty());
+    }
 
     #[test]
     fn a_status_survives_the_wire() {
