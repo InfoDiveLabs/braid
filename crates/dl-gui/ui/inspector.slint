@@ -1,0 +1,485 @@
+// The Inspector, from the right-hand pane of mockup/macos/inspector.jpg.
+//
+// Built once over what every transfer has, not as a torrent panel. The piece
+// grid is worth more on an ordinary HTTP download than on a torrent: it is the
+// only place the journal's two least visible guarantees become something a
+// person can see: that a resumed transfer keeps what it had, and that a chunk
+// failing its hash costs one cell rather than the file.
+//
+// Rows that do not apply are absent rather than zero. "Ratio 0.00" on an HTTP
+// download is a lie about what the transfer is.
+
+import { Theme } from "theme.slint";
+import { Platform } from "@platform";
+import { Segmented, Button } from "controls.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export struct InspectorCell {
+    /// 0 missing, 1 downloading, 2 have. A small integer rather than a string
+    /// because there is one of these per cell and there are thousands.
+    state: int,
+    /// For a bucketed grid, how much of the bucket is complete.
+    fill: float,
+}
+
+export struct InspectorFile {
+    name: string,
+    size: string,
+    detail: string,
+    progress: float,
+}
+
+export struct InspectorPeer {
+    /// Interface name for an HTTP transfer, address for a torrent peer.
+    label: string,
+    detail: string,
+    rate: string,
+    parked: bool,
+}
+
+export struct InspectorStat {
+    label: string,
+    value: string,
+}
+
+component StatLine inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+
+    height: 26px;
+    HorizontalLayout {
+        Text {
+            text: root.label;
+            font-family: Theme.font;
+            font-size: 12px;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+        }
+        Rectangle { }
+        Text {
+            text: root.value;
+            font-family: Theme.mono;
+            font-size: 12px;
+            color: Theme.text;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+        }
+    }
+}
+
+component LegendKey inherits HorizontalLayout {
+    in property <string> label;
+    in property <brush> swatch;
+    in property <bool> outline;
+
+    spacing: 6px;
+    VerticalLayout {
+        alignment: center;
+        Rectangle {
+            width: 11px;
+            height: 11px;
+            border-radius: 2px;
+            background: root.outline ? transparent : root.swatch;
+            border-width: root.outline ? 1px : 0px;
+            border-color: Theme.border-strong;
+        }
+    }
+    Text {
+        text: root.label;
+        font-family: Theme.font;
+        font-size: 11px;
+        color: Theme.text-muted;
+        vertical-alignment: center;
+    }
+}
+
+export component Inspector inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    /// Which tab is drawn: "info" | "pieces" | "peers" | "files". Resolved by
+    /// the caller from `tab`, which is the only thing this panel reports.
+    in property <string> page: "info";
+    in property <int> tab;
+    /// Tab names, so a transfer with no files or peers does not offer them.
+    in property <[string]> tabs;
+    in property <[InspectorCell]> cells;
+    /// How many chunks one cell stands for. 1 unless the grid is bucketed.
+    in property <int> bucket: 1;
+    in property <string> have-label;
+    in property <[InspectorStat]> stats;
+    in property <[string]> interface-names;
+    in property <[string]> interface-rates;
+    in property <[float]> interface-fills;
+    in property <[color]> interface-colors;
+    in property <[InspectorFile]> files;
+    in property <[InspectorPeer]> peers;
+    in property <string> peers-column: "INTERFACES";
+    in property <string> empty-note;
+
+    /// The tab the user picked, by position in `tabs`.
+    ///
+    /// By index, not by name: the tab set differs per transfer: a torrent has
+    /// no Pieces tab: and a panel that mapped position to meaning itself got
+    /// it wrong the moment the list changed length, highlighting one tab while
+    /// drawing another.
+    callback chose-tab(int);
+    callback reveal();
+    /// Whether the file is on disk to be shown.
+    in property <bool> finished;
+
+    background: Theme.canvas;
+
+    Rectangle {
+        x: 0;
+        width: 1px;
+        height: parent.height;
+        background: Theme.border;
+    }
+
+    VerticalLayout {
+        padding: 18px;
+        padding-top: 16px;
+        spacing: 12px;
+
+        Text {
+            text: root.title;
+            font-family: Theme.font;
+            font-size: 17px;
+            font-weight: 700;
+            color: Theme.text;
+            horizontal-alignment: center;
+            overflow: elide;
+            vertical-stretch: 0;
+        }
+        Text {
+            text: root.subtitle;
+            font-family: Theme.font;
+            font-size: 12px;
+            color: Theme.text-muted;
+            horizontal-alignment: center;
+            overflow: elide;
+            vertical-stretch: 0;
+        }
+
+        // Only once there is something to show. Offering it mid-transfer
+        // would open a folder holding a `.part` file.
+        if root.finished: HorizontalLayout {
+            vertical-stretch: 0;
+            alignment: center;
+            Button {
+                label: "Show in " + Platform.file-manager;
+                clicked => { root.reveal(); }
+            }
+        }
+
+        Segmented {
+            vertical-stretch: 0;
+            options: root.tabs;
+            selected: root.tab;
+            chose(i) => { root.chose-tab(i); }
+        }
+
+        // ------------------------------------------------------------- grid
+        if root.page == "pieces" || (root.page == "info" && root.cells.length > 0): VerticalLayout {
+            spacing: 8px;
+            vertical-stretch: 0;
+
+            Rectangle {
+                height: grid.preferred-height;
+                grid := VerticalLayout {
+                    spacing: 2px;
+                    for row in root.grid-rows: HorizontalLayout {
+                        spacing: 2px;
+                        height: root.cell-size;
+                        for column in root.grid-columns: Rectangle {
+                            property <int> index: row * root.grid-columns + column;
+                            property <InspectorCell> cell: root.cells[self.index];
+                            visible: self.index < root.cells.length;
+                            border-radius: 1px;
+                            // A bucketed cell is shaded by how much of it is
+                            // there, so a grid that cannot show every chunk
+                            // still tells the truth about the ones it merges.
+                            background: self.cell.state == 2 ? Theme.accent
+                                : self.cell.state == 1
+                                ? Theme.accent.transparentize(1.0 - 0.35 - self.cell.fill * 0.5)
+                                : self.cell.fill > 0.0
+                                ? Theme.accent.transparentize(1.0 - self.cell.fill)
+                                : transparent;
+                            border-width: self.cell.state == 0 && self.cell.fill == 0.0 ? 1px : 0px;
+                            border-color: Theme.border-strong;
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 14px;
+                LegendKey {
+                    label: root.have-label;
+                    swatch: Theme.accent;
+                }
+                LegendKey {
+                    label: "Downloading";
+                    swatch: Theme.accent.transparentize(0.55);
+                }
+                LegendKey {
+                    label: "Missing";
+                    outline: true;
+                }
+                Rectangle { }
+            }
+            if root.bucket > 1: Text {
+                text: "Each cell is " + root.bucket + " pieces.";
+                font-family: Theme.font;
+                font-size: 10px;
+                color: Theme.text-faint;
+            }
+        }
+        // Takes the slack on a tab whose content is its natural height, so the
+        // header above does not drift down the pane to fill it.
+        if root.page == "pieces": Rectangle { vertical-stretch: 1; }
+
+        // ------------------------------------------------------------- info
+        if root.page == "info": Rectangle {
+            border-radius: Theme.radius;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 0px;
+                for stat in root.stats: StatLine {
+                    label: stat.label;
+                    value: stat.value;
+                }
+
+                if root.interface-names.length > 0: Rectangle { height: 10px; }
+                if root.interface-names.length > 0: Rectangle {
+                    height: 1px;
+                    background: Theme.border;
+                }
+                if root.interface-names.length > 0: Rectangle { height: 12px; }
+                if root.interface-names.length > 0: Text {
+                    text: "PER INTERFACE";
+                    font-family: Theme.font;
+                    font-size: 11px;
+                    font-weight: 600;
+                    letter-spacing: 0.5px;
+                    color: Theme.text-faint;
+                }
+                if root.interface-names.length > 0: Rectangle { height: 8px; }
+                for name[i] in root.interface-names: HorizontalLayout {
+                    height: 24px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: root.interface-colors[Math.mod(i, 5)];
+                        }
+                    }
+                    Text {
+                        text: name;
+                        font-family: Theme.font;
+                        font-size: 12px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Rectangle { }
+                    Text {
+                        width: 66px;
+                        text: root.interface-rates[i];
+                        font-family: Theme.mono;
+                        font-size: 11px;
+                        color: Theme.text-muted;
+                        vertical-alignment: center;
+                        horizontal-alignment: right;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        width: 62px;
+                        Rectangle {
+                            height: 4px;
+                            border-radius: 2px;
+                            background: Theme.track;
+                            Rectangle {
+                                x: 0;
+                                width: parent.width * root.interface-fills[i];
+                                height: parent.height;
+                                border-radius: 2px;
+                                background: root.interface-colors[Math.mod(i, 5)];
+                                animate width { duration: 260ms; easing: ease-out; }
+                            }
+                        }
+                    }
+                }
+                Rectangle { }
+            }
+        }
+
+        // ------------------------------------------------------------ files
+        if root.page == "files": Rectangle {
+            border-radius: Theme.radius;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            vertical-stretch: 1;
+            clip: true;
+            // A busy swarm is dozens of rows and a torrent can hold hundreds
+            // of files; without this the list simply runs off the panel.
+            files-scroll := ScrollView {
+            content-height: files-body.preferred-height;
+            files-body := VerticalLayout {
+                width: files-scroll.visible-width;
+                padding: 4px;
+                for file[i] in root.files: Rectangle {
+                    height: 44px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            Text {
+                                text: file.name;
+                                font-family: Theme.font;
+                                font-size: 12px;
+                                color: Theme.text;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: file.detail;
+                                font-family: Theme.mono;
+                                font-size: 10px;
+                                color: Theme.text-faint;
+                                overflow: elide;
+                            }
+                        }
+                        Rectangle { }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 0;
+                            width: 84px;
+                            spacing: 5px;
+                            Text {
+                                text: file.size;
+                                font-family: Theme.mono;
+                                font-size: 11px;
+                                color: Theme.text-muted;
+                                horizontal-alignment: right;
+                            }
+                            Rectangle {
+                                height: 3px;
+                                border-radius: 1.5px;
+                                background: Theme.track;
+                                Rectangle {
+                                    x: 0;
+                                    width: parent.width * file.progress;
+                                    height: parent.height;
+                                    border-radius: 1.5px;
+                                    background: file.progress >= 1.0 ? Theme.upload : Theme.accent;
+                                    animate width { duration: 260ms; easing: ease-out; }
+                                }
+                            }
+                        }
+                    }
+                }
+                Rectangle { }
+            }
+            }
+        }
+
+        // ------------------------------------------------------------ peers
+        if root.page == "peers": Rectangle {
+            border-radius: Theme.radius;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            vertical-stretch: 1;
+            clip: true;
+            // A busy swarm is dozens of rows and a torrent can hold hundreds
+            // of files; without this the list simply runs off the panel.
+            peers-scroll := ScrollView {
+            content-height: peers-body.preferred-height;
+            peers-body := VerticalLayout {
+                width: peers-scroll.visible-width;
+                padding: 12px;
+                spacing: 6px;
+                Text {
+                    vertical-stretch: 0;
+                    text: root.peers-column;
+                    font-family: Theme.font;
+                    font-size: 11px;
+                    font-weight: 600;
+                    letter-spacing: 0.5px;
+                    color: Theme.text-faint;
+                }
+                for peer in root.peers: Rectangle {
+                    height: 36px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        // Two lines. An IPv6 address is 39 characters and a
+                        // client name is another twenty; sharing one row left
+                        // both elided to nothing and pushed the figure that
+                        // matters off the end.
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: peer.label;
+                                font-family: Theme.mono;
+                                font-size: 11px;
+                                color: peer.parked ? Theme.text-faint : Theme.text;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: peer.detail;
+                                font-family: Theme.font;
+                                font-size: 10px;
+                                color: Theme.text-faint;
+                                overflow: elide;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 0;
+                            width: 74px;
+                            Text {
+                                text: peer.rate;
+                                font-family: Theme.mono;
+                                font-size: 11px;
+                                color: peer.parked ? Theme.text-faint : Theme.text-muted;
+                                horizontal-alignment: right;
+                            }
+                        }
+                    }
+                }
+                if root.peers.length == 0: Text {
+                    text: root.empty-note;
+                    font-family: Theme.font;
+                    font-size: 11px;
+                    color: Theme.text-faint;
+                    wrap: word-wrap;
+                }
+                Rectangle { }
+            }
+            }
+        }
+    }
+
+    // Layout arithmetic for the grid, kept out of the markup above.
+    property <int> grid-columns: 18;
+    property <length> cell-size: (root.width - 36px - (root.grid-columns - 1) * 2px)
+        / root.grid-columns;
+    property <int> grid-rows: root.cells.length > 0
+        ? Math.ceil(root.cells.length / root.grid-columns) : 0;
+
+}

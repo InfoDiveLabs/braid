@@ -1,0 +1,167 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  Derived from the cargo-wix template, Copyright (C) 2017 Christopher R. Field,
+  licensed under the Apache License, Version 2.0. A copy is at
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Changes from that template: the product is named and attributed, the CLI is
+  installed beside the GUI, there is a Start Menu entry, and the product icon
+  is wired up.
+
+  Every path to a file here is written from the workspace root, not from this
+  file's own directory: WiX's linker resolves them against its working
+  directory, and that is where cargo runs.
+
+  Magnet and .torrent handling is deliberately absent here. Braid claims those
+  at runtime from its own settings, so the claim can be turned off again
+  without an uninstall, and so an installer does not seize a file type on
+  behalf of someone who has not opened the application yet.
+-->
+
+<!--
+  Please do not remove these pre-processor If-Else blocks. These are used with
+  the `cargo wix` subcommand to automatically determine the installation
+  destination for 32-bit versus 64-bit installers. Removal of these lines will
+  cause installation errors.
+-->
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='Braid'
+        UpgradeCode='6F2C1B84-7A3E-4C29-9B1D-5E8A2D4F7C13'
+        Manufacturer='InfoDive Labs Pvt Ltd.'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Braid: a download manager that splits one file across every network path you have.'
+            Manufacturer='InfoDive Labs Pvt Ltd.'
+            InstallerVersion='500'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='Braid Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='Braid'>
+
+                    <Component Id='License' Guid='*'>
+                        <File Id='LicenseFile' Name='LICENSE.txt' DiskId='1'
+                              Source='crates\dl-gui\wix\LICENSE.txt' KeyPath='yes'/>
+                    </Component>
+
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='Path' Guid='9D4E7A21-3C85-4B6F-8E2A-1F7B9C3D5E80' KeyPath='yes'>
+                            <Environment
+                                Id='PATH'
+                                Name='PATH'
+                                Value='[Bin]'
+                                Permanent='no'
+                                Part='last'
+                                Action='set'
+                                System='yes'/>
+                        </Component>
+
+                        <Component Id='binary0' Guid='*'>
+                            <File
+                                Id='exe0'
+                                Name='braid.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\braid.exe'
+                                KeyPath='yes'/>
+                        </Component>
+
+                        <!-- The same engine without a window, for scripts and
+                             for anyone who would rather not have one. -->
+                        <Component Id='binary1' Guid='*'>
+                            <File
+                                Id='exe1'
+                                Name='dl.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\dl.exe'
+                                KeyPath='yes'/>
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
+
+            <!-- Without this the application is installed and unreachable
+                 except from a shell, which for a windowed program is the same
+                 as not installed. -->
+            <Directory Id='ProgramMenuFolder'>
+                <Component Id='StartMenuShortcut' Guid='*'>
+                    <Shortcut Id='BraidShortcut'
+                              Name='Braid'
+                              Description='Split one download across every network path you have'
+                              Target='[Bin]braid.exe'
+                              WorkingDirectory='Bin'
+                              Icon='ProductICO'/>
+                    <RegistryValue Root='HKCU'
+                                   Key='Software\InfoDive Labs\Braid'
+                                   Name='StartMenuShortcut'
+                                   Type='integer'
+                                   Value='1'
+                                   KeyPath='yes'/>
+                </Component>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs Braid, the dl command line tool, and the licence.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='License'/>
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='binary1'/>
+            <ComponentRef Id='StartMenuShortcut'/>
+
+            <Feature
+                Id='Environment'
+                Title='PATH Environment Variable'
+                Description='Add the install location of the [ProductName] executables to the PATH system environment variable. This allows dl to be called from any location.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <!-- Generated from the same source as every other platform's icon by
+             `xtask package`, so the three cannot drift. -->
+        <Icon Id='ProductICO' SourceFile='crates\dl-gui\wix\braid.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
+
+        <Property Id='ARPHELPLINK' Value='https://github.com/InfoDiveLabs/braid'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+        </UI>
+
+        <WixVariable Id='WixUILicenseRtf' Value='crates\dl-gui\wix\License.rtf'/>
+    </Product>
+</Wix>

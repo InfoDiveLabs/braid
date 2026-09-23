@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "GPL-3.0-only"
+repository = "https://github.com/InfoDiveLabs/braid"
+homepage = "https://www.infodivelabs.com"
+description = "A download manager that splits one file across every network path you have."
+authors = ["Suraj Tiwari <surajtiwari020@gmail.com>"]
+keywords = ["download-manager", "bittorrent", "multipath", "resume"]
+categories = ["command-line-utilities", "network-programming"]
+
+[workspace.dependencies]
+dl-core    = { path = "crates/dl-core" }
+dl-net     = { path = "crates/dl-net" }
+dl-testkit = { path = "crates/dl-testkit" }
+dl-torrent = { path = "crates/dl-torrent" }
+
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1.53", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level     = "s"
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
+incremental   = false
+
+# NOTE: re-add `[profile.release.package.{blake3,crc32c}] opt-level = 3` in phase 2.
+# opt-level="s" de-vectorizes hashing/memcpy hot paths (2-5x cost); those crates
+# must stay at 3. Cargo warns on specs that match no package, so they land with
+# the dependencies.

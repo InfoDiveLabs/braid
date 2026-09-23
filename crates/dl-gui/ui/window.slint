@@ -1,0 +1,1527 @@
+// The main window, drawn from mockup/macos/main.jpg.
+//
+// A source-list sidebar, the live throughput reduced to a sparkline in the
+// header, and the transfer list taking every remaining pixel. The large chart
+// this replaced earned its space while you watched a transfer and wasted it
+// the rest of the time.
+//
+// Everything that differs between platforms comes from `@platform`, which
+// build.rs swaps per target: window-control clearance, selection style,
+// metrics and the system font. There is one layout, not three.
+
+import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Platform } from "@platform";
+import {
+    TransferRow, TransferLine, Meter, FileGlyph, KindGlyph, LinkGlyph,
+} from "components.slint";
+import {
+    Inspector, InspectorCell, InspectorFile, InspectorPeer, InspectorStat,
+} from "inspector.slint";
+import { Button, Stepper, Dropdown, Toggle, Field } from "controls.slint";
+
+component SectionLabel inherits Text {
+    font-family: Theme.font;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: Theme.text-faint;
+}
+
+component SourceRow inherits Rectangle {
+    in property <string> label;
+    /// "all" | "active" | "queued" | "seeding" | "done" | "failed"
+    in property <string> glyph;
+    in property <bool> selected;
+    in property <int> count;
+    callback clicked;
+
+    // Aqua fills the selected row with the accent outright and turns its label
+    // white. Fluent and Adwaita tint it instead and mark the edge.
+    property <bool> filled: root.selected && Platform.solid-selection;
+    property <color> ink: root.filled ? Theme.on-accent : Theme.text-muted;
+    property <color> label-ink: root.filled ? Theme.on-accent : Theme.text;
+
+    height: Platform.source-row-height;
+    border-radius: Theme.radius-sm;
+    background: root.selected
+        ? (Platform.solid-selection ? Theme.accent : Theme.accent.transparentize(0.78))
+        : touch.has-hover ? Theme.border.transparentize(0.6) : transparent;
+    animate background { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: root.label + " filter";
+    accessible-action-default => { root.clicked(); }
+
+    if !Platform.solid-selection && root.selected: Rectangle {
+        x: 0;
+        y: 6px;
+        width: 3px;
+        height: parent.height - 12px;
+        border-radius: 1.5px;
+        background: Theme.accent;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 10px;
+        spacing: 8px;
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            width: 17px;
+
+            if root.glyph == "all": Path {
+                width: 16px; height: 13px; viewbox-width: 16; viewbox-height: 13;
+                commands: "M 1 1.2 L 2.6 1.2 M 5 1.2 L 15 1.2"
+                    + " M 1 6.5 L 2.6 6.5 M 5 6.5 L 15 6.5"
+                    + " M 1 11.8 L 2.6 11.8 M 5 11.8 L 15 11.8";
+                stroke: ink;
+                stroke-width: 1.7px;
+            }
+            // A level meter rather than a play triangle: "active" means moving
+            // bytes, and a transport control would invite a click.
+            if root.glyph == "active": Path {
+                width: 15px; height: 14px; viewbox-width: 15; viewbox-height: 14;
+                commands: "M 1.4 5 L 1.4 9 M 5.6 1.4 L 5.6 12.6"
+                    + " M 9.4 3.4 L 9.4 10.6 M 13.6 6 L 13.6 8";
+                stroke: ink;
+                stroke-width: 2px;
+            }
+            if root.glyph == "queued": Path {
+                width: 15px; height: 13px; viewbox-width: 15; viewbox-height: 13;
+                commands: "M 1 1 L 14 1 L 14 12 L 1 12 Z"
+                    + " M 1 7.4 L 4.6 7.4 L 5.9 9.6 L 9.1 9.6 L 10.4 7.4 L 14 7.4";
+                stroke: ink;
+                stroke-width: 1.4px;
+            }
+            // Upward: the one state where bytes leave the machine.
+            if root.glyph == "seeding": Path {
+                width: 13px; height: 14px; viewbox-width: 13; viewbox-height: 14;
+                commands: "M 6.5 13 L 6.5 1.4 M 1.6 6.3 L 6.5 1.4 L 11.4 6.3";
+                stroke: ink;
+                stroke-width: 1.7px;
+            }
+            if root.glyph == "done": Path {
+                width: 15px; height: 11px; viewbox-width: 15; viewbox-height: 11;
+                commands: "M 1 5.6 L 5.4 10 L 14 1.2";
+                stroke: ink;
+                stroke-width: 1.9px;
+            }
+            if root.glyph == "failed": Rectangle {
+                width: 14px; height: 14px;
+                border-radius: 7px;
+                border-width: 1.4px;
+                border-color: ink;
+                Rectangle { x: 6.3px; y: 3.2px; width: 1.4px; height: 5px; background: ink; }
+                Rectangle { x: 6.3px; y: 9.4px; width: 1.4px; height: 1.4px; background: ink; }
+            }
+        }
+
+        Text {
+            text: root.label;
+            font-family: Theme.font;
+            font-size: 13px;
+            font-weight: root.selected ? 600 : 400;
+            color: label-ink;
+            vertical-alignment: center;
+        }
+        Rectangle { }
+        Text {
+            text: root.count;
+            font-family: Theme.font;
+            font-size: 12px;
+            color: root.filled ? Theme.on-accent : Theme.text-faint;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component InterfaceRow inherits Rectangle {
+    in property <string> name;
+    in property <string> rate;
+    in property <string> icon;
+    in property <float> fill;
+    in property <color> tint;
+
+    height: 38px;
+
+    // The same left inset and glyph column as SourceRow above. Without them
+    // the interface labels started 33px left of the filter labels, and the two
+    // groups read as belonging to different windows.
+    HorizontalLayout {
+        y: 0;
+        height: 18px;
+        padding-left: 9px;
+        padding-right: 10px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            width: 17px;
+            LinkGlyph {
+                kind: root.icon;
+                ink: Theme.text-muted;
+            }
+        }
+        Text {
+            text: root.name;
+            font-family: Theme.font;
+            font-size: 13px;
+            color: Theme.text;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Rectangle { }
+        // Fixed, right-aligned: the figure changes width as it moves through
+        // "0 B/s" and "12.0 MB/s", and sized to its content it dragged the
+        // label beside it about.
+        Text {
+            // Wide enough for "948.7 KB/s"; at 64px the unit was clipped.
+            width: 78px;
+            horizontal-stretch: 0;
+            text: root.rate;
+            font-family: Theme.mono;
+            font-size: 12px;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+        }
+    }
+    // Explicit geometry rather than a layout: the bar has to sit closer to its
+    // own label than to the next interface's label, or the grouping reads as
+    // rate-over-bar pairs that belong to the wrong rows.
+    Meter {
+        x: 9px;
+        y: 24px;
+        width: root.width - 19px;
+        fill: root.fill;
+        tint: root.tint;
+    }
+}
+
+// The total, as a trace rather than a chart.
+//
+// `Path` centres its commands' bounding box unless given a viewbox, so an idle
+// trace: a flat line, no height: floats to the middle and draws a rate that
+// contradicts the figure beside it. The viewbox pins it to the origin, and
+// because the viewbox is in pixels the commands must be too, which is why the
+// plot publishes its measured size for the bridge to draw against.
+component Sparkline inherits Rectangle {
+    in property <string> area;
+    in property <string> line;
+    in property <string> up-area;
+    in property <string> up-line;
+    in property <bool> live;
+    out property <length> plot-w: self.width;
+    out property <length> plot-h: self.height;
+
+    clip: true;
+
+    Path {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: parent.width / 1px;
+        viewbox-height: parent.height / 1px;
+        commands: root.area;
+        fill: root.live ? Theme.accent.transparentize(0.6)
+            : Theme.text-faint.transparentize(0.88);
+    }
+    Path {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: parent.width / 1px;
+        viewbox-height: parent.height / 1px;
+        commands: root.line;
+        stroke: root.live ? Theme.accent : Theme.text-faint;
+        stroke-width: 1.4px;
+    }
+
+    // Upload, mirrored below the centre. Drawn unconditionally: with nothing
+    // uploading the commands describe a flat run along the centre line, which
+    // renders as nothing at all rather than as a shape that has to be hidden.
+    Path {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: parent.width / 1px;
+        viewbox-height: parent.height / 1px;
+        commands: root.up-area;
+        fill: Theme.upload.transparentize(0.65);
+    }
+    Path {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: parent.width / 1px;
+        viewbox-height: parent.height / 1px;
+        commands: root.up-line;
+        stroke: Theme.upload;
+        stroke-width: 1.4px;
+    }
+}
+
+component SearchField inherits Rectangle {
+    in-out property <string> text;
+    out property <bool> focused <=> input.has-focus;
+
+    height: 28px;
+    border-radius: Theme.radius-sm;
+    background: Theme.field;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.border;
+    animate border-color { duration: 120ms; }
+
+    // A ring and a handle: `Path` has no circle primitive, and a rounded
+    // Rectangle is a truer one than four arcs stitched together.
+    Rectangle {
+        x: 9px; y: 9px; width: 9px; height: 9px;
+        border-radius: 4.5px;
+        border-width: 1.2px;
+        border-color: Theme.text-faint;
+    }
+    Path {
+        x: 17px; y: 17px; width: 5px; height: 5px;
+        viewbox-width: 5; viewbox-height: 5;
+        commands: "M 0 0 L 4 4";
+        stroke: Theme.text-faint;
+        stroke-width: 1.3px;
+    }
+
+    input := TextInput {
+        x: 27px;
+        width: parent.width - 36px;
+        height: parent.height;
+        vertical-alignment: center;
+        font-family: Theme.font;
+        font-size: 12px;
+        color: Theme.text;
+        text <=> root.text;
+        single-line: true;
+        accessible-role: text-input;
+        accessible-label: "Search transfers";
+    }
+    Text {
+        x: 27px;
+        visible: root.text == "";
+        text: "Search";
+        font-family: Theme.font;
+        font-size: 12px;
+        color: Theme.text-faint;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+}
+
+// Removing a transfer, which is the one action here that can destroy work.
+//
+// Three outcomes, not two: keeping the file is the common case and deleting it
+// is the one someone came here for, and a single "Remove" that silently picks
+// one of them is wrong half the time.
+component RemoveSheet inherits Rectangle {
+    in property <string> filename;
+    in property <bool> finished;
+    callback keep();
+    callback erase();
+    callback cancel();
+
+    background: #00000088;
+    TouchArea {
+        clicked => { root.cancel(); }
+    }
+
+    Rectangle {
+        width: 420px;
+        height: card.preferred-height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: Theme.radius;
+        background: Theme.sidebar;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 40px;
+        drop-shadow-offset-y: 12px;
+        drop-shadow-color: #000000aa;
+
+        TouchArea { }
+
+        card := VerticalLayout {
+            width: parent.width;
+            padding: 20px;
+            spacing: 10px;
+
+            Text {
+                text: "Remove this transfer?";
+                font-family: Theme.font;
+                font-size: 15px;
+                font-weight: 700;
+                color: Theme.text;
+                wrap: word-wrap;
+            }
+            Text {
+                text: root.filename;
+                font-family: Theme.font;
+                font-size: 12px;
+                color: Theme.text-muted;
+                overflow: elide;
+            }
+            Text {
+                text: root.finished
+                    ? "The downloaded file stays on disk unless you delete it here."
+                    : "Keeping the partial file lets this transfer be resumed later.";
+                font-family: Theme.font;
+                font-size: 11px;
+                color: Theme.text-faint;
+                wrap: word-wrap;
+            }
+
+            Rectangle { height: 6px; }
+
+            HorizontalLayout {
+                spacing: 10px;
+                Button {
+                    label: "Delete files";
+                    clicked => { root.erase(); }
+                }
+                Rectangle { }
+                Button {
+                    label: "Cancel";
+                    clicked => { root.cancel(); }
+                }
+                Button {
+                    label: "Remove";
+                    primary: true;
+                    clicked => { root.keep(); }
+                }
+            }
+        }
+    }
+}
+
+// Add Transfer, from mockup/macos/add-sheet.jpg.
+//
+// Sized from its content, never a constant: a fixed height silently clipped
+// the buttons off the bottom the moment the type got bigger.
+component AddSheet inherits Rectangle {
+    in-out property <string> url;
+    in-out property <int> connections;
+    in-out property <string> limit-text;
+    in-out property <bool> verify-on;
+    in-out property <int> checksum-algorithm;
+    in-out property <string> checksum-text;
+    in property <string> destination;
+    in property <[string]> interface-options;
+    in-out property <int> interface-choice;
+
+    // "idle" | "probing" | "ok" | "failed"
+    in property <string> probe-state: "idle";
+    in property <string> probe-name;
+    in property <string> probe-detail;
+    in property <string> probe-kind: "doc";
+
+    callback start();
+    callback cancel();
+    callback choose-destination();
+    callback probe(string);
+
+    // The scrim swallows clicks too, so the list behind cannot be operated
+    // while the sheet is up.
+    background: #00000088;
+    TouchArea {
+        clicked => { root.cancel(); }
+    }
+
+    Rectangle {
+        width: 520px;
+        height: card.preferred-height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: Theme.radius;
+        background: Theme.sidebar;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 40px;
+        drop-shadow-offset-y: 12px;
+        drop-shadow-color: #000000aa;
+
+        // Clicks on the card must not reach the scrim behind it.
+        TouchArea { }
+
+        card := VerticalLayout {
+            width: parent.width;
+            padding: 20px;
+            spacing: 10px;
+
+            Text {
+                text: "Add Transfer";
+                font-family: Theme.font;
+                font-size: 16px;
+                font-weight: 700;
+                color: Theme.text;
+            }
+
+            Rectangle { height: 2px; }
+
+            Rectangle {
+                height: 34px;
+                border-radius: Theme.radius-sm;
+                background: Theme.field;
+                border-width: url-input.has-focus ? 2px : 1px;
+                border-color: url-input.has-focus ? Theme.accent : Theme.border;
+                animate border-color { duration: 120ms; }
+
+                url-input := TextInput {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    font-family: Theme.font;
+                    font-size: 13px;
+                    color: Theme.text;
+                    text <=> root.url;
+                    single-line: true;
+                    accessible-role: text-input;
+                    accessible-label: "Transfer URL";
+                    edited => { root.probe(root.url); }
+                    accepted => { root.start(); }
+                }
+                Text {
+                    x: 10px;
+                    visible: root.url == "";
+                    text: "https://";
+                    font-family: Theme.font;
+                    font-size: 13px;
+                    color: Theme.text-faint;
+                    vertical-alignment: center;
+                    height: parent.height;
+                }
+            }
+
+            Text {
+                // Not "drop a .torrent file": cross-application drag and drop
+                // does not work in Slint at all (docs/spikes.md, spike 3), and
+                // a hint that names a gesture nothing listens for is worse
+                // than one that names the two that work. Opening a .torrent
+                // from Finder reaches Braid through the system handler, not
+                // through this field.
+                text: "Paste a URL, a magnet link, or the path to a .torrent file.";
+                font-family: Theme.font;
+                font-size: 11px;
+                color: Theme.text-faint;
+            }
+
+            // What the server actually said, once we have asked it. Absent
+            // until there is a URL, because an empty strip reads as a failure.
+            if root.probe-state != "idle": Rectangle {
+                height: 58px;
+                border-radius: Theme.radius-sm;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        // A magnet link names a swarm, not a file. Showing a
+                        // page icon beside it would claim we know what is in
+                        // there before anyone has answered.
+                        if root.probe-state == "torrent": KindGlyph {
+                            kind: "torrent";
+                            ink: Theme.text-muted;
+                        }
+                        if root.probe-state != "torrent": FileGlyph {
+                            file: root.probe-state == "failed" ? "doc" : root.probe-kind;
+                            ink: root.probe-state == "failed" ? Theme.danger : Theme.text-muted;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 3px;
+                        Text {
+                            text: root.probe-name;
+                            font-family: Theme.font;
+                            font-size: 13px;
+                            color: Theme.text;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: root.probe-detail;
+                            font-family: Theme.font;
+                            font-size: 11px;
+                            color: root.probe-state == "failed" ? Theme.danger : Theme.text-muted;
+                            overflow: elide;
+                        }
+                    }
+                    Rectangle { }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        width: 20px;
+                        if root.probe-state == "ok": Path {
+                            width: 20px; height: 16px;
+                            viewbox-width: 20; viewbox-height: 16;
+                            commands: "M 1.5 8.4 L 7 13.6 L 18.5 2.4";
+                            stroke: Theme.success;
+                            stroke-width: 2.2px;
+                        }
+                        if root.probe-state == "probing": Rectangle {
+                            width: 14px; height: 14px;
+                            border-radius: 7px;
+                            border-width: 2px;
+                            border-color: Theme.border-strong;
+                            Rectangle {
+                                width: 6px; height: 6px;
+                                border-radius: 3px;
+                                background: Theme.accent;
+                                x: 4px;
+                                y: 0px;
+                                opacity: 0.9;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 44px;
+                border-radius: Theme.radius-sm;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 10px;
+                    spacing: 10px;
+                    Text {
+                        text: "Save to";
+                        font-family: Theme.font;
+                        font-size: 13px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
+                    }
+                    Text {
+                        text: root.destination;
+                        font-family: Theme.font;
+                        font-size: 12px;
+                        color: Theme.text-muted;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Button {
+                            label: "Choose…";
+                            clicked => { root.choose-destination(); }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 44px;
+                border-radius: Theme.radius-sm;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    spacing: 8px;
+                    Text {
+                        text: "Connections";
+                        font-family: Theme.font;
+                        font-size: 13px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Stepper {
+                            value: root.connections;
+                            minimum: 1;
+                            maximum: 32;
+                            label: "connections";
+                            changed(v) => { root.connections = v; }
+                        }
+                    }
+                    Rectangle { width: 6px; }
+                    Text {
+                        text: "Interfaces";
+                        font-family: Theme.font;
+                        font-size: 13px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Dropdown {
+                            options: root.interface-options;
+                            selected: root.interface-choice;
+                            label: "Interfaces";
+                            chose(i) => { root.interface-choice = i; }
+                        }
+                    }
+                    Rectangle { width: 6px; }
+                    Text {
+                        text: "Limit";
+                        font-family: Theme.font;
+                        font-size: 13px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Field {
+                            text <=> root.limit-text;
+                            placeholder: "Unlimited";
+                            mono: false;
+                            label: "Transfer limit";
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 44px;
+                border-radius: Theme.radius-sm;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    spacing: 10px;
+                    Text {
+                        text: "Verify checksum";
+                        font-family: Theme.font;
+                        font-size: 13px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Toggle {
+                            on: root.verify-on;
+                            label: "Verify checksum";
+                            changed(v) => { root.verify-on = v; }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Dropdown {
+                            options: ["BLAKE3", "SHA-256", "MD5"];
+                            selected: root.checksum-algorithm;
+                            enabled: root.verify-on;
+                            label: "Checksum algorithm";
+                            chose(i) => { root.checksum-algorithm = i; }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Field {
+                            text <=> root.checksum-text;
+                            placeholder: "paste the expected digest";
+                            enabled: root.verify-on;
+                            label: "Expected digest";
+                        }
+                    }
+                }
+            }
+
+            Rectangle { height: 4px; }
+            Rectangle { height: 1px; background: Theme.border; }
+            Rectangle { height: 4px; }
+
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: end;
+                Button {
+                    label: "Cancel";
+                    clicked => { root.cancel(); }
+                }
+                Button {
+                    label: "Add";
+                    primary: true;
+                    enabled: root.url != "";
+                    clicked => { root.start(); }
+                }
+            }
+        }
+    }
+}
+
+
+export component MainWindow inherits Window {
+    title: "Braid";
+    preferred-width: 1162px;
+    preferred-height: 698px;
+    min-width: 860px;
+    min-height: 460px;
+    // Transparent only when the compositor granted blur, so the window still
+    // has a ground to stand on when it did not.
+    background: root.vibrancy ? transparent : Theme.canvas;
+    default-font-family: Theme.font;
+    icon: @image-url("brand/icon-256.png");
+
+    // Screenshot tests drive this rather than depending on the host's setting.
+    in-out property <bool> dark <=> Theme.dark;
+
+    in property <[TransferRow]> rows;
+    /// Which transfers are open, by id. Held here rather than in the row
+    /// model: the model is rebuilt from the engine on every tick, so an
+    /// expansion kept in it would collapse ten times a second.
+    in-out property <[int]> expanded-rows;
+    /// The selected transfer's id, or -1. The Inspector hangs off this.
+    in-out property <int> selected-id: -1;
+    in-out property <bool> inspector-open;
+    // Filled by the bridge for the selected transfer only, and only while the
+    // panel is open. See dl_core::chunks for why this is pulled rather than
+    // pushed with the rest of the snapshot.
+    in property <string> inspector-title;
+    in property <string> inspector-subtitle;
+    in property <string> inspector-page: "info";
+    in-out property <int> inspector-tab;
+    in property <[string]> inspector-tabs: ["Info", "Pieces", "Peers", "Files"];
+    in property <[InspectorCell]> inspector-cells;
+    in property <int> inspector-bucket: 1;
+    in property <string> inspector-have: "Have";
+    in property <[InspectorStat]> inspector-stats;
+    in property <[InspectorFile]> inspector-files;
+    in property <[InspectorPeer]> inspector-peers;
+    in property <string> inspector-peers-column: "INTERFACES";
+    in property <string> inspector-empty-note;
+    in property <bool> inspector-finished;
+    /// True while the search field has focus, so the arrow keys type rather
+    /// than move the selection.
+    out property <bool> search-focused: search.focused;
+    in property <string> down-total: "0 B/s";
+    /// Whether anything is actually moving bytes right now. Drives the
+    /// sparkline's presence, which is noise when nothing is.
+    in property <bool> transferring;
+    in property <string> up-total: "0 B/s";
+    in property <bool> has-upload;
+    in property <[string]> interface-names;
+    in property <[string]> interface-rates;
+    in property <[string]> interface-icons;
+    in property <[float]> interface-fills;
+    in property <int> total-count;
+    in property <int> active-count;
+    in property <int> paused-count;
+    in property <int> queued-count;
+    in property <int> seeding-count;
+    in property <int> done-count;
+    in property <int> failed-count;
+    in property <string> chart-area;
+    in property <string> chart-line;
+    in property <string> chart-up-area;
+    in property <string> chart-up-line;
+    in property <string> filter: "all";
+    in property <string> destination;
+    in-out property <string> search-text;
+    in-out property <string> url-input;
+    in-out property <int> connections: 8;
+    in-out property <bool> sheet-open;
+    /// The transfer awaiting a remove confirmation, or -1.
+    in-out property <int> removing-id: -1;
+    in property <string> removing-name;
+    in property <bool> removing-finished;
+    // What the add sheet knows about the URL in it. Filled in by the bridge
+    // once the server has answered; see AddSheet for the states.
+    in property <string> probe-state: "idle";
+    in property <string> probe-name;
+    in property <string> probe-detail;
+    in property <string> probe-kind: "doc";
+    in property <[string]> interface-options: ["All"];
+    in-out property <int> interface-choice;
+    in-out property <string> add-limit-text;
+    in-out property <bool> verify-on;
+    in-out property <int> checksum-algorithm: 1;
+    in-out property <string> checksum-text;
+    /// From Settings: whether finished transfers stay in the default view.
+    in property <bool> keep-completed: true;
+    /// Set by the bridge: fullscreen hides the window controls, so the space
+    /// reserved for them has to go with them.
+    in property <bool> fullscreen;
+    /// What the platform actually granted, never what was asked for.
+    in property <bool> vibrancy;
+
+    property <length> controls-width: root.fullscreen ? 0px : Platform.window-controls-width;
+    out property <length> plot-width: spark.plot-w;
+    out property <length> plot-height: spark.plot-h;
+
+    callback add-download(string);
+    callback probe-url(string);
+    callback choose-destination();
+    callback select-download(int);
+    /// Remove the transfer; the flag says whether its files go with it.
+    callback confirm-remove(int, bool);
+    callback reveal-download(int);
+    callback toggle-inspector();
+    /// Move the selection by one row, for the arrow keys. The bridge owns the
+    /// order the list is in, so it resolves which id that lands on.
+    callback step-selection(int);
+    callback toggle-download(int);
+    callback remove-download(int);
+    callback expand-download(int);
+    callback set-filter(string);
+    callback open-settings();
+    callback quit();
+
+    // Keyboard operation of the list. Wrapped around the whole window rather
+    // than the list itself so the keys work without having to click a row
+    // first: with a selection there is no other thing these keys could mean.
+    //
+    // Typing in the search field or the add sheet must win, so every key is
+    // let through when either has focus.
+    keys := FocusScope {
+        // Focused at startup, so the arrow keys work without clicking a row
+        // first. Anything that takes focus: the search field, the sheet: // takes it back on its own.
+        init => { keys.focus(); }
+
+        key-pressed(event) => {
+            if (root.sheet-open || root.search-focused) {
+                return EventResult.reject;
+            }
+            if (event.text == Key.UpArrow) {
+                root.step-selection(-1);
+                return EventResult.accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.step-selection(1);
+                return EventResult.accept;
+            }
+            if (root.selected-id < 0) {
+                return EventResult.reject;
+            }
+            if (event.text == " ") {
+                root.toggle-download(root.selected-id);
+                return EventResult.accept;
+            }
+            if (event.text == Key.Delete || event.text == Key.Backspace) {
+                root.remove-download(root.selected-id);
+                return EventResult.accept;
+            }
+            if (event.text == Key.Escape && root.removing-id >= 0) {
+                root.removing-id = -1;
+                return EventResult.accept;
+            }
+            if (event.text == Key.Escape) {
+                root.selected-id = -1;
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+
+    HorizontalLayout {
+        // Painted with its own colour rather than left transparent, so it
+        // still reads correctly when the compositor declines vibrancy.
+        Rectangle {
+            width: Platform.sidebar-width;
+            background: root.vibrancy ? Theme.sidebar.transparentize(0.32) : Theme.sidebar;
+
+            Rectangle {
+                x: parent.width - 1px;
+                width: 1px;
+                height: parent.height;
+                background: Theme.border;
+            }
+
+            VerticalLayout {
+                padding: 10px;
+                padding-top: 6px;
+                padding-bottom: 10px;
+                spacing: 0px;
+
+                // Level with the window controls, starting where they end.
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 8px;
+                    padding-left: root.controls-width;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Image {
+                            width: 22px;
+                            height: 22px;
+                            source: @image-url("brand/mark-64.png");
+                            image-fit: contain;
+                        }
+                    }
+                    Text {
+                        text: "Braid";
+                        font-family: Theme.font;
+                        font-size: 15px;
+                        font-weight: 700;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { }
+                }
+
+                Rectangle { height: 14px; }
+                SectionLabel { text: Platform.shouty-sections ? "TRANSFERS" : "Transfers"; }
+                Rectangle { height: 4px; }
+
+                SourceRow {
+                    label: "All"; glyph: "all";
+                    selected: root.filter == "all"; count: root.total-count;
+                    clicked => { root.set-filter("all"); }
+                }
+                SourceRow {
+                    label: "Active"; glyph: "active";
+                    selected: root.filter == "active";
+                    // Matches what the filter shows: a paused transfer is
+                    // still one you started.
+                    count: root.active-count + root.paused-count;
+                    clicked => { root.set-filter("active"); }
+                }
+                SourceRow {
+                    label: "Queued"; glyph: "queued";
+                    selected: root.filter == "queued"; count: root.queued-count;
+                    clicked => { root.set-filter("queued"); }
+                }
+                // Only BitTorrent can put anything in this state, so the
+                // filter stays out of the way until something is in it.
+                if root.seeding-count > 0: SourceRow {
+                    label: "Seeding"; glyph: "seeding";
+                    selected: root.filter == "seeding"; count: root.seeding-count;
+                    clicked => { root.set-filter("seeding"); }
+                }
+                SourceRow {
+                    label: "Completed"; glyph: "done";
+                    selected: root.filter == "done"; count: root.done-count;
+                    clicked => { root.set-filter("done"); }
+                }
+                SourceRow {
+                    label: "Failed"; glyph: "failed";
+                    selected: root.filter == "error"; count: root.failed-count;
+                    clicked => { root.set-filter("error"); }
+                }
+
+                Rectangle { height: 16px; }
+                SectionLabel { text: Platform.shouty-sections ? "INTERFACES" : "Interfaces"; }
+                Rectangle { height: 6px; }
+
+                for name[i] in root.interface-names: InterfaceRow {
+                    name: name;
+                    icon: root.interface-icons[i];
+                    rate: root.interface-rates[i];
+                    fill: root.interface-fills[i];
+                    tint: Theme.interface-colors[Math.mod(i, 5)];
+                }
+
+                Rectangle { }
+                Rectangle { height: 1px; background: Theme.border; }
+                Rectangle { height: 10px; }
+
+                // The total is the sum of the interfaces above it, which is
+                // the whole argument for having a sidebar full of them.
+                SectionLabel { text: Platform.shouty-sections ? "TOTAL" : "Total"; }
+                Rectangle { height: 3px; }
+                HorizontalLayout {
+                    height: 24px;
+                    spacing: 7px;
+                    padding-left: 2px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Path {
+                            width: 11px; height: 13px;
+                            viewbox-width: 11; viewbox-height: 13;
+                            commands: "M 5.5 0.6 L 5.5 12 M 1 7.6 L 5.5 12 L 10 7.6";
+                            stroke: Theme.accent;
+                            stroke-width: 1.7px;
+                        }
+                    }
+                    Text {
+                        text: root.down-total;
+                        font-family: Theme.mono;
+                        font-size: 21px;
+                        font-weight: 600;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { }
+                }
+                // Hidden until something uploads, rather than a permanent zero.
+                if root.has-upload: HorizontalLayout {
+                    height: 22px;
+                    spacing: 7px;
+                    padding-left: 2px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Path {
+                            width: 11px; height: 13px;
+                            viewbox-width: 11; viewbox-height: 13;
+                            commands: "M 5.5 12.4 L 5.5 1 M 1 5.4 L 5.5 1 L 10 5.4";
+                            stroke: Theme.upload;
+                            stroke-width: 1.7px;
+                        }
+                    }
+                    Text {
+                        text: root.up-total;
+                        font-family: Theme.mono;
+                        font-size: 16px;
+                        font-weight: 600;
+                        color: Theme.upload;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { }
+                }
+            }
+        }
+
+        Rectangle {
+            background: Theme.canvas;
+            VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            Rectangle {
+                height: 52px;
+                background: Theme.canvas;
+
+                Rectangle {
+                    y: parent.height - 1px;
+                    width: parent.width;
+                    height: 1px;
+                    background: Theme.border;
+                }
+
+                Rectangle {
+                    width: parent.width;
+                    height: 52px;
+
+                    HorizontalLayout {
+                        padding-left: 18px;
+                        padding-right: 16px;
+                        spacing: 12px;
+
+                        Text {
+                            text: root.filter == "all" ? "Transfers"
+                                : root.filter == "active" ? "Active"
+                                : root.filter == "queued" ? "Queued"
+                                : root.filter == "seeding" ? "Seeding"
+                                : root.filter == "done" ? "Completed"
+                                : "Failed";
+                            font-family: Theme.font;
+                            font-size: 17px;
+                            font-weight: 700;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                        }
+
+                        // The stats travel with the search and the add
+                        // button, not with the title: they are the live state
+                        // of the controls beside them, not a subtitle.
+                        Rectangle { }
+
+                        // Present only while something is transferring. A
+                        // flat line beside a "0 B/s" readout says nothing the
+                        // readout does not, and it looked like a graph that
+                        // had stopped working rather than an idle app.
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 0;
+                            width: 132px;
+                            spark := Sparkline {
+                                // Taller than before: it carries two
+                                // directions about a centre line, so each half
+                                // has what the whole strip used to.
+                                height: 34px;
+                                // Fades rather than collapsing: taking the
+                                // width back shifted the search field and the
+                                // buttons across the moment a transfer began.
+                                opacity: root.transferring ? 1.0 : 0.0;
+                                animate opacity { duration: 220ms; easing: ease-out; }
+                                area: root.chart-area;
+                                line: root.chart-line;
+                                up-area: root.chart-up-area;
+                                up-line: root.chart-up-line;
+                                live: root.active-count > 0;
+                            }
+                        }
+                        search := SearchField {
+                            width: 190px;
+                            y: 12px;
+                            text <=> root.search-text;
+                        }
+
+                        Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            y: 12px;
+                            border-radius: Theme.radius-sm;
+                            background: gear-touch.has-hover ? Theme.border : transparent;
+                            animate background { duration: 120ms; }
+
+                            accessible-role: button;
+                            accessible-label: "Settings";
+                            accessible-action-default => { root.open-settings(); }
+
+                            // A gear, drawn as a ring with eight teeth: the
+                            // glyph is not in every system face and a missing
+                            // one renders as nothing at all.
+                            Rectangle {
+                                x: 8px; y: 8px; width: 12px; height: 12px;
+                                border-radius: 6px;
+                                border-width: 1.5px;
+                                border-color: gear-touch.has-hover ? Theme.text : Theme.text-muted;
+                            }
+                            Path {
+                                x: 5px; y: 5px; width: 18px; height: 18px;
+                                viewbox-width: 18; viewbox-height: 18;
+                                commands: "M 9 0.6 L 9 3 M 9 15 L 9 17.4"
+                                    + " M 0.6 9 L 3 9 M 15 9 L 17.4 9"
+                                    + " M 3.1 3.1 L 4.8 4.8 M 13.2 13.2 L 14.9 14.9"
+                                    + " M 14.9 3.1 L 13.2 4.8 M 4.8 13.2 L 3.1 14.9";
+                                stroke: gear-touch.has-hover ? Theme.text : Theme.text-muted;
+                                stroke-width: 1.5px;
+                            }
+                            gear-touch := TouchArea {
+                                clicked => { root.open-settings(); }
+                            }
+                        }
+
+                        // The split-view toggle, as in the mockup's toolbar.
+                        // Disabled with nothing selected rather than hidden: a
+                        // control that comes and goes as rows are clicked is
+                        // harder to find than one that is simply dim.
+                        Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            y: 12px;
+                            border-radius: Theme.radius-sm;
+                            background: root.inspector-open ? Theme.border
+                                : split-touch.has-hover ? Theme.border.transparentize(0.5)
+                                : transparent;
+                            opacity: root.selected-id >= 0 ? 1.0 : 0.4;
+                            animate background { duration: 120ms; }
+
+                            accessible-role: button;
+                            accessible-label: "Toggle inspector";
+                            accessible-checked: root.inspector-open;
+                            accessible-action-default => { root.toggle-inspector(); }
+
+                            // A pane split off the right of a rectangle. Drawn
+                            // rather than set as text: the SF Symbol is not in
+                            // every system face and a missing glyph renders as
+                            // nothing at all.
+                            Rectangle {
+                                x: 5px; y: 7px; width: 18px; height: 14px;
+                                border-radius: 3px;
+                                border-width: 1.5px;
+                                border-color: root.inspector-open ? Theme.accent : Theme.text-muted;
+                            }
+                            Rectangle {
+                                x: 16px; y: 7px; width: 7px; height: 14px;
+                                border-radius: 3px;
+                                background: root.inspector-open
+                                    ? Theme.accent.transparentize(0.55)
+                                    : Theme.text-muted.transparentize(0.7);
+                            }
+                            split-touch := TouchArea {
+                                enabled: root.selected-id >= 0;
+                                clicked => { root.toggle-inspector(); }
+                            }
+                        }
+
+                        Rectangle {
+                            width: Platform.labelled-add ? 74px : 28px;
+                            height: 28px;
+                            y: 12px;
+                            border-radius: Platform.labelled-add ? Theme.radius-sm : 14px;
+                            background: add-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                            animate background { duration: 120ms; }
+
+                            accessible-role: button;
+                            accessible-label: "Add Download";
+                            accessible-action-default => { root.sheet-open = true; }
+
+                            // The glyph, and on the desktops that label their
+                            // primary action, the word beside it. Drawn from
+                            // the same two bars either way rather than as two
+                            // separate buttons that drift apart.
+                            HorizontalLayout {
+                                padding-left: Platform.labelled-add ? 11px : 8px;
+                                padding-right: Platform.labelled-add ? 12px : 8px;
+                                spacing: 7px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Rectangle {
+                                        width: 12px;
+                                        height: 12px;
+                                        Rectangle {
+                                            y: 5.2px; width: 12px; height: 1.6px;
+                                            border-radius: 0.8px;
+                                            background: Theme.on-accent;
+                                        }
+                                        Rectangle {
+                                            x: 5.2px; width: 1.6px; height: 12px;
+                                            border-radius: 0.8px;
+                                            background: Theme.on-accent;
+                                        }
+                                    }
+                                }
+                                if Platform.labelled-add: Text {
+                                    text: "Add";
+                                    font-family: Theme.font;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: Theme.on-accent;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            add-touch := TouchArea {
+                                clicked => { root.sheet-open = true; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The list takes every remaining pixel, and keeps the same frame
+            // when empty so a fresh window reads as an empty list rather than
+            // a broken screen.
+            HorizontalLayout {
+                vertical-stretch: 1;
+            Rectangle {
+                horizontal-stretch: 1;
+                background: Theme.canvas;
+
+                if root.rows.length == 0: VerticalLayout {
+                    width: parent.width;
+                    height: parent.height;
+                    alignment: center;
+                    spacing: 12px;
+                    HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            width: 64px;
+                            height: 64px;
+                            source: @image-url("brand/mark-256.png");
+                            image-fit: contain;
+                            opacity: 0.16;
+                        }
+                    }
+                    Text {
+                        text: root.filter == "all" ? "No transfers"
+                            : root.filter == "active" ? "Nothing active"
+                            : root.filter == "queued" ? "Nothing queued"
+                            : root.filter == "seeding" ? "Nothing seeding"
+                            : root.filter == "done" ? "Nothing finished yet"
+                            : "Nothing has failed";
+                        font-family: Theme.font;
+                        font-size: 14px;
+                        font-weight: 600;
+                        color: Theme.text-muted;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: root.filter == "all"
+                            ? "Press + to add a download or a torrent."
+                            : "Switch to All to see everything.";
+                        font-family: Theme.font;
+                        font-size: 12px;
+                        color: Theme.text-faint;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                // ListView virtualizes, so row count is not a performance
+                // concern; it does need an explicit size inside a plain
+                // Rectangle, which does no layout of its own.
+                if root.rows.length > 0: ListView {
+                    width: parent.width;
+                    height: parent.height;
+                    for entry[i] in root.rows: Rectangle {
+                        height: entry.depth > 0 ? 30px : Platform.transfer-row-height;
+
+                        if i > 0 && entry.depth == 0: Rectangle {
+                            x: 14px;
+                            y: 0;
+                            width: parent.width - 28px;
+                            height: 1px;
+                            background: Theme.border;
+                        }
+
+                        TransferLine {
+                            width: parent.width;
+                            height: parent.height;
+                            item: entry;
+                            // By id, never by row index: the list is filtered
+                            // and re-sorted underneath the selection ten times
+                            // a second, and an index would quietly come to
+                            // mean a different transfer the moment a row above
+                            // it finishes and leaves.
+                            selected: entry.id == root.selected-id;
+                            select => { root.select-download(entry.id); }
+                            toggle => { root.toggle-download(entry.id); }
+                            remove => { root.remove-download(entry.id); }
+                            expand => { root.expand-download(entry.id); }
+                        }
+                    }
+                }
+            }
+
+            // Fixed width rather than a draggable splitter: the grid is laid
+            // out in whole cells, and a pane that resized continuously would
+            // reflow it on every pixel of the drag.
+            if root.inspector-open && root.selected-id >= 0: Inspector {
+                width: 320px;
+                horizontal-stretch: 0;
+                title: root.inspector-title;
+                subtitle: root.inspector-subtitle;
+                page: root.inspector-page;
+                tab: root.inspector-tab;
+                tabs: root.inspector-tabs;
+                cells: root.inspector-cells;
+                bucket: root.inspector-bucket;
+                have-label: root.inspector-have;
+                stats: root.inspector-stats;
+                interface-names: root.interface-names;
+                interface-rates: root.interface-rates;
+                interface-fills: root.interface-fills;
+                interface-colors: Theme.interface-colors;
+                files: root.inspector-files;
+                peers: root.inspector-peers;
+                peers-column: root.inspector-peers-column;
+                empty-note: root.inspector-empty-note;
+                finished: root.inspector-finished;
+                chose-tab(i) => { root.inspector-tab = i; }
+                reveal => { root.reveal-download(root.selected-id); }
+            }
+            }
+            }
+        }
+    }
+
+    }
+
+    if root.removing-id >= 0: RemoveSheet {
+        width: root.width;
+        height: root.height;
+        filename: root.removing-name;
+        finished: root.removing-finished;
+        keep => {
+            root.confirm-remove(root.removing-id, false);
+            root.removing-id = -1;
+        }
+        erase => {
+            root.confirm-remove(root.removing-id, true);
+            root.removing-id = -1;
+        }
+        cancel => { root.removing-id = -1; }
+    }
+
+    // Last child, so it paints over the window rather than inside a column.
+    if root.sheet-open: AddSheet {
+        width: root.width;
+        height: root.height;
+        url <=> root.url-input;
+        connections <=> root.connections;
+        limit-text <=> root.add-limit-text;
+        verify-on <=> root.verify-on;
+        checksum-algorithm <=> root.checksum-algorithm;
+        checksum-text <=> root.checksum-text;
+        interface-choice <=> root.interface-choice;
+        interface-options: root.interface-options;
+        destination: root.destination;
+        probe-state: root.probe-state;
+        probe-name: root.probe-name;
+        probe-detail: root.probe-detail;
+        probe-kind: root.probe-kind;
+        probe(u) => { root.probe-url(u); }
+        choose-destination => { root.choose-destination(); }
+        cancel => { root.sheet-open = false; }
+        start => {
+            if (root.url-input != "") {
+                root.sheet-open = false;
+                root.add-download(root.url-input);
+            }
+        }
+    }
+}
+
+// A top-level component rather than a child of the window: Slint builds the
+// tray entry from its own instance and it shares no globals, so anything it
+// shows is passed in explicitly.
+export component Tray inherits SystemTrayIcon {
+    in property <int> active;
+    in property <int> queued;
+    in property <string> speed: "0 B/s";
+    /// The label beside the icon, from the menu bar style setting. Empty shows
+    /// the icon alone, which is what most menu bar apps do.
+    in property <string> label;
+    /// From "Show Braid in the menu bar".
+    in property <bool> shown: true;
+
+    callback show-requested();
+    callback quit-requested();
+    callback pause-all();
+
+    visible: root.shown;
+    icon: @image-url("brand/icon-32.png");
+    title: root.label;
+    tooltip: root.active > 0 ? root.active + " transferring · " + root.speed : "Braid";
+
+    // Left-clicking raises the window on Windows and Linux; on macOS AppKit
+    // opens the menu instead, so the menu carries the same action.
+    clicked => { root.show-requested(); }
+
+    Menu {
+        MenuItem {
+            title: root.active + " active · " + root.queued + " queued";
+            enabled: false;
+        }
+        MenuItem {
+            title: "Show transfers";
+            activated => { root.show-requested(); }
+        }
+        MenuItem {
+            title: "Pause all";
+            enabled: root.active > 0;
+            activated => { root.pause-all(); }
+        }
+        MenuItem {
+            title: "Quit";
+            activated => { root.quit-requested(); }
+        }
+    }
+}

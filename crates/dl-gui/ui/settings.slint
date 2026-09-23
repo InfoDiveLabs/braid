@@ -1,0 +1,1131 @@
+// The settings window, built from mockup/macos/settings-*.jpg.
+//
+// A source list on the left and grouped rows on the right, in the shape macOS
+// System Settings uses. All five pages from the mockups are here.
+//
+// Some controls change something the engine cannot honour yet. Those are
+// marked in docs/ui-status.md rather than left out: the mockups are the
+// agreed design, and a half-drawn preferences window is harder to finish than
+// a complete one with a list of what is still inert.
+
+import { Theme } from "theme.slint";
+import { Platform } from "@platform";
+import { ScrollView } from "std-widgets.slint";
+import { LinkGlyph } from "components.slint";
+import {
+    PageRow, Group, Separator, Caption, Toggle, Checkbox, Stepper,
+    Segmented, Button, Field, Dropdown,
+} from "controls.slint";
+
+export struct InterfaceSetting {
+    /// The device id. The identity everywhere else in the app, and what the
+    /// callbacks below carry.
+    name: string,
+    /// What to show: "Wi-Fi (en0)". Presentation only.
+    display: string,
+    /// Kind key for the glyph: "wifi" | "ethernet" | "cellular" | "vpn" |
+    /// "bridge" | "loopback" | "network".
+    icon: string,
+    address: string,
+    binding: string,
+    /// "up" | "metered" | "down"
+    status: string,
+    enabled: bool,
+    /// Rendered as typed: "Unlimited", "5 MB/s", or "-" when excluded.
+    limit: string,
+}
+
+// The source-list glyphs. Drawn rather than imported so they carry the same
+// stroke weight as everything else in the window.
+component NavIcon inherits Rectangle {
+    in property <string> kind;
+    in property <color> ink;
+
+    width: 20px;
+    height: 20px;
+
+    if root.kind == "gear": Path {
+        width: 20px; height: 20px;
+        viewbox-width: 20; viewbox-height: 20;
+        commands: "M 10 5.6 A 4.4 4.4 0 1 1 9.98 5.6"
+            + " M 10 8.1 A 1.9 1.9 0 1 1 9.98 8.1"
+            + " M 10 1.4 L 10 3.6 M 10 16.4 L 10 18.6"
+            + " M 1.4 10 L 3.6 10 M 16.4 10 L 18.6 10"
+            + " M 3.9 3.9 L 5.5 5.5 M 14.5 14.5 L 16.1 16.1"
+            + " M 16.1 3.9 L 14.5 5.5 M 5.5 14.5 L 3.9 16.1";
+        stroke: root.ink;
+        stroke-width: 1.4px;
+    }
+    if root.kind == "globe": Path {
+        width: 20px; height: 20px;
+        viewbox-width: 20; viewbox-height: 20;
+        commands: "M 10 1.8 A 8.2 8.2 0 1 1 9.98 1.8"
+            + " M 10 1.8 A 4.2 8.2 0 1 1 9.98 1.8"
+            + " M 1.8 10 L 18.2 10 M 3.4 5.8 L 16.6 5.8 M 3.4 14.2 L 16.6 14.2";
+        stroke: root.ink;
+        stroke-width: 1.3px;
+    }
+    if root.kind == "gauge": Path {
+        width: 20px; height: 20px;
+        viewbox-width: 20; viewbox-height: 20;
+        commands: "M 10 1.8 A 8.2 8.2 0 1 1 9.98 1.8"
+            + " M 10 10 L 13.8 6.2";
+        stroke: root.ink;
+        stroke-width: 1.4px;
+    }
+    if root.kind == "lock": Path {
+        width: 20px; height: 20px;
+        viewbox-width: 20; viewbox-height: 20;
+        commands: "M 6.4 8.6 L 6.4 6.6 A 3.6 3.6 0 0 1 13.6 6.6 L 13.6 8.6"
+            + " M 4.4 8.8 L 15.6 8.8 L 15.6 17.2 L 4.4 17.2 Z";
+        stroke: root.ink;
+        stroke-width: 1.4px;
+    }
+    if root.kind == "sliders": Path {
+        width: 20px; height: 20px;
+        viewbox-width: 20; viewbox-height: 20;
+        commands: "M 2.4 5.6 L 17.6 5.6 M 2.4 10 L 17.6 10 M 2.4 14.4 L 17.6 14.4"
+            + " M 6.8 3.6 L 6.8 7.6 M 13.2 8 L 13.2 12 M 8.4 12.4 L 8.4 16.4";
+        stroke: root.ink;
+        stroke-width: 1.4px;
+    }
+}
+
+// A caption *inside* a group.
+//
+// `Caption` on its own is for the text that sits under a whole group, flush
+// with its edge. Dropped straight into a group it lands hard against the
+// border while every row above it is inset, which reads as a rendering fault
+// rather than as a note about the row.
+component GroupNote inherits Rectangle {
+    in property <string> text;
+
+    height: note.preferred-height + 12px;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-bottom: 10px;
+        note := Caption {
+            text: root.text;
+            vertical-alignment: top;
+        }
+    }
+}
+
+component SettingsSource inherits Rectangle {
+    in property <string> label;
+    in property <string> icon;
+    in property <bool> selected;
+    callback clicked;
+
+    height: 32px;
+    border-radius: Theme.radius-sm;
+    background: root.selected
+        ? (Platform.solid-selection ? Theme.accent : Theme.accent.transparentize(0.78))
+        : touch.has-hover ? Theme.border.transparentize(0.6) : transparent;
+    animate background { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: root.label + " settings";
+    accessible-action-default => { root.clicked(); }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 9px;
+        VerticalLayout {
+            alignment: center;
+            NavIcon {
+                kind: root.icon;
+                ink: root.selected && Platform.solid-selection ? Theme.on-accent : Theme.accent;
+            }
+        }
+        Text {
+            text: root.label;
+            font-family: Theme.font;
+            font-size: 13px;
+            font-weight: root.selected ? 600 : 400;
+            color: root.selected && Platform.solid-selection ? Theme.on-accent : Theme.text;
+            vertical-alignment: center;
+        }
+        Rectangle { }
+    }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// One interface in the Network table.
+component InterfaceLine inherits Rectangle {
+    in property <InterfaceSetting> iface;
+    callback toggled(bool);
+    callback limit-edited(string);
+
+    height: 42px;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 10px;
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            width: 34px;
+            Checkbox {
+                checked: root.iface.enabled;
+                label: "Use " + root.iface.display;
+                changed(v) => { root.toggled(v); }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: 7px;
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    LinkGlyph {
+                        kind: root.iface.icon;
+                        ink: root.iface.enabled ? Theme.accent : Theme.text-faint;
+                    }
+                }
+                Text {
+                    // The system's name for the link with its device id after
+                    // it. `name` above stays the device id: it is the key for
+                    // the callbacks and for the saved settings.
+                    text: root.iface.display;
+                    font-family: Theme.font;
+                    font-size: 13px;
+                    color: root.iface.enabled ? Theme.text : Theme.text-faint;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    Rectangle {
+                        width: 7px; height: 7px; border-radius: 3.5px;
+                        background: root.iface.status == "up" ? Theme.success
+                            : root.iface.status == "metered" ? Theme.warning
+                            : Theme.text-faint;
+                    }
+                }
+                Rectangle { }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            width: 116px;
+            Text {
+                text: root.iface.address;
+                font-family: Theme.mono;
+                font-size: 11px;
+                color: root.iface.enabled ? Theme.text-muted : Theme.text-faint;
+                overflow: elide;
+            }
+        }
+        // The mechanism actually in force, not the one we asked for: silent
+        // fallback to a plain source-address bind is the failure this whole
+        // feature has, and this is the only place it shows.
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            width: 98px;
+            Text {
+                text: root.iface.binding;
+                font-family: Theme.mono;
+                font-size: 11px;
+                color: Theme.text-faint;
+                overflow: elide;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            width: 86px;
+            Field {
+                text: root.iface.limit;
+                placeholder: "Unlimited";
+                mono: false;
+                enabled: root.iface.enabled;
+                label: root.iface.display + " limit";
+                edited(v) => { root.limit-edited(v); }
+            }
+        }
+    }
+}
+
+export component SettingsWindow inherits Window {
+    title: "Braid Settings";
+    preferred-width: 860px;
+    preferred-height: 600px;
+    min-width: 760px;
+    min-height: 420px;
+    background: Theme.canvas;
+    default-font-family: Theme.font;
+    icon: @image-url("brand/icon-256.png");
+
+    in-out property <bool> dark <=> Theme.dark;
+    in-out property <string> page: "general";
+
+    // General
+    in property <string> destination;
+    /// Empty means partials sit beside the finished file.
+    in property <string> incomplete-dir;
+    in-out property <bool> ask-where;
+    in-out property <int> max-concurrent;
+    in-out property <bool> reveal-on-done;
+    in-out property <bool> sound-on-done;
+    in-out property <bool> keep-completed;
+    in-out property <bool> launch-at-login;
+    in-out property <bool> menu-bar;
+    in-out property <int> menu-bar-style;
+    /// Whether the system agreed to send us magnet links, never what was
+    /// asked for. Reverted by the Rust side when registration fails.
+    in-out property <bool> handle-magnets;
+    /// False in a build with no torrent support compiled in, which greys the
+    /// torrent rows rather than offering switches that cannot do anything.
+    in property <bool> torrents-available;
+    in-out property <bool> seed-after-complete;
+
+    // Network
+    in property <[InterfaceSetting]> interfaces;
+    in-out property <int> proxy-mode;
+    in-out property <string> proxy-server;
+    in-out property <int> dns-mode;
+
+    // Bandwidth
+    in-out property <bool> limited;
+    in-out property <string> limit-text;
+    in-out property <bool> upload-limited;
+    in-out property <string> upload-limit-text;
+    in-out property <bool> schedule-on;
+    in property <[bool]> schedule-cells;
+    in-out property <bool> manual-ignores-limit;
+
+    // Integrity
+    in-out property <bool> verify-every;
+    in-out property <int> checksum-algorithm;
+    in-out property <bool> refetch-damaged;
+    in-out property <int> durability;
+    in-out property <bool> keep-partial;
+    in-out property <int> retries;
+
+    // Advanced
+    in-out property <int> chunk-size;
+    in-out property <int> connections;
+    in-out property <bool> refresh-links;
+    in-out property <int> refresh-cap;
+
+    callback choose-destination();
+    callback choose-incomplete();
+    callback clear-incomplete();
+    callback set-ask-where(bool);
+    callback set-max-concurrent(int);
+    callback set-reveal-on-done(bool);
+    callback set-sound-on-done(bool);
+    callback set-keep-completed(bool);
+    callback set-launch-at-login(bool);
+    callback set-menu-bar(bool);
+    callback set-menu-bar-style(int);
+    callback set-handle-magnets(bool);
+    callback set-seed-after-complete(bool);
+
+    callback set-interface(string, bool);
+    callback set-interface-limit(string, string);
+    callback set-proxy-mode(int);
+    callback set-proxy-server(string);
+    callback set-dns-mode(int);
+
+    callback set-limited(bool);
+    callback set-limit(string);
+    callback set-upload-limited(bool);
+    callback set-upload-limit(string);
+    callback set-schedule-on(bool);
+    callback toggle-slot(int);
+    callback add-window();
+    callback clear-schedule();
+    callback set-manual-ignores-limit(bool);
+
+    callback set-verify-every(bool);
+    callback set-checksum-algorithm(int);
+    callback set-refetch-damaged(bool);
+    callback set-durability(int);
+    callback set-keep-partial(bool);
+    callback set-retries(int);
+
+    callback set-chunk-size(int);
+    callback set-connections(int);
+    callback set-refresh-links(bool);
+    callback set-refresh-cap(int);
+    callback reset-all();
+
+    HorizontalLayout {
+        Rectangle {
+            width: 186px;
+            background: Theme.sidebar;
+            Rectangle {
+                x: parent.width - 1px;
+                width: 1px;
+                height: parent.height;
+                background: Theme.border;
+            }
+            VerticalLayout {
+                padding: 10px;
+                padding-top: 42px;
+                spacing: 2px;
+                SettingsSource {
+                    label: "General"; icon: "gear"; selected: root.page == "general";
+                    clicked => { root.page = "general"; }
+                }
+                SettingsSource {
+                    label: "Network"; icon: "globe"; selected: root.page == "network";
+                    clicked => { root.page = "network"; }
+                }
+                SettingsSource {
+                    label: "Bandwidth"; icon: "gauge"; selected: root.page == "bandwidth";
+                    clicked => { root.page = "bandwidth"; }
+                }
+                SettingsSource {
+                    label: "Integrity"; icon: "lock"; selected: root.page == "integrity";
+                    clicked => { root.page = "integrity"; }
+                }
+                SettingsSource {
+                    label: "Advanced"; icon: "sliders"; selected: root.page == "advanced";
+                    clicked => { root.page = "advanced"; }
+                }
+                Rectangle { }
+            }
+        }
+
+        Rectangle {
+            background: Theme.canvas;
+            VerticalLayout {
+                padding-left: 22px;
+                padding-right: 22px;
+                padding-top: 16px;
+                spacing: 24px;
+
+                Text {
+                    text: root.page == "general" ? "General"
+                        : root.page == "network" ? "Network"
+                        : root.page == "bandwidth" ? "Bandwidth"
+                        : root.page == "integrity" ? "Integrity" : "Advanced";
+                    font-family: Theme.font;
+                    font-size: 17px;
+                    font-weight: 700;
+                    color: Theme.text;
+                }
+
+                scroll := ScrollView {
+                    content-height: body.preferred-height;
+                    body := VerticalLayout {
+                        width: scroll.visible-width;
+                        spacing: 18px;
+                        padding-bottom: 20px;
+                        // Clearance for the scrollbar. Without it the bar is
+                        // drawn over the right border of every group the
+                        // moment a page grows tall enough to need one, and
+                        // only the taller pages look wrong: which is exactly
+                        // the kind of fault that survives a screenshot of the
+                        // page that happens to fit.
+                        padding-right: 14px;
+
+                        // ---------------------------------------- General
+                        if root.page == "general": Group {
+                            title: "DOWNLOADS";
+                            PageRow {
+                                label: "Save files to";
+                                Text {
+                                    text: root.destination;
+                                    font-family: Theme.font;
+                                    font-size: 12px;
+                                    color: Theme.text-muted;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Button {
+                                        label: "Choose…";
+                                        clicked => { root.choose-destination(); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Keep incomplete files in";
+                                detail: root.incomplete-dir == ""
+                                    ? "Beside the finished file, as name.part. Torrents always use the download folder."
+                                    : "Moved to the download folder when finished. Torrents always use the download folder.";
+                                Text {
+                                    text: root.incomplete-dir == ""
+                                        ? "Download folder" : root.incomplete-dir;
+                                    font-family: Theme.font;
+                                    font-size: 12px;
+                                    color: Theme.text-muted;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Button {
+                                        label: root.incomplete-dir == "" ? "Choose…" : "Reset";
+                                        clicked => {
+                                            if (root.incomplete-dir == "") {
+                                                root.choose-incomplete();
+                                            } else {
+                                                root.clear-incomplete();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Ask where to save each file";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.ask-where;
+                                        label: "Ask where to save each file";
+                                        changed(v) => { root.set-ask-where(v); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Maximum concurrent transfers";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Stepper {
+                                        value: root.max-concurrent;
+                                        minimum: 1;
+                                        maximum: 16;
+                                        label: "concurrent transfers";
+                                        changed(v) => { root.set-max-concurrent(v); }
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "general": Group {
+                            title: "WHEN A TRANSFER COMPLETES";
+                            PageRow {
+                                label: "Reveal in " + Platform.file-manager;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.reveal-on-done;
+                                        label: "Reveal in " + Platform.file-manager;
+                                        changed(v) => { root.set-reveal-on-done(v); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Play a sound";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.sound-on-done;
+                                        label: "Play a sound";
+                                        changed(v) => { root.set-sound-on-done(v); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Keep completed transfers in the list";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.keep-completed;
+                                        label: "Keep completed transfers in the list";
+                                        changed(v) => { root.set-keep-completed(v); }
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "general": Group {
+                            title: "SYSTEM";
+                            PageRow {
+                                label: "Launch Braid at login";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.launch-at-login;
+                                        label: "Launch Braid at login";
+                                        changed(v) => { root.set-launch-at-login(v); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: Platform.shouty-sections ? "Menu bar shows" : "Tray icon shows";
+                                enabled: root.menu-bar;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Dropdown {
+                                        options: ["Icon only", "Icon and speed", "Icon and count"];
+                                        selected: root.menu-bar-style;
+                                        enabled: root.menu-bar;
+                                        label: "Menu bar style";
+                                        chose(i) => { root.set-menu-bar-style(i); }
+                                    }
+                                }
+                            }
+                            GroupNote {
+                                text: "A label only appears while something is transferring.";
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Show Braid in the " + Platform.status-area;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.menu-bar;
+                                        label: "Show Braid in the " + Platform.status-area;
+                                        changed(v) => { root.set-menu-bar(v); }
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "general": Group {
+                            title: "TORRENTS";
+                            PageRow {
+                                label: "Handle magnet links";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.handle-magnets;
+                                        enabled: root.torrents-available;
+                                        label: "Handle magnet links";
+                                        changed(v) => { root.set-handle-magnets(v); }
+                                    }
+                                }
+                            }
+                            GroupNote {
+                                text: root.torrents-available
+                                    ? "Opens magnet links and .torrent files in Braid. The switch follows what the system accepted."
+                                    : "This build was compiled without torrent support.";
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Keep seeding after a torrent completes";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.seed-after-complete;
+                                        enabled: root.torrents-available;
+                                        label: "Keep seeding after a torrent completes";
+                                        changed(v) => { root.set-seed-after-complete(v); }
+                                    }
+                                }
+                            }
+                            GroupNote {
+                                text: "Seeding publishes your address to everyone in the swarm. Off, a torrent stops when the last piece arrives.";
+                            }
+                        }
+
+                        // ---------------------------------------- Network
+                        if root.page == "network": Group {
+                            title: "NETWORK INTERFACES";
+                            Rectangle {
+                                height: 30px;
+                                background: Theme.field.transparentize(0.6);
+                                HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    spacing: 10px;
+                                    Text {
+                                        width: 34px;
+                                        text: "Use";
+                                        font-family: Theme.font;
+                                        font-size: 11px;
+                                        color: Theme.text-muted;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: "Interface";
+                                        font-family: Theme.font;
+                                        font-size: 11px;
+                                        color: Theme.text-muted;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        width: 96px;
+                                        text: "Address";
+                                        font-family: Theme.font;
+                                        font-size: 11px;
+                                        color: Theme.text-muted;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        width: 98px;
+                                        text: "Binding";
+                                        font-family: Theme.font;
+                                        font-size: 11px;
+                                        color: Theme.text-muted;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        width: 86px;
+                                        text: "Limit";
+                                        font-family: Theme.font;
+                                        font-size: 11px;
+                                        color: Theme.text-muted;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            for iface[i] in root.interfaces: VerticalLayout {
+                                Separator { }
+                                InterfaceLine {
+                                    iface: iface;
+                                    toggled(v) => { root.set-interface(iface.name, v); }
+                                    limit-edited(v) => { root.set-interface-limit(iface.name, v); }
+                                }
+                            }
+                        }
+                        if root.page == "network": Caption {
+                            text: "Braid binds each connection to the interface you choose. "
+                                + "Unchecked interfaces are never used.";
+                        }
+
+                        if root.page == "network": Group {
+                            title: "PROXY";
+                            PageRow {
+                                label: "Proxy";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Dropdown {
+                                        options: ["System settings", "None", "Manual"];
+                                        selected: root.proxy-mode;
+                                        label: "Proxy mode";
+                                        chose(i) => { root.set-proxy-mode(i); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Proxy server";
+                                enabled: root.proxy-mode == 2;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Field {
+                                        width: 180px;
+                                        text: root.proxy-server;
+                                        placeholder: "host:port";
+                                        enabled: root.proxy-mode == 2;
+                                        label: "Proxy server";
+                                        edited(v) => { root.set-proxy-server(v); }
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "network": Group {
+                            title: "DNS";
+                            PageRow {
+                                label: "Resolve hostnames on";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Dropdown {
+                                        options: ["Fastest interface", "System resolver"];
+                                        selected: root.dns-mode;
+                                        label: "DNS interface";
+                                        chose(i) => { root.set-dns-mode(i); }
+                                    }
+                                }
+                            }
+                        }
+
+                        // -------------------------------------- Bandwidth
+                        if root.page == "bandwidth": Group {
+                            title: "LIMITS";
+                            PageRow {
+                                label: "Download limit";
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Segmented {
+                                        width: 168px;
+                                        options: ["Unlimited", "Custom"];
+                                        selected: root.limited ? 1 : 0;
+                                        chose(i) => { root.set-limited(i == 1); }
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Field {
+                                        width: 96px;
+                                        text: root.limit-text;
+                                        placeholder: "MB/s";
+                                        enabled: root.limited;
+                                        label: "Download limit";
+                                        edited(v) => { root.set-limit(v); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Upload limit";
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Segmented {
+                                        width: 168px;
+                                        options: ["Unlimited", "Custom"];
+                                        selected: root.upload-limited ? 1 : 0;
+                                        chose(i) => { root.set-upload-limited(i == 1); }
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Field {
+                                        width: 96px;
+                                        text: root.upload-limit-text;
+                                        placeholder: "MB/s";
+                                        enabled: root.upload-limited;
+                                        label: "Upload limit";
+                                        edited(v) => { root.set-upload-limit(v); }
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "bandwidth": Group {
+                            title: "SCHEDULE";
+                            PageRow {
+                                label: "Limit bandwidth on a schedule";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.schedule-on;
+                                        label: "Limit bandwidth on a schedule";
+                                        changed(v) => { root.set-schedule-on(v); }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                // Sized from its content, never a constant: a
+                                // fixed height clipped the buttons and the
+                                // caption off the bottom of the group.
+                                height: grid.preferred-height;
+                                opacity: root.schedule-on ? 1.0 : 0.4;
+                                animate opacity { duration: 140ms; }
+                                grid := VerticalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    padding-bottom: 12px;
+                                    spacing: 5px;
+                                    HorizontalLayout {
+                                        height: 15px;
+                                        padding-left: 44px;
+                                        spacing: 6px;
+                                        for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]: Text {
+                                            text: day;
+                                            font-family: Theme.font;
+                                            font-size: 11px;
+                                            color: Theme.text-muted;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+                                    // Eight three-hour slots, so one cell is a
+                                    // block of the day rather than a pixel to
+                                    // aim at.
+                                    for slot in [0, 1, 2, 3, 4, 5, 6, 7]: HorizontalLayout {
+                                        height: 14px;
+                                        spacing: 6px;
+                                        Text {
+                                            width: 38px;
+                                            text: slot == 0 ? "00:00" : slot == 2 ? "06:00"
+                                                : slot == 4 ? "12:00" : slot == 6 ? "18:00" : "";
+                                            font-family: Theme.font;
+                                            font-size: 10px;
+                                            color: Theme.text-faint;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                        }
+                                        for day in [0, 1, 2, 3, 4, 5, 6]: Rectangle {
+                                            border-radius: 4px;
+                                            background: root.schedule-cells[day * 8 + slot]
+                                                ? (cell.has-hover ? Theme.accent-hover : Theme.accent)
+                                                : (cell.has-hover ? Theme.border : Theme.canvas);
+                                            accessible-role: checkbox;
+                                            accessible-label: "Schedule day " + day + " slot " + slot;
+                                            accessible-checked: root.schedule-cells[day * 8 + slot];
+                                            accessible-action-default => { root.toggle-slot(day * 8 + slot); }
+                                            cell := TouchArea {
+                                                clicked => { root.toggle-slot(day * 8 + slot); }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        padding-top: 4px;
+                                        padding-left: 44px;
+                                        spacing: 8px;
+                                        Button {
+                                            label: "Add window";
+                                            enabled: root.schedule-on;
+                                            clicked => { root.add-window(); }
+                                        }
+                                        Button {
+                                            label: "Clear";
+                                            enabled: root.schedule-on;
+                                            clicked => { root.clear-schedule(); }
+                                        }
+                                        Rectangle { }
+                                    }
+                                    Caption {
+                                        text: "Outside these windows Braid runs unlimited.";
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "bandwidth": Group {
+                            title: "RULES";
+                            PageRow {
+                                label: "Ignore limits for transfers I start manually";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.manual-ignores-limit;
+                                        label: "Ignore limits for transfers I start manually";
+                                        changed(v) => { root.set-manual-ignores-limit(v); }
+                                    }
+                                }
+                            }
+                        }
+
+                        // -------------------------------------- Integrity
+                        if root.page == "integrity": Group {
+                            title: "VERIFICATION";
+                            PageRow {
+                                label: "Verify every completed transfer";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.verify-every;
+                                        label: "Verify every completed transfer";
+                                        changed(v) => { root.set-verify-every(v); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Checksum algorithm";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Dropdown {
+                                        options: ["BLAKE3", "SHA-256", "MD5"];
+                                        selected: root.checksum-algorithm;
+                                        label: "Checksum algorithm";
+                                        chose(i) => { root.set-checksum-algorithm(i); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Re-fetch only the damaged part";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.refetch-damaged;
+                                        label: "Re-fetch only the damaged part";
+                                        changed(v) => { root.set-refetch-damaged(v); }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                height: 30px;
+                                HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    Caption {
+                                        text: "Each chunk is hashed as it lands, so a bad one "
+                                            + "is replaced without restarting.";
+                                        vertical-alignment: top;
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "integrity": Group {
+                            title: "DURABILITY";
+                            Rectangle {
+                                height: 44px;
+                                HorizontalLayout {
+                                    padding: 10px;
+                                    Segmented {
+                                        options: ["Safe", "Balanced", "Fast"];
+                                        selected: root.durability;
+                                        chose(i) => { root.set-durability(i); }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                height: 46px;
+                                HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    Caption {
+                                        text: root.durability == 0
+                                            ? "Safe flushes on every completed chunk and survives a "
+                                                + "power cut at the cost of speed."
+                                            : root.durability == 1
+                                            ? "Balanced flushes to disk every 5 seconds or 64 MB. "
+                                                + "A crash costs at most that much re-downloading."
+                                            : "Fast leaves flushing to the operating system. A power "
+                                                + "cut can cost the whole transfer.";
+                                        vertical-alignment: top;
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "integrity": Group {
+                            title: "ON FAILURE";
+                            PageRow {
+                                label: "Keep partial files";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.keep-partial;
+                                        label: "Keep partial files";
+                                        changed(v) => { root.set-keep-partial(v); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Retry automatically";
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Stepper {
+                                        value: root.retries;
+                                        minimum: 0;
+                                        maximum: 20;
+                                        label: "retries";
+                                        changed(v) => { root.set-retries(v); }
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Text {
+                                        text: "times";
+                                        font-family: Theme.font;
+                                        font-size: 12px;
+                                        color: Theme.text-muted;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
+                        // --------------------------------------- Advanced
+                        //
+                        // No mockup exists for this page; the sidebar in the
+                        // approved designs lists it, so it is built from the
+                        // engine knobs that are real and were otherwise
+                        // unreachable.
+                        if root.page == "advanced": Group {
+                            title: "CHUNKING";
+                            PageRow {
+                                label: "Connections per transfer";
+                                detail: "How many ranges are fetched at once by default.";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Stepper {
+                                        value: root.connections;
+                                        minimum: 1;
+                                        maximum: 32;
+                                        label: "connections";
+                                        changed(v) => { root.set-connections(v); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Chunk size";
+                                detail: "Automatic scales the chunk to the file and the connection count.";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Dropdown {
+                                        options: ["Automatic", "1 MB", "4 MB", "16 MB", "64 MB"];
+                                        selected: root.chunk-size;
+                                        label: "Chunk size";
+                                        chose(i) => { root.set-chunk-size(i); }
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "advanced": Group {
+                            title: "EXPIRING LINKS";
+                            PageRow {
+                                label: "Re-resolve links that expire";
+                                detail: "Pre-signed URLs are refreshed before they lapse.";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.refresh-links;
+                                        label: "Re-resolve links that expire";
+                                        changed(v) => { root.set-refresh-links(v); }
+                                    }
+                                }
+                            }
+                            Separator { }
+                            PageRow {
+                                label: "Give up after";
+                                enabled: root.refresh-links;
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Stepper {
+                                        value: root.refresh-cap;
+                                        minimum: 1;
+                                        maximum: 100;
+                                        enabled: root.refresh-links;
+                                        label: "refreshes";
+                                        changed(v) => { root.set-refresh-cap(v); }
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Text {
+                                        text: "refreshes";
+                                        font-family: Theme.font;
+                                        font-size: 12px;
+                                        color: Theme.text-muted;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.page == "advanced": HorizontalLayout {
+                            Button {
+                                label: "Reset all settings";
+                                clicked => { root.reset-all(); }
+                            }
+                            Rectangle { }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

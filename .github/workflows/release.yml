@@ -1,0 +1,134 @@
+name: release
+
+# Native installers, one runner per target: there is no cross-packaging here.
+# A tag builds them all; a manual run builds without publishing, which is how
+# the packaging is exercised without cutting a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      only:
+        description: One platform's installers, for working on the packaging
+        type: choice
+        options: [all, macos, linux, windows]
+        default: all
+
+permissions:
+  contents: write
+
+jobs:
+  # The matrix is built here rather than written inline so a dispatch can ask
+  # for one platform. Packaging is the part of this repository that cannot be
+  # tested from a developer's machine, and iterating on it should not mean
+  # building five installers to look at one.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.pick.outputs.targets }}
+    steps:
+      - id: pick
+        env:
+          ONLY: ${{ inputs.only || 'all' }}
+        run: |
+          # One universal binary for macOS rather than two downloads: `lipo`
+          # joins the two architectures and macOS picks at launch.
+          all='[
+            {"os":"macos-latest","label":"macos-universal","kind":"macos"},
+            {"os":"ubuntu-latest","label":"linux-x86_64","kind":"linux"},
+            {"os":"ubuntu-24.04-arm","label":"linux-aarch64","kind":"linux"},
+            {"os":"windows-latest","label":"windows-x86_64","kind":"windows"},
+            {"os":"windows-11-arm","label":"windows-aarch64","kind":"windows"}
+          ]'
+          if [ "$ONLY" = all ]; then
+            targets=$(echo "$all" | jq -c .)
+          else
+            targets=$(echo "$all" | jq -c --arg kind "$ONLY" '[.[] | select(.kind == $kind)]')
+          fi
+          echo "building: $targets"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: plan
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.targets) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Second macOS architecture
+        if: matrix.kind == 'macos'
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Linux build dependencies
+        if: matrix.kind == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libfontconfig1-dev
+          cargo install cargo-deb cargo-generate-rpm
+
+      # Building cargo-wix from source is minutes that buy nothing after the
+      # first run.
+      - name: Cached cargo-wix
+        id: wix-cache
+        if: matrix.kind == 'windows'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-wix.exe
+          key: cargo-wix-0.3.9-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Windows packaging tool
+        if: matrix.kind == 'windows' && steps.wix-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-wix --version 0.3.9
+
+      # Installed rather than assumed: the x86_64 image ships WiX 3, the ARM
+      # image does not, and pinning it here means both produce an installer
+      # from the same toolset instead of from whatever the image happens to
+      # carry.
+      - name: WiX Toolset
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\wix.zip"
+          Invoke-WebRequest -Uri https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\wix\bin" -Force
+          # cargo-wix looks for candle.exe and light.exe under $WIX\bin.
+          Add-Content -Path $env:GITHUB_ENV -Value "WIX=$env:RUNNER_TEMP\wix"
+
+      - name: Build installer
+        run: cargo run -p xtask --release -- package --out dist
+
+      # Where the release build already happened, so the figure costs nothing
+      # and names the platform it belongs to.
+      - name: Binary size
+        run: cargo run -p xtask --release -- size
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: braid-${{ matrix.label }}
+          path: |
+            dist/*.dmg
+            dist/*.deb
+            dist/*.rpm
+            dist/*.msi
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: true
+          generate_release_notes: true

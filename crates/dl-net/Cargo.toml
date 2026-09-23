@@ -1,0 +1,51 @@
+[package]
+name = "dl-net"
+description = "Interface enumeration, per-NIC socket binding, and HTTP transport."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+devtools = []
+# Tests that need synthetic network interfaces (dummy/feth) and therefore root.
+privileged-tests = []
+
+[dependencies]
+dl-core.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+async-trait = "0.1"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+netdev = "0.46"
+socket2 = { version = "0.6", features = ["all"] }
+
+# default-features = false pins the feature set deliberately. Adding `gzip`,
+# `brotli`, `zstd` or `deflate` here would let reqwest transparently decode a
+# ranged response, making every byte offset wrong. See src/http.rs.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "http2",
+    "charset",
+    "stream",
+    "system-proxy",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation"] }
+
+[dev-dependencies]
+dl-testkit.workspace = true
+async-trait = "0.1"
+blake3 = "1"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tempfile = "3"

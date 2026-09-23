@@ -1,0 +1,144 @@
+[package]
+name = "dl-gui"
+description = "Braid: a download manager that splits one file across every network path you have."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "braid"
+path = "src/main.rs"
+
+# ---------------------------------------------------------------- packaging
+#
+# The desktop entry and the icons are what make an installed application
+# findable in the launcher and offered for a `.torrent`; without them the
+# package installs a binary nobody can reach except from a shell.
+
+[package.metadata.deb]
+name = "braid"
+maintainer = "Suraj Tiwari <surajtiwari020@gmail.com>"
+copyright = "2026, InfoDive Labs Pvt Ltd. <https://www.infodivelabs.com>"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Braid downloads a file over several network paths at once: Wi-Fi, Ethernet \
+and a tethered phone together: and reassembles it exactly. Transfers survive \
+a crash, a reboot and an expiring link, and every chunk is verified as it \
+lands so corruption costs one chunk rather than the file."""
+section = "net"
+priority = "optional"
+assets = [
+    ["../../target/release/braid", "usr/bin/braid", "755"],
+    ["../../target/release/dl", "usr/bin/dl", "755"],
+    ["../../packaging/linux/braid.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/icons/hicolor/16x16/apps/braid.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["../../packaging/linux/icons/hicolor/32x32/apps/braid.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["../../packaging/linux/icons/hicolor/64x64/apps/braid.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../packaging/linux/icons/hicolor/128x128/apps/braid.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["../../packaging/linux/icons/hicolor/256x256/apps/braid.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../../packaging/linux/icons/hicolor/512x512/apps/braid.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["../../README.md", "usr/share/doc/braid/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "braid"
+summary = "A download manager that splits one file across every network path you have."
+license = "GPL-3.0-only"
+assets = [
+    { source = "target/release/braid", dest = "/usr/bin/braid", mode = "755" },
+    { source = "target/release/dl", dest = "/usr/bin/dl", mode = "755" },
+    { source = "packaging/linux/braid.desktop", dest = "/usr/share/applications/braid.desktop", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/16x16/apps/braid.png", dest = "/usr/share/icons/hicolor/16x16/apps/braid.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/32x32/apps/braid.png", dest = "/usr/share/icons/hicolor/32x32/apps/braid.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/64x64/apps/braid.png", dest = "/usr/share/icons/hicolor/64x64/apps/braid.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/128x128/apps/braid.png", dest = "/usr/share/icons/hicolor/128x128/apps/braid.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/256x256/apps/braid.png", dest = "/usr/share/icons/hicolor/256x256/apps/braid.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/512x512/apps/braid.png", dest = "/usr/share/icons/hicolor/512x512/apps/braid.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/braid/README.md", mode = "644", doc = true },
+]
+
+# Unverified: written from WiX's documentation, built by CI, never installed.
+# See README.md.
+[package.metadata.wix]
+# Otherwise the file on disk is named after the crate, and nobody downloads
+# `dl-gui-0.1.0-x86_64.msi` expecting Braid.
+name = "braid"
+upgrade-guid = "6F2C1B84-7A3E-4C29-9B1D-5E8A2D4F7C13"
+path-guid = "9D4E7A21-3C85-4B6F-8E2A-1F7B9C3D5E80"
+license = false
+eula = false
+
+[features]
+# `native-shell` is on by default so a macOS release cannot be built without it
+# by forgetting a flag. It measured at zero bytes: i-slint-backend-winit is
+# already linked via `backend-winit`, and the code is a no-op off macOS. The
+# tradeoff is a dependency on slint's `unstable-winit-030`, which Slint may
+# change in a minor release.
+# `torrent` is on by default because the UI is built around it: the Seeding
+# filter, the upload row and the kind glyph are all drawn in the approved
+# design, and shipping them inert is exactly what docs/ui-status.md exists to
+# stop. Measured at +2.49 MB (12.56 -> 15.05 MB), which leaves headroom under
+# the 20 MB ceiling. `--no-default-features` still builds, and every control it
+# feeds says so rather than doing nothing.
+default = ["native-shell", "torrent"]
+torrent = ["dep:dl-torrent"]
+devtools = ["dep:dl-testkit", "dl-core/devtools"]
+# macOS window integration via the winit escape hatch: a transparent, full-size
+# content view so the traffic lights sit in our own sidebar, plus the optional
+# desktop blur behind the window. A no-op elsewhere. See src/platform.rs.
+native-shell = ["slint/unstable-winit-030", "dep:i-slint-backend-winit"]
+
+[dependencies]
+dl-core.workspace = true
+dl-net.workspace = true
+dl-testkit = { workspace = true, optional = true }
+dl-torrent = { workspace = true, optional = true }
+
+anyhow.workspace = true
+# The system folder chooser. default-features off so Linux uses the XDG portal
+# rather than pulling in GTK.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# default-features=false so a future change to Slint's defaults cannot silently
+# pull in skia (~16MB). accessibility is required for the testing backend's
+# find_by_accessible_label lookups.
+[dependencies.slint]
+version = "1.18.1"
+default-features = false
+features = [
+    "std",
+    "backend-winit",
+    "renderer-femtovg",
+    "renderer-software",
+    "accessibility",
+    "compat-1-2",
+    "system-tray",
+]
+
+# Only for the local wall-clock offset the schedule needs; see src/settings.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Only macOS implements window blur, so this is only ever linked there.
+[target.'cfg(target_os = "macos")'.dependencies.i-slint-backend-winit]
+version = "=1.18.1"
+optional = true
+
+[build-dependencies]
+slint-build = "1.18.1"
+
+[dev-dependencies]
+# The screenshot fixture implements `TorrentBackend`, which is an async trait.
+async-trait = "0.1"
+dl-net.workspace = true
+dl-testkit.workspace = true
+tempfile = "3"
+# Deliberately pinned exactly: this crate does not follow semver and must move
+# in lockstep with `slint`.
+i-slint-backend-testing = "=1.18.1"

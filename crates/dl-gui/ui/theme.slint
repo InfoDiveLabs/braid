@@ -1,0 +1,67 @@
+// Design tokens.
+//
+// The app is styled to look native rather than branded: system typography, the
+// platform's own greys, and its control metrics. Copper survives as the accent,
+// which is the one place an app of this kind is expected to assert itself.
+//
+// The dark values are macOS system colours rather than pixels sampled from a
+// rendered design. A mockup's sidebar picks up whatever its own backdrop was
+// showing through the vibrancy, which is not a colour that exists on anyone's
+// desktop.
+//
+// No fonts are bundled. See ui/platform/ for why.
+
+import { Platform } from "@platform";
+
+export global Theme {
+    in-out property <bool> dark: true;
+
+    // Brand constants, unchanged by appearance: a brand colour that varies
+    // between light and dark is two brand colours.
+    out property <color> copper: #c77a4a;
+    out property <color> verdigris: #3fa292;
+
+    // Surfaces. The sidebar is lighter than the content, as a macOS source
+    // list is; the other desktops invert that and swap these two values.
+    out property <brush> canvas: dark ? #1e1e20 : #ffffff;
+    out property <brush> sidebar: dark ? #2c2c2e : #ecebef;
+    out property <brush> surface: dark ? #262628 : #f5f4f7;
+    out property <brush> field: dark ? #3a3a3c : #ffffff;
+    // Well clear of every container colour: when the track matched the surface
+    // behind it, a transfer at 2% looked like a bar that was not there at all.
+    out property <brush> track: dark ? #48484a : #d8d8dc;
+
+    out property <color> border: dark ? #3a3a3c : #d8d8dc;
+    out property <color> border-strong: dark ? #48484a : #c6c6ca;
+
+    // The system label colours.
+    out property <color> text: dark ? #ebebf0 : #1d1d1f;
+    out property <color> text-muted: dark ? #98989d : #6e6e73;
+    out property <color> text-faint: dark ? #6e6e73 : #98989d;
+
+    out property <color> accent: #c77a4a;
+    out property <color> accent-hover: dark ? #d2895a : #b86f3f;
+    out property <color> on-accent: #ffffff;
+
+    // Upload and seeding are the only things that are not a download, so they
+    // get the only other colour in the system.
+    out property <color> upload: dark ? #3fa292 : #2e8578;
+    out property <color> success: dark ? #3fa292 : #2e8578;
+    out property <color> warning: dark ? #d9a441 : #a6761f;
+    out property <color> danger: dark ? #ff6961 : #d70015;
+
+    // Per-interface identity, so a NIC keeps its colour across the sidebar
+    // meters, the sparkline bands and each row's progress segments.
+    out property <[color]> interface-colors: [#c77a4a, #3fa292, #d9a441, #b5654a, #8a9a6b];
+
+    out property <string> font: Platform.font;
+    // Figures are monospace so digits keep their column while a rate updates
+    // ten times a second.
+    out property <string> mono: Platform.mono;
+
+    out property <length> radius: Platform.panel-radius;
+    out property <length> radius-sm: Platform.control-radius;
+    out property <length> pad: 14px;
+
+    out property <color> shadow: dark ? #00000066 : #00000022;
+}

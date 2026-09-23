@@ -1,0 +1,31 @@
+[package]
+name = "dl-torrent"
+description = "BitTorrent transfers for the download engine, over librqbit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dl-core.workspace = true
+
+anyhow.workspace = true
+async-trait = "0.1"
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "fs"] }
+
+# `http-api-client` is off: it pulls in an HTTP client for talking to another
+# rqbit's REST API, which is not something this app does. `rust-tls` rather
+# than the default `default-tls` so tracker HTTPS goes through the same rustls
+# that dl-net already links, instead of adding native-tls beside it.
+[dependencies.librqbit]
+version = "9.0.1"
+default-features = false
+features = ["rust-tls"]
+
+[dev-dependencies]
+blake3 = "1"
+bytes = "1"
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net"] }

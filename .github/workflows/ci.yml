@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Clippy builds the GUI, so it needs what the GUI links against.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libfontconfig1-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+      # A feature that is only believed to be compiled out is not compiled out.
+      - run: cargo xtask verify-release
+
+  # Both feature configurations are built everywhere. Feature-gated code that CI
+  # does not compile is code that silently rots.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        features: ["--all-features", "--no-default-features"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libfontconfig1-dev
+      - run: cargo test --workspace ${{ matrix.features }}
+
+  # Catches breakage in feature combinations the matrix above never produces.
+  feature-powerset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libfontconfig1-dev
+      - run: cargo hack check --workspace --feature-powerset --depth 2
+
+  # Renders the real UI with no display server via SLINT_BACKEND=headless, and
+  # asserts accessible-values alongside the pixels.
+  screenshots:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libfontconfig1-dev
+      # Drives the real UI against a local mock origin: walks the element tree,
+      # clicks pause, and asserts the row's own state changed. A screenshot
+      # alone cannot distinguish a working UI from a stale snapshot.
+      - run: cargo xtask screenshots --out artifacts/screens
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots-${{ github.sha }}
+          path: artifacts/screens
+
+  # Canary for the real winit + femtovg path, which the headless software
+  # renderer above does not exercise.
+  gui-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libxkbcommon-dev libfontconfig1-dev \
+            libwayland-dev libxcb1-dev libgl1-mesa-dev libegl1-mesa-dev
+      - run: xvfb-run -a cargo test -p dl-gui --all-features
+
+  # Real setsockopt validation needs synthetic interfaces, which need root.
+  # Windows cannot participate: installing a loopback adapter is too invasive.
+  # Added in phase 6; declared now so the job exists before the code does.
+  privileged-net:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Create synthetic interfaces
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo ip link add dum0 type dummy
+            sudo ip addr add 10.99.0.1/24 dev dum0
+            sudo ip link set dum0 up
+            sudo ip link add dum1 type dummy
+            sudo ip addr add 10.99.1.1/24 dev dum1
+            sudo ip link set dum1 up
+          else
+            sudo ifconfig feth0 create
+            sudo ifconfig feth1 create
+            sudo ifconfig feth0 10.99.0.1/24 up
+            sudo ifconfig feth1 10.99.1.1/24 up
+          fi
+      - run: cargo test -p dl-net --features privileged-tests
+        env:
+          DL_TEST_PRIVILEGED: "1"

@@ -1,0 +1,11 @@
+// Single compilation entry point.
+//
+// `slint::include_modules!()` includes only the most recently compiled file, so
+// calling `slint_build::compile` once per `.slint` silently drops every earlier
+// one. Everything Rust needs is re-exported from here and build.rs compiles
+// this file alone.
+
+export { MainWindow, Tray } from "window.slint";
+export { SettingsWindow, InterfaceSetting } from "settings.slint";
+export { TransferRow, Segment } from "components.slint";
+export { InspectorCell, InspectorFile, InspectorPeer, InspectorStat } from "inspector.slint";

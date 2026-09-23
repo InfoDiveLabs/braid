@@ -1,0 +1,52 @@
+[package]
+name = "dl-cli"
+description = "Command-line interface to the download engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dl"
+path = "src/main.rs"
+
+[features]
+# On by default, matching dl-gui: a split where the app opens magnet links and
+# the CLI beside it does not is a surprise nobody benefits from. It costs
+# +2.51 MB (3.36 -> 5.87 MB). Built without it, `dl add <magnet:…>` names the
+# missing feature rather than failing obscurely.
+default = ["torrent"]
+devtools = ["dep:dl-testkit", "dl-core/devtools", "dl-net/devtools"]
+torrent = ["dep:dl-torrent"]
+
+[dependencies]
+dl-core.workspace = true
+dl-net.workspace = true
+dl-testkit = { workspace = true, optional = true }
+dl-torrent = { workspace = true, optional = true }
+
+anyhow.workspace = true
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Only the local wall-clock offset needs it; everything above is portable.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+dl-testkit.workspace = true
+blake3 = "1"
+tempfile = "3"
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "time",
+    "test-util",
+] }

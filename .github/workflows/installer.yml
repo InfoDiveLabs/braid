@@ -1,0 +1,56 @@
+name: installer check
+
+# Does WiX accept the installer definition?
+#
+# Separate from `release` because it answers that question in a couple of
+# minutes rather than twenty. The release workflow builds the application with
+# `lto = "fat"` before it ever reaches WiX, and WiX does not care what is
+# inside the executables it packages: so this stubs them.
+#
+# Runs on a push to any `installer/` branch, which is the loop: change the
+# WiX definition, push, read the error, repeat, without touching main or
+# cutting a release. It proves the definition compiles and links, not that the
+# installer installs anything that runs.
+on:
+  push:
+    branches: ["installer/**"]
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x86_64
+          - os: windows-11-arm
+            label: windows-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Only xtask is built, so the workspace cache is not worth restoring;
+      # cargo-wix is, because building it from source is most of this job.
+      - name: Cached cargo-wix
+        id: wix-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-wix.exe
+          key: cargo-wix-0.3.9-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Windows packaging tool
+        if: steps.wix-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-wix --version 0.3.9
+
+      - name: WiX Toolset
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\wix.zip"
+          Invoke-WebRequest -Uri https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\wix\bin" -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "WIX=$env:RUNNER_TEMP\wix"
+
+      - run: cargo run -p xtask -- installer-check

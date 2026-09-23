@@ -1,0 +1,34 @@
+// Tokens for every target that is not macOS.
+//
+// Same surface as `macos.slint`: build.rs swaps the file, so a token added to
+// one must be added to the other or the UI will not compile on that target.
+// That is deliberate: a missing platform value should be a build error rather
+// than a silent fallback to something that looks wrong.
+export global Platform {
+    // Windows and the Linux desktops draw their title bar outside our content,
+    // so there is nothing to leave room for.
+    out property <length> window-controls-width: 0px;
+
+    out property <string> font: "";
+    out property <string> mono: "monospace";
+
+    out property <length> control-radius: 4px;
+    out property <length> panel-radius: 8px;
+
+    // Fluent and Adwaita both tint the selected row rather than filling it.
+    out property <bool> solid-selection: false;
+    out property <length> sidebar-width: 264px;
+    out property <length> source-row-height: 36px;
+    out property <length> transfer-row-height: 44px;
+
+    // Fluent and Adwaita set section headers in sentence case; only Aqua uses
+    // small caps.
+    out property <bool> shouty-sections: false;
+    // Both desktops label their primary action rather than relying on a glyph.
+    out property <bool> labelled-add: true;
+
+    out property <string> file-manager: "file manager";
+    // "Notification area" on Windows, "system tray" on the Linux desktops;
+    // the shorter name is the one both are actually called in conversation.
+    out property <string> status-area: "system tray";
+}

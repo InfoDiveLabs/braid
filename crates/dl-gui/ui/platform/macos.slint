@@ -1,0 +1,46 @@
+// macOS platform tokens.
+//
+// Selected by build.rs and imported as `@platform`, so these values are
+// compiled in only on this target: there is no runtime branch and no other
+// platform's constants in the binary.
+//
+// Only what genuinely differs between platforms belongs here. Anything shared
+// is a brand or product decision and lives in theme.slint.
+export global Platform {
+    // The window keeps its title bar for dragging and for the traffic lights
+    // but draws nothing. The buttons occupy roughly x 20..72 at the top of the
+    // sidebar, so the brand row sits BESIDE them rather than below: reserving
+    // a full-width band above everything left a strip of dead space and pushed
+    // the whole sidebar down.
+    out property <length> window-controls-width: 80px;
+
+    // Empty means the system UI face, which on macOS is San Francisco. Using
+    // it rather than a bundled family is most of what makes an app look like
+    // it belongs here: and it saved the 788KB two Plex families cost.
+    out property <string> font: "";
+    // Ships with every macOS; SF Mono does not, it comes with Xcode.
+    out property <string> mono: "Menlo";
+
+    // Aqua rounds controls harder than the other desktops.
+    out property <length> control-radius: 6px;
+    out property <length> panel-radius: 10px;
+
+    // A selected source-list row is filled with the accent at full strength
+    // and its label goes white. Windows uses a tint plus an edge pill instead.
+    out property <bool> solid-selection: true;
+    out property <length> sidebar-width: 272px;
+    out property <length> source-row-height: 28px;
+    out property <length> transfer-row-height: 50px;
+
+    // Aqua sets section headers in small caps; Fluent and Adwaita use sentence
+    // case. One token rather than two sidebars.
+    out property <bool> shouty-sections: true;
+    // A round icon button, as every macOS toolbar has.
+    out property <bool> labelled-add: false;
+
+    // What the file manager is called, so "Reveal in Finder" does not appear
+    // on a machine that has no Finder.
+    out property <string> file-manager: "Finder";
+    // And what the strip of status icons is called there.
+    out property <string> status-area: "menu bar";
+}

@@ -1,0 +1,454 @@
+// The control vocabulary shared by the settings window and the add sheet.
+//
+// These are AppKit's controls redrawn rather than std-widgets restyled: the
+// Fluent/Cupertino widget sets bring their own metrics and their own focus
+// rings, which sit badly beside hand-drawn rows.
+//
+// Everything here is presentation only. A control reports what the user did
+// and nothing more: no control reaches into a model, so the same Stepper is
+// the one in Settings and the one in the add sheet.
+
+import { Theme } from "theme.slint";
+import { Platform } from "@platform";
+
+// A labelled row inside a Group. The label column is fixed by the layout and
+// the trailing control is whatever gets passed in.
+export component PageRow inherits Rectangle {
+    in property <string> label;
+    in property <string> detail;
+    in property <bool> enabled: true;
+
+    height: Math.max(40px, row.preferred-height);
+    opacity: root.enabled ? 1.0 : 0.45;
+    animate opacity { duration: 140ms; }
+
+    row := HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 9px;
+        padding-bottom: 9px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.label;
+                font-family: Theme.font;
+                font-size: 13px;
+                color: Theme.text;
+            }
+            if root.detail != "": Text {
+                text: root.detail;
+                font-family: Theme.font;
+                font-size: 11px;
+                color: Theme.text-faint;
+                wrap: word-wrap;
+            }
+        }
+        Rectangle { }
+        @children
+    }
+}
+
+// Rows in one rounded container, in the shape System Settings uses. The
+// hairlines between rows are drawn by the caller with Separator, because only
+// the caller knows which rows are conditional.
+export component Group inherits VerticalLayout {
+    in property <string> title;
+    spacing: 0px;
+
+    if root.title != "": Text {
+        text: root.title;
+        font-family: Theme.font;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        color: Theme.text-faint;
+    }
+    if root.title != "": Rectangle { height: 7px; }
+    Rectangle {
+        border-radius: Theme.radius;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        clip: true;
+        VerticalLayout {
+            width: parent.width;
+            @children
+        }
+    }
+}
+
+export component Separator inherits Rectangle {
+    height: 1px;
+    background: Theme.border;
+}
+
+// A caption under a group, for the sentence that explains what the group does.
+export component Caption inherits Text {
+    font-family: Theme.font;
+    font-size: 11px;
+    color: Theme.text-faint;
+    wrap: word-wrap;
+}
+
+export component Toggle inherits Rectangle {
+    in-out property <bool> on;
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback changed(bool);
+
+    width: 38px;
+    height: 22px;
+    border-radius: 11px;
+    background: root.on ? Theme.accent : Theme.track;
+    opacity: root.enabled ? 1.0 : 0.5;
+    animate background { duration: 140ms; }
+
+    accessible-role: switch;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-checked: root.on;
+    accessible-action-default => { if (root.enabled) { root.changed(!root.on); } }
+
+    Rectangle {
+        x: root.on ? parent.width - self.width - 2px : 2px;
+        y: 2px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: #ffffff;
+        animate x { duration: 140ms; easing: ease-out; }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { root.changed(!root.on); }
+    }
+}
+
+export component Checkbox inherits Rectangle {
+    in property <bool> checked;
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback changed(bool);
+
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    background: root.checked ? Theme.accent : transparent;
+    border-width: root.checked ? 0px : 1px;
+    border-color: Theme.border-strong;
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    accessible-role: checkbox;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-checked: root.checked;
+    accessible-action-default => { if (root.enabled) { root.changed(!root.checked); } }
+
+    if root.checked: Path {
+        x: 3px; y: 4px; width: 10px; height: 8px;
+        viewbox-width: 10; viewbox-height: 8;
+        commands: "M 0.6 4 L 3.6 7 L 9.4 1";
+        stroke: Theme.on-accent;
+        stroke-width: 1.8px;
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { root.changed(!root.checked); }
+    }
+}
+
+// The little up/down chevron pair AppKit puts on steppers and pop-up buttons.
+export component Chevrons inherits Rectangle {
+    in property <color> ink: Theme.text-muted;
+    width: 9px;
+    height: 14px;
+    Path {
+        width: 9px; height: 14px;
+        viewbox-width: 9; viewbox-height: 14;
+        commands: "M 1.2 5.6 L 4.5 2.2 L 7.8 5.6 M 1.2 8.4 L 4.5 11.8 L 7.8 8.4";
+        stroke: root.ink;
+        stroke-width: 1.4px;
+    }
+}
+
+export component Stepper inherits Rectangle {
+    in property <int> value;
+    in property <int> minimum: 1;
+    in property <int> maximum: 32;
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback changed(int);
+
+    width: 62px;
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    background: Theme.field;
+    border-width: 1px;
+    border-color: Theme.border;
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    Text {
+        x: 0;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: root.value;
+        font-family: Theme.mono;
+        font-size: 12px;
+        color: Theme.text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        x: parent.width - 20px;
+        width: 1px;
+        height: parent.height;
+        background: Theme.border;
+    }
+
+    // Two hit targets over one chevron pair: the whole point of a stepper is
+    // that up and down are separate, even though they read as one control.
+    Chevrons {
+        x: parent.width - 15px;
+        y: (parent.height - self.height) / 2;
+        ink: root.enabled ? Theme.text-muted : Theme.text-faint;
+    }
+    Rectangle {
+        x: parent.width - 20px;
+        width: 20px;
+        height: parent.height / 2;
+        accessible-role: button;
+        accessible-label: "More " + root.label;
+        accessible-enabled: root.enabled;
+        accessible-action-default => { root.changed(Math.min(root.maximum, root.value + 1)); }
+        TouchArea {
+            enabled: root.enabled;
+            clicked => { root.changed(Math.min(root.maximum, root.value + 1)); }
+        }
+    }
+    Rectangle {
+        x: parent.width - 20px;
+        y: parent.height / 2;
+        width: 20px;
+        height: parent.height / 2;
+        accessible-role: button;
+        accessible-label: "Fewer " + root.label;
+        accessible-enabled: root.enabled;
+        accessible-action-default => { root.changed(Math.max(root.minimum, root.value - 1)); }
+        TouchArea {
+            enabled: root.enabled;
+            clicked => { root.changed(Math.max(root.minimum, root.value - 1)); }
+        }
+    }
+}
+
+export component Segmented inherits Rectangle {
+    in property <[string]> options;
+    in property <int> selected;
+    in property <bool> enabled: true;
+    callback chose(int);
+
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    background: Theme.field;
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+        for option[i] in root.options: Rectangle {
+            border-radius: Theme.radius-sm - 1px;
+            background: i == root.selected ? Theme.accent : transparent;
+            accessible-role: button;
+            accessible-label: option;
+            accessible-enabled: root.enabled;
+            accessible-action-default => { root.chose(i); }
+            Text {
+                text: option;
+                font-family: Theme.font;
+                font-size: 12px;
+                font-weight: i == root.selected ? 600 : 400;
+                color: i == root.selected ? Theme.on-accent : Theme.text;
+            }
+            TouchArea {
+                enabled: root.enabled;
+                clicked => { root.chose(i); }
+            }
+        }
+    }
+}
+
+export component Button inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    width: Math.max(74px, caption.preferred-width + 24px);
+    height: 26px;
+    border-radius: Theme.radius-sm;
+    background: !root.enabled ? Theme.field
+        : root.primary ? (touch.has-hover ? Theme.accent-hover : Theme.accent)
+        : (touch.has-hover ? Theme.border : Theme.field);
+    border-width: root.primary ? 0px : 1px;
+    border-color: Theme.border;
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+
+    caption := Text {
+        text: root.label;
+        font-family: Theme.font;
+        font-size: 12px;
+        font-weight: root.primary ? 600 : 400;
+        color: !root.enabled ? Theme.text-faint
+            : root.primary ? Theme.on-accent : Theme.text;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component Field inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <bool> mono: true;
+    in property <bool> enabled: true;
+    in property <string> label;
+    out property <bool> focused <=> input.has-focus;
+    callback edited(string);
+    callback accepted();
+
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    background: Theme.field;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.border;
+    opacity: root.enabled ? 1.0 : 0.45;
+    animate border-color { duration: 120ms; }
+
+    input := TextInput {
+        x: 8px;
+        width: parent.width - 16px;
+        height: parent.height;
+        vertical-alignment: center;
+        font-family: root.mono ? Theme.mono : Theme.font;
+        font-size: 12px;
+        color: Theme.text;
+        text <=> root.text;
+        single-line: true;
+        enabled: root.enabled;
+        accessible-role: text-input;
+        accessible-label: root.label;
+        edited => { root.edited(root.text); }
+        accepted => { root.accepted(); }
+    }
+    Text {
+        x: 8px;
+        visible: root.text == "";
+        text: root.placeholder;
+        font-family: root.mono ? Theme.mono : Theme.font;
+        font-size: 12px;
+        color: Theme.text-faint;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+}
+
+// A pop-up button: the current value, chevrons, and a real menu on click.
+export component Dropdown inherits Rectangle {
+    in property <[string]> options;
+    in property <int> selected;
+    in property <bool> enabled: true;
+    in property <string> label;
+    callback chose(int);
+
+    width: Math.max(96px, current.preferred-width + 44px);
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    background: touch.has-hover && root.enabled ? Theme.border : Theme.field;
+    border-width: 1px;
+    border-color: Theme.border;
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    accessible-role: combobox;
+    accessible-label: root.label;
+    accessible-value: root.options[root.selected];
+    accessible-action-default => { if (root.enabled) { menu.show(); } }
+
+    current := Text {
+        x: 10px;
+        height: parent.height;
+        text: root.options[root.selected];
+        font-family: Theme.font;
+        font-size: 12px;
+        color: Theme.text;
+        vertical-alignment: center;
+    }
+    Chevrons {
+        x: parent.width - 18px;
+        y: (parent.height - self.height) / 2;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { menu.show(); }
+    }
+
+    menu := PopupWindow {
+        x: 0;
+        y: parent.height + 2px;
+        width: root.width;
+        height: root.options.length * 26px + 8px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            border-radius: Theme.radius-sm;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 5px;
+            drop-shadow-color: Theme.shadow;
+            VerticalLayout {
+                padding: 4px;
+                for option[i] in root.options: Rectangle {
+                    height: 26px;
+                    border-radius: Theme.radius-sm - 2px;
+                    background: item.has-hover ? Theme.accent : transparent;
+                    accessible-role: button;
+                    accessible-label: option;
+                    accessible-action-default => { root.chose(i); }
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 6px;
+                        Text {
+                            text: option;
+                            font-family: Theme.font;
+                            font-size: 12px;
+                            color: item.has-hover ? Theme.on-accent : Theme.text;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { }
+                        if i == root.selected: Path {
+                            width: 11px; height: 26px;
+                            viewbox-width: 11; viewbox-height: 26;
+                            commands: "M 0.8 13.6 L 4.2 17 L 10.2 9.4";
+                            stroke: item.has-hover ? Theme.on-accent : Theme.accent;
+                            stroke-width: 1.8px;
+                        }
+                    }
+                    item := TouchArea {
+                        clicked => { root.chose(i); }
+                    }
+                }
+            }
+        }
+    }
+}
