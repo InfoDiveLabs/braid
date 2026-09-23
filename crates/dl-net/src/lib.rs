@@ -4,6 +4,7 @@
 //! through traits so the engine is testable with no real sockets.
 
 pub mod bind;
+pub mod control;
 pub mod http;
 pub mod iface;
 pub mod multi;
