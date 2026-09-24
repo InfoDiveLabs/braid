@@ -443,10 +443,67 @@ fn wire_phones(ui: &MainWindow, runtime: tokio::runtime::Handle) {
             // control timeout, and a frozen window reads as a crash.
             handle.spawn(async move {
                 let found = scan_for_relays().await;
+                // Say what happened. An empty list with no explanation reads
+                // as "no phone", when the likeliest cause is that multicast
+                // was refused: on macOS the permission is per application, and
+                // a network can simply drop it.
+                let note = match found.len() {
+                    0 => "Nothing answered. Some networks block discovery, so try the address."
+                        .to_string(),
+                    1 => "Found 1 phone.".to_string(),
+                    n => format!("Found {n} phones."),
+                };
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = weak.upgrade() else { return };
                     ui.set_relays(std::rc::Rc::new(slint::VecModel::from(to_rows(found))).into());
+                    ui.set_phone_scan_note(note.into());
                     ui.set_scanning_phones(false);
+                });
+            });
+        }
+    });
+
+    ui.on_add_phone_by_address({
+        let weak = ui.as_weak();
+        let handle = runtime.clone();
+        move |typed| {
+            let Some(ui) = weak.upgrade() else { return };
+            let address = typed.trim().to_string();
+            if address.is_empty() {
+                return;
+            }
+            ui.set_phone_scan_note("Asking...".into());
+            let weak = weak.clone();
+            handle.spawn(async move {
+                // The same confirmation discovery uses: an address is only a
+                // relay once it says so. Typing a printer's address should
+                // say it is not a phone, not add a lane that never serves.
+                let found = dl_net::discovery::confirm(std::slice::from_ref(&address)).await;
+                let note = if found.is_empty() {
+                    format!("Nothing at {address} answered as a phone.")
+                } else {
+                    format!("Found {}.", found[0].hello.name)
+                };
+
+                // Merge with what is already known rather than replacing it,
+                // so typing an address does not clear a scan's results.
+                let mut rows = scan_for_relays().await;
+                for candidate in found {
+                    if !rows.iter().any(|r| r.address == candidate.address) {
+                        rows.push(Found {
+                            name: candidate.hello.name,
+                            address: candidate.address,
+                            paired: false,
+                            reachable: true,
+                            lanes: Vec::new(),
+                        });
+                    }
+                }
+
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak.upgrade() else { return };
+                    ui.set_relays(std::rc::Rc::new(slint::VecModel::from(to_rows(rows))).into());
+                    ui.set_phone_scan_note(note.into());
                 });
             });
         }

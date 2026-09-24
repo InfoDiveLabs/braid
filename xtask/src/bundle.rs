@@ -133,6 +133,18 @@ fn info_plist() -> String {
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>NSHighResolutionCapable</key><true/>
 
+    <!-- Finding a paired phone means sending and receiving multicast DNS on
+         the local network. Since macOS 15 that is gated: an application which
+         declares neither of these is refused silently, its queries going out
+         and no answer ever arriving, which looks exactly like no phone being
+         there. The usage string is what the person is shown when asked. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Braid looks for paired phones on this network so they can share their connection with your downloads.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_braid-relay._tcp</string>
+    </array>
+
     <key>CFBundleURLTypes</key>
     <array>
         <dict>

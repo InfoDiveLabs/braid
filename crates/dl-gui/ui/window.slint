@@ -498,7 +498,12 @@ component PhoneSheet inherits Rectangle {
     callback pair(int);
     callback forget(int);
     callback set-lane(int, string, bool);
+    callback add-by-address(string);
     callback cancel();
+    in-out property <string> manual-address;
+    /// What the last scan came to, so an empty list is explained rather than
+    /// just empty.
+    in property <string> scan-note;
 
     background: #00000088;
     TouchArea {
@@ -633,12 +638,83 @@ component PhoneSheet inherits Rectangle {
             }
 
             Rectangle { height: 4px; }
+            Rectangle { height: 1px; background: Theme.border; }
+
+            // Typing an address has to stay possible. Discovery depends on
+            // multicast, which plenty of networks drop and which macOS gates
+            // behind a permission, and a person who can read the address off
+            // their phone should never be stuck behind that.
+            Text {
+                text: "Or add one by address";
+                font-family: Theme.font;
+                font-size: 11px;
+                color: Theme.text-muted;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle {
+                    height: 30px;
+                    border-radius: Theme.radius-sm;
+                    background: Theme.field;
+                    border-width: address-input.has-focus ? 2px : 1px;
+                    border-color: address-input.has-focus ? Theme.accent : Theme.border;
+                    animate border-color { duration: 120ms; }
+
+                    address-input := TextInput {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        font-family: Theme.mono;
+                        font-size: 12px;
+                        color: Theme.text;
+                        text <=> root.manual-address;
+                        single-line: true;
+                        accessible-role: text-input;
+                        accessible-label: "Phone address";
+                        accepted => { root.add-by-address(root.manual-address); }
+                    }
+                    Text {
+                        x: 10px;
+                        visible: root.manual-address == "";
+                        // Bracketed, because on an IPv6-only network that is
+                        // the shape the address takes.
+                        text: "[2409:...:9ea5]:8710";
+                        font-family: Theme.mono;
+                        font-size: 12px;
+                        color: Theme.text-faint;
+                        vertical-alignment: center;
+                        height: parent.height;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    Button {
+                        label: "Add";
+                        enabled: root.manual-address != "";
+                        clicked => { root.add-by-address(root.manual-address); }
+                    }
+                }
+            }
+
+            Rectangle { height: 4px; }
             HorizontalLayout {
                 spacing: 8px;
                 Button {
                     label: root.scanning ? "Scanning..." : "Scan";
                     enabled: !root.scanning;
                     clicked => { root.scan(); }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: root.scan-note;
+                        font-family: Theme.font;
+                        font-size: 10px;
+                        color: Theme.text-faint;
+                        wrap: word-wrap;
+                    }
                 }
                 Rectangle { }
                 Button {
@@ -1092,7 +1168,10 @@ export component MainWindow inherits Window {
     in-out property <bool> phones-open;
     in property <[RelayRow]> relays;
     in property <bool> scanning-phones;
+    in property <string> phone-scan-note;
+    in-out property <string> phone-manual-address;
     callback scan-phones();
+    callback add-phone-by-address(string);
     callback pair-phone(int);
     callback forget-phone(int);
     callback set-phone-lane(int, string, bool);
@@ -1701,7 +1780,10 @@ export component MainWindow inherits Window {
         height: 100%;
         relays: root.relays;
         scanning: root.scanning-phones;
+        scan-note: root.phone-scan-note;
+        manual-address <=> root.phone-manual-address;
         scan => { root.scan-phones(); }
+        add-by-address(a) => { root.add-phone-by-address(a); }
         pair(i) => { root.pair-phone(i); }
         forget(i) => { root.forget-phone(i); }
         set-lane(i, lane, on) => { root.set-phone-lane(i, lane, on); }

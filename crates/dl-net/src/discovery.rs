@@ -44,8 +44,20 @@ pub fn tether_candidates(provider: &dyn InterfaceProvider) -> Vec<String> {
             let v6 = interface.gateway_ipv6.map(IpAddr::from);
             [v4, v6].into_iter().flatten()
         })
+        // The same rule as discovery: an address that needs a scope id is not
+        // one we can build a URL from, and `netdev` reports an unspecified
+        // `fe80::` for interfaces that have no gateway at all, which would
+        // otherwise fill the candidate list with a dozen copies of nothing.
+        .filter(|gateway| !is_link_local(gateway) && !is_unspecified(gateway))
         .map(|gateway| endpoint(gateway, RELAY_PORT))
         .collect()
+}
+
+fn is_unspecified(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => v4.is_unspecified(),
+        IpAddr::V6(v6) => v6.is_unspecified(),
+    }
 }
 
 /// An address and port as a URL authority.
@@ -155,6 +167,19 @@ mod tests {
         interface.gateway_ipv6 = Some("fd00::1".parse().unwrap());
         let found = tether_candidates(&FakeInterfaces(vec![interface]));
         assert_eq!(found, vec!["192.168.42.129:8710".to_string(), "[fd00::1]:8710".to_string()]);
+    }
+
+    #[test]
+    fn a_link_local_gateway_is_not_a_candidate() {
+        // Measured: on a hotspot, netdev reports the router's link-local as
+        // the gateway, and reports an unspecified fe80:: for every interface
+        // that has none. Probing either wastes a request and, worse, fills the
+        // list with addresses no URL parser will accept.
+        let mut router = interface("en0", None, false);
+        router.gateway_ipv6 = Some("fe80::6057:c8ff:fe2e:2c64".parse().unwrap());
+        let mut empty = interface("utun0", None, false);
+        empty.gateway_ipv6 = Some("::".parse().unwrap());
+        assert!(tether_candidates(&FakeInterfaces(vec![router, empty])).is_empty());
     }
 
     #[test]
