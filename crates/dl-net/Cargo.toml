@@ -25,7 +25,10 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+mdns-sd = "0.21"
 netdev = "0.46"
+# `time` only: discovery needs a deadline, and reqwest already brings tokio in.
+tokio = { workspace = true, features = ["time"] }
 socket2 = { version = "0.6", features = ["all"] }
 
 # default-features = false pins the feature set deliberately. Adding `gzip`,

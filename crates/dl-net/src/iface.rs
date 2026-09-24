@@ -73,6 +73,13 @@ pub struct Interface {
     /// A NIC with an address but no gateway cannot reach the internet, however
     /// "up" it claims to be.
     pub has_gateway: bool,
+    /// The gateway itself, when the system reports one.
+    ///
+    /// Kept rather than reduced to the flag above because a USB-tethered phone
+    /// *is* the gateway of the link it creates, so this is the address the
+    /// companion is listening on. Discovering it this way needs no Android
+    /// platform tools: ordinary tethering already set the route up.
+    pub gateway_ipv4: Option<Ipv4Addr>,
     pub kind: InterfaceKind,
     /// The system's own name for it: "Wi-Fi", "Thunderbolt 1": when it has
     /// one that says more than the device id does.
@@ -90,6 +97,7 @@ impl Interface {
             is_up: true,
             is_loopback: false,
             has_gateway: false,
+            gateway_ipv4: None,
             kind: InterfaceKind::default(),
             service_name: None,
         }
@@ -181,6 +189,7 @@ impl InterfaceProvider for SystemInterfaces {
                 is_loopback: i.is_loopback(),
                 is_up: i.is_up(),
                 has_gateway: i.gateway.is_some(),
+                gateway_ipv4: i.gateway.as_ref().and_then(|g| g.ipv4.first().copied()),
                 kind: kind_of(i.if_type),
                 service_name: i.friendly_name.clone(),
                 name: i.name,
@@ -309,6 +318,7 @@ mod tests {
             is_up: up,
             is_loopback: loopback,
             has_gateway: !loopback,
+            gateway_ipv4: (!loopback).then(|| "10.0.0.1".parse().unwrap()),
             kind: InterfaceKind::default(),
             service_name: None,
         }
@@ -326,6 +336,7 @@ mod tests {
             is_up: true,
             is_loopback: false,
             has_gateway: true,
+            gateway_ipv4: None,
             kind: InterfaceKind::default(),
             service_name: None,
         };
@@ -343,6 +354,7 @@ mod tests {
             is_up: true,
             is_loopback: false,
             has_gateway: true,
+            gateway_ipv4: None,
             kind: InterfaceKind::default(),
             service_name: None,
         };

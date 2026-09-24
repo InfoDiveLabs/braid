@@ -5,6 +5,7 @@
 
 pub mod bind;
 pub mod control;
+pub mod discovery;
 pub mod http;
 pub mod iface;
 pub mod multi;

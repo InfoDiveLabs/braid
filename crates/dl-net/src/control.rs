@@ -175,6 +175,24 @@ async fn get<T: for<'de> Deserialize<'de>>(
         .map_err(|e| Error::Transport(format!("{address} is not a relay we understand: {e}")))
 }
 
+/// This computer's own public address, asked of a service that echoes it.
+///
+/// Used only to notice that a phone is offering the route we already have. A
+/// failure is not an error: it means no lane is marked duplicate, which shows
+/// someone one more lane than they need rather than hiding one they wanted.
+///
+/// The service is a parameter rather than a constant so that it is testable,
+/// and so a person can point it at something they trust instead of whatever
+/// this project chose.
+pub async fn host_egress(service: &str) -> Option<String> {
+    let client = control_client(CONTROL_TIMEOUT).ok()?;
+    let body = client.get(service).send().await.ok()?.text().await.ok()?;
+    // Whatever it returns has to look like an address. A captive portal
+    // answering with a login page must not become "our" egress and switch off
+    // every lane as a duplicate.
+    body.trim().parse::<std::net::IpAddr>().ok().map(|address| address.to_string())
+}
+
 /// The offered lanes that leave from the same address this computer does.
 ///
 /// Such a lane is the route we already have, wearing a second name. Throughput
@@ -197,6 +215,23 @@ pub fn duplicates_of<'a>(status: &'a Status, host_egress: Option<&str>) -> Vec<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn our_own_address_comes_from_whatever_service_is_named() {
+        let origin =
+            dl_testkit::Origin::spawn(dl_testkit::Scenario::Ok200 { size: 8 }).await.unwrap();
+        // The origin serves bytes, not an address, which is the case that
+        // matters: anything that is not an address must be refused rather
+        // than believed.
+        assert_eq!(host_egress(&origin.url("payload.bin")).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_service_that_is_not_there_costs_nothing() {
+        // Offline, or the service is down. No lane is marked duplicate, which
+        // is the safe direction.
+        assert_eq!(host_egress("http://127.0.0.1:9/ip").await, None);
+    }
 
     fn offered(id: &str, egress: Option<&str>) -> OfferedLane {
         OfferedLane {

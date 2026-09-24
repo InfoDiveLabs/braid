@@ -237,6 +237,7 @@ mod tests {
             is_up: true,
             is_loopback: false,
             has_gateway: gateway,
+            gateway_ipv4: None,
             kind: Default::default(),
             service_name: None,
         }
