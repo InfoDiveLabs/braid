@@ -24,7 +24,9 @@
 ---
 
 <p align="center">
-  <img src="assets/screenshots/transfers.png" alt="Braid on macOS" width="860">
+  <img src="assets/screenshots/transfers.png" alt="Braid on macOS" width="860"><br>
+  <sub><i>A scripted demonstration, not a live desktop.
+  <a href="#screens">What is simulated in these images</a>.</i></sub>
 </p>
 
 ## What it does
@@ -75,6 +77,27 @@ from a different one.
 ---
 
 ## Screens
+
+Every image here is the running application: the real interface, the real
+engine, real transfers with real chunking and a real journal behind them. They
+are captured from a scripted demonstration rather than from someone's desktop,
+and two things in them are staged. Both are named here rather than left for
+you to discover.
+
+**The three network interfaces are one.** The machine these were captured on
+has a single routable interface. The Wi-Fi, Ethernet and USB Tether in the
+sidebar are three connections over loopback wearing those labels, so that the
+part of the interface built to display aggregation has something to display.
+The mechanism is real and tested; the three separate paths in the picture are
+not.
+
+**The torrent's swarm is simulated.** Its peer count, throughput and file list
+come from a stand-in backend rather than from a real swarm.
+
+Everything else is what it appears to be. The transfers are genuine downloads
+performed by the engine against a local test server, which is why the inspector
+reports `127.0.0.1`, and the piece grid is the journal's own bitmap rather than
+a drawing of one.
 
 <table>
 <tr>
