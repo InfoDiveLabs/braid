@@ -19,8 +19,8 @@ use dl_core::budget::Budget;
 use dl_core::engine::{DownloadSpec, Engine, SourceFactory};
 use dl_core::lane::LaneSet;
 use dl_gui::{
-    InterfaceSetting, MainWindow, SettingsWindow, Tray, bridge, platform, relays, settings,
-    transfers,
+    InterfaceSetting, MainWindow, RelayLaneRow, RelayRow, SettingsWindow, Tray, bridge, platform,
+    relays, settings, transfers,
 };
 use dl_net::{HttpConfig, HttpSource, SystemInterfaces};
 use slint::{ComponentHandle as _, Model as _};
@@ -173,12 +173,185 @@ fn download_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
+/// One phone as the scan found it.
+///
+/// Plain data on purpose. A Slint model is not `Send`, so nothing built from
+/// one may cross a thread boundary: the scan returns this and the event loop
+/// turns it into rows.
+struct Found {
+    name: String,
+    address: String,
+    paired: bool,
+    reachable: bool,
+    lanes: Vec<FoundLane>,
+}
+
+struct FoundLane {
+    id: String,
+    label: String,
+    icon: &'static str,
+    note: String,
+    on: bool,
+    duplicate: bool,
+}
+
+/// Build the model, on the thread that owns it.
+fn to_rows(found: Vec<Found>) -> Vec<RelayRow> {
+    found
+        .into_iter()
+        .map(|phone| {
+            let lanes: Vec<RelayLaneRow> = phone
+                .lanes
+                .into_iter()
+                .map(|lane| RelayLaneRow {
+                    id: lane.id.into(),
+                    label: lane.label.into(),
+                    icon: lane.icon.into(),
+                    note: lane.note.into(),
+                    on: lane.on,
+                    duplicate: lane.duplicate,
+                })
+                .collect();
+            RelayRow {
+                name: phone.name.into(),
+                address: phone.address.into(),
+                paired: phone.paired,
+                reachable: phone.reachable,
+                lanes: std::rc::Rc::new(slint::VecModel::from(lanes)).into(),
+            }
+        })
+        .collect()
+}
+
+/// Everything discoverable right now, paired or not.
+///
+/// mDNS first, then the gateway of every link that might be a tethered phone.
+/// Both end at `/braid/hello`, which is what separates a companion from a
+/// router that happened to accept a connection.
+async fn scan_for_relays() -> Vec<Found> {
+    let mut found = dl_net::discovery::browse(std::time::Duration::from_secs(3)).await;
+    let tethered = dl_net::discovery::tether_candidates(&dl_net::SystemInterfaces);
+    for candidate in dl_net::discovery::confirm(&tethered).await {
+        if !found.iter().any(|c| c.hello.device_id == candidate.hello.device_id) {
+            found.push(candidate);
+        }
+    }
+
+    let paired = relays::load();
+    let ours = dl_net::control::host_egress(settings::EGRESS_SERVICE).await;
+    let mut rows = Vec::new();
+
+    for entry in &paired {
+        let reachable = found.iter().any(|c| c.address == entry.relay.address);
+        rows.push(row_for(entry, reachable, ours.as_deref()).await);
+    }
+
+    // Then anything discovered that is not paired yet, so there is something
+    // to press Pair on.
+    for candidate in found {
+        if paired.iter().any(|p| p.relay.address == candidate.address) {
+            continue;
+        }
+        rows.push(Found {
+            name: candidate.hello.name,
+            address: candidate.address,
+            paired: false,
+            reachable: true,
+            lanes: Vec::new(),
+        });
+    }
+    rows
+}
+
+/// One paired phone, with whatever it says it is offering.
+async fn row_for(entry: &relays::Paired, reachable: bool, ours: Option<&str>) -> Found {
+    let status = dl_net::control::status(&entry.relay.address, entry.relay.key.as_deref())
+        .await
+        .unwrap_or_default();
+    let duplicates = dl_net::control::duplicates_of(&status, ours);
+
+    let lanes: Vec<FoundLane> = status
+        .lanes
+        .iter()
+        .map(|lane| FoundLane {
+            id: lane.id.clone(),
+            label: lane.label.clone(),
+            icon: icon_for(lane.kind),
+            note: lane.note.clone().unwrap_or_default(),
+            on: entry.enabled.contains(&lane.id),
+            duplicate: duplicates.iter().any(|d| d.id == lane.id),
+        })
+        .collect();
+
+    Found {
+        name: entry.relay.name.clone(),
+        address: entry.relay.address.clone(),
+        paired: entry.relay.key.is_some(),
+        reachable,
+        lanes,
+    }
+}
+
+/// The list as it stands before anything is scanned, so opening the page shows
+/// the phones already paired rather than an empty panel.
+fn rows_for_paired(paired: &[relays::Paired]) -> Vec<RelayRow> {
+    to_rows(
+        paired
+            .iter()
+            .map(|entry| Found {
+                name: entry.relay.name.clone(),
+                address: entry.relay.address.clone(),
+                paired: entry.relay.key.is_some(),
+                // Unknown until something is asked, and claiming otherwise
+                // would be a guess shown as a fact.
+                reachable: false,
+                lanes: Vec::new(),
+            })
+            .collect(),
+    )
+}
+
+/// Which glyph a lane gets, reusing the interface icon keys so a phone's
+/// cellular lane looks like a cellular card.
+fn icon_for(kind: dl_net::control::LaneKind) -> &'static str {
+    use dl_net::control::LaneKind;
+    match kind {
+        LaneKind::Cellular => "cellular",
+        LaneKind::Wifi => "wifi",
+        LaneKind::Ethernet => "ethernet",
+        LaneKind::Unknown => "network",
+    }
+}
+
+/// What to call this computer when asking a phone to trust it.
+///
+/// Shown on the phone's screen, so it has to mean something to the person
+/// holding it.
+fn whoami() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "A computer".to_string())
+}
+
 /// Build the settings window and connect every control in it.
 ///
 /// The window is created once and shown again on each request rather than
 /// rebuilt: a settings window that forgets which page you were on is a small
 /// thing that feels broken.
-fn wire_settings(ui: &MainWindow, config: settings::Shared, usable: Vec<dl_net::Interface>) {
+fn wire_settings(
+    ui: &MainWindow,
+    config: settings::Shared,
+    usable: Vec<dl_net::Interface>,
+    runtime: tokio::runtime::Handle,
+) {
     let window = match SettingsWindow::new() {
         Ok(window) => window,
         Err(error) => {
@@ -330,6 +503,116 @@ fn wire_settings(ui: &MainWindow, config: settings::Shared, usable: Vec<dl_net::
             if let Some(window) = weak.upgrade() {
                 window.set_max_concurrent(value);
             }
+        }
+    });
+
+    let relay_rows = std::rc::Rc::new(slint::VecModel::from(rows_for_paired(&relays::load())));
+    window.set_relays(relay_rows.clone().into());
+
+    // -------------------------------------------------------------- Phones
+
+    window.on_scan({
+        let weak = window.as_weak();
+        let handle = runtime.clone();
+        move || {
+            let Some(window) = weak.upgrade() else { return };
+            window.set_scanning(true);
+            let weak = weak.clone();
+            // Off the event loop. A phone that is asleep takes the full
+            // control timeout, and a frozen settings window reads as a crash.
+            handle.spawn(async move {
+                let found = scan_for_relays().await;
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(window) = weak.upgrade() else { return };
+                    window
+                        .set_relays(std::rc::Rc::new(slint::VecModel::from(to_rows(found))).into());
+                    window.set_scanning(false);
+                });
+            });
+        }
+    });
+
+    window.on_pair({
+        let handle = runtime.clone();
+        let weak = window.as_weak();
+        let rows = relay_rows.clone();
+        move |index| {
+            let Some(row) = rows.row_data(index as usize) else { return };
+            let address = row.address.to_string();
+            let name = row.name.to_string();
+            let weak = weak.clone();
+            // Sits until someone taps accept on the phone, so this cannot be
+            // on the event loop either.
+            handle.spawn(async move {
+                let desktop = whoami();
+                let Ok(outcome) = dl_net::control::pair(&address, &desktop).await else {
+                    tracing::warn!(%address, "pairing was refused or timed out");
+                    return;
+                };
+                let hello = dl_net::control::hello(&address).await.ok();
+                let mut paired = relays::load();
+                paired.retain(|p| p.relay.address != address);
+                paired.push(relays::Paired {
+                    relay: dl_net::Relay::new(name, address, Some(outcome.key)),
+                    device_id: hello.map(|h| h.device_id).unwrap_or_default(),
+                    // Nothing on by default. A lane that spends someone's
+                    // money is switched on by them, not by pairing.
+                    enabled: Vec::new(),
+                });
+                relays::save(&paired);
+                let refreshed = scan_for_relays().await;
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(window) = weak.upgrade() else { return };
+                    window.set_relays(
+                        std::rc::Rc::new(slint::VecModel::from(to_rows(refreshed))).into(),
+                    );
+                });
+            });
+        }
+    });
+
+    window.on_forget({
+        let rows = relay_rows.clone();
+        move |index| {
+            let Some(row) = rows.row_data(index as usize) else { return };
+            let address = row.address.to_string();
+            let mut paired = relays::load();
+            paired.retain(|p| p.relay.address != address);
+            relays::save(&paired);
+            rows.set_vec(rows_for_paired(&paired));
+        }
+    });
+
+    window.on_set_lane({
+        let rows = relay_rows.clone();
+        move |index, lane, on| {
+            let Some(row) = rows.row_data(index as usize) else { return };
+            let address = row.address.to_string();
+            let lane = lane.to_string();
+            let mut paired = relays::load();
+            if let Some(entry) = paired.iter_mut().find(|p| p.relay.address == address) {
+                entry.enabled.retain(|id| *id != lane);
+                if on {
+                    entry.enabled.push(lane.clone());
+                }
+            }
+            relays::save(&paired);
+
+            // Reflect it immediately rather than waiting for a rescan: a
+            // toggle that does not move has been pressed twice by everyone.
+            let mut row = row;
+            let lanes: Vec<RelayLaneRow> = row
+                .lanes
+                .iter()
+                .map(|mut l| {
+                    if l.id == lane.as_str() {
+                        l.on = on;
+                    }
+                    l
+                })
+                .collect();
+            row.lanes = std::rc::Rc::new(slint::VecModel::from(lanes)).into();
+            rows.set_row_data(index as usize, row);
         }
     });
 
@@ -1220,7 +1503,7 @@ fn main() -> Result<()> {
     // The schedule owns the global budget from here on, so the manual limit
     // and the timetable can never disagree about which one is in force.
     settings::spawn_scheduler(config.clone(), engine.budget().clone());
-    wire_settings(&ui, config, usable);
+    wire_settings(&ui, config, usable, runtime.handle().clone());
     ui.run()?;
     Ok(())
 }

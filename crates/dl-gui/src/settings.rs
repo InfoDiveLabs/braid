@@ -21,6 +21,13 @@ pub const SLOT_HOURS: u32 = 3;
 /// Cells per day: 24 hours in three-hour slots.
 pub const SLOTS_PER_DAY: usize = (24 / SLOT_HOURS) as usize;
 /// The whole grid, day-major, so cell `d * SLOTS_PER_DAY + s` is day `d`.
+/// Where to ask for this computer's own public address.
+///
+/// Used only to notice that a phone is offering the route this computer
+/// already has. Failing to reach it costs nothing: no lane is marked as a
+/// duplicate, which shows one lane too many rather than hiding a useful one.
+pub const EGRESS_SERVICE: &str = "https://api.ipify.org";
+
 pub const SCHEDULE_CELLS: usize = 7 * SLOTS_PER_DAY;
 
 /// How often the schedule is re-evaluated. Windows have minute resolution, so

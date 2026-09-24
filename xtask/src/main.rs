@@ -313,7 +313,7 @@ fn settings(out: &std::path::Path, port: u16) -> Result<()> {
     let binary = app::HeadlessApp::build_example(false, "settings")?;
     std::fs::create_dir_all(out)?;
 
-    for page in ["general", "network", "bandwidth", "integrity", "advanced"] {
+    for page in ["general", "network", "relays", "bandwidth", "integrity", "advanced"] {
         let app = app::HeadlessApp::launch_with_args(&binary, port, &["--page", page])?;
         let window = app.mcp.first_window()?;
         let root = app.mcp.root_element(&window)?;
