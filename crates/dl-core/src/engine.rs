@@ -236,9 +236,11 @@ struct Record {
 /// readout unreadable and let a single burst set the graph's axis so that
 /// everything after it drew as a flat line near zero.
 ///
-/// Short, because the HTTP path now smooths per lane before it reports: two
-/// filters in series took two and a half seconds to follow a change, which is
-/// long enough that switching networks looked like nothing had happened.
+/// The HTTP path already reports a plain mean over the last second, so for a
+/// download this only takes the last of the edge off an already steady figure.
+/// It earns its keep on the torrent backend, which reports raw instantaneous
+/// rates: without it one spike sets the graph's axis and everything after it
+/// draws as a flat line near zero.
 const RATE_TAU: Duration = Duration::from_millis(600);
 
 impl Record {

@@ -11,12 +11,19 @@
 //! be handed work.
 
 use crate::source::ByteSource;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Weight given to each new measurement. Low enough to ride out one slow
-/// chunk, high enough to notice an interface that has actually degraded.
-const EWMA_ALPHA: f64 = 0.3;
+/// How much of the recent past a lane's rate describes.
+///
+/// A plain mean over a fixed window rather than an exponential filter, which
+/// is what this used to be. The figure then means something a person can check
+/// against a stopwatch: bytes that arrived in the last second. It also settles
+/// rather than chasing, and on a link that genuinely swings between twenty-five
+/// and seventy megabytes a second the readout was following every one of those
+/// swings and reading as broken.
+const RATE_WINDOW: Duration = Duration::from_secs(1);
 
 /// Consecutive failures before a lane is taken out of rotation.
 const FAILURES_BEFORE_PARKED: u32 = 3;
@@ -90,12 +97,22 @@ impl LaneSet for SingleLane<'_> {
     }
 }
 
-/// Fold a rate observation into a lane's smoothed estimate.
-fn fold(entry: &mut LaneState, sample: f64) {
-    entry.throughput = Some(match entry.throughput {
-        Some(previous) => previous * (1.0 - EWMA_ALPHA) + sample * EWMA_ALPHA,
-        None => sample,
-    });
+/// Record one closed window and recompute the lane's rate from the last
+/// [`RATE_WINDOW`] of them.
+fn fold(entry: &mut LaneState, bytes: u64, over: Duration) {
+    entry.recent.push_back((bytes, over));
+    let mut span: Duration = entry.recent.iter().map(|(_, d)| *d).sum();
+    // Drop from the front while the rest still covers the window, so the mean
+    // is always over at least a window and never over much more.
+    while let Some((_, oldest)) = entry.recent.front().copied() {
+        if entry.recent.len() < 2 || span - oldest < RATE_WINDOW {
+            break;
+        }
+        entry.recent.pop_front();
+        span -= oldest;
+    }
+    let carried: u64 = entry.recent.iter().map(|(b, _)| *b).sum();
+    entry.throughput = (span > Duration::ZERO).then(|| carried as f64 / span.as_secs_f64());
 }
 
 /// Close the current measurement window if it has run its course.
@@ -117,7 +134,7 @@ fn sample(entry: &mut LaneState, now: Instant) {
     if elapsed < SAMPLE_WINDOW {
         return;
     }
-    fold(entry, entry.live_bytes as f64 / elapsed.as_secs_f64());
+    fold(entry, entry.live_bytes, elapsed);
     entry.live_bytes = 0;
     entry.live_at = Some(now);
 }
@@ -131,6 +148,8 @@ struct LaneState {
     /// Bytes seen since the open window began, and when it began.
     live_bytes: u64,
     live_at: Option<Instant>,
+    /// Closed windows, oldest first, covering about [`RATE_WINDOW`].
+    recent: VecDeque<(u64, Duration)>,
     chunks: u64,
     consecutive_failures: u32,
     parked: bool,
@@ -373,7 +392,7 @@ impl LaneSelector {
             let Some(opened) = entry.live_at.take() else { continue };
             let elapsed = now.duration_since(opened);
             if entry.live_bytes > 0 && elapsed > Duration::ZERO {
-                fold(entry, entry.live_bytes as f64 / elapsed.as_secs_f64());
+                fold(entry, entry.live_bytes, elapsed);
             }
             entry.live_bytes = 0;
         }
@@ -479,6 +498,56 @@ mod tests {
         let reported: f64 = s.reports_at(now).iter().filter_map(|r| r.throughput).sum();
         assert!((reported - s.aggregate_throughput_at(now)).abs() < 1.0);
         assert!((reported - 12_900_000.0).abs() < 1.0, "got {reported}");
+    }
+
+    #[test]
+    fn the_rate_is_a_plain_mean_over_the_last_second() {
+        // A figure someone can check against a stopwatch, rather than the
+        // output of a filter. Ten megabytes arrived in the last second, so the
+        // lane reads ten megabytes a second.
+        let s = selector(1);
+        let now = Instant::now();
+        let mut at = now - RATE_WINDOW;
+        for _ in 0..4 {
+            s.progressed_at(0, 2_500_000, at);
+            at += SAMPLE_WINDOW;
+        }
+        let measured = rate_of(&s, 0, at);
+        assert!((measured - 10_000_000.0).abs() < 200_000.0, "got {measured}");
+    }
+
+    #[test]
+    fn a_burst_does_not_throw_the_reading() {
+        // The complaint: a link swinging between a quarter and the whole of
+        // its capacity had a readout chasing every swing. A mean over a second
+        // settles on the middle instead of following the peaks.
+        let s = selector(1);
+        let mut at = Instant::now();
+        // Four quarter-seconds carrying wildly different amounts.
+        for bytes in [1_000_000u64, 9_000_000, 1_000_000, 9_000_000] {
+            s.progressed_at(0, bytes, at);
+            at += SAMPLE_WINDOW;
+        }
+        let measured = rate_of(&s, 0, at);
+        assert!((measured - 20_000_000.0).abs() < 500_000.0, "got {measured}");
+    }
+
+    #[test]
+    fn the_window_does_not_grow_past_a_second() {
+        // Otherwise a long transfer would average over minutes and stop
+        // describing now at all, which is what the very first version did.
+        let s = selector(1);
+        let mut at = Instant::now();
+        for _ in 0..40 {
+            s.progressed_at(0, 1_000_000, at);
+            at += SAMPLE_WINDOW;
+        }
+        // Then the link stops dead for a second.
+        for _ in 0..4 {
+            at += SAMPLE_WINDOW;
+            s.reports_at(at);
+        }
+        assert!(rate_of(&s, 0, at) < 100_000.0, "still reporting {}", rate_of(&s, 0, at));
     }
 
     #[test]
