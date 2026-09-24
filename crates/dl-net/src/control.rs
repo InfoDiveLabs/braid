@@ -296,6 +296,28 @@ mod tests {
     }
 
     #[test]
+    fn the_rule_gives_the_right_answer_on_a_real_phone() {
+        // Measured on a Pixel 7 Pro and a Mac at the same moment, on an
+        // IPv6-only carrier. Every IPv4 address here differs from every other,
+        // so an IPv4-only rule flags nothing and the Wi-Fi lane looks like a
+        // second path when it is the Mac's own. The prefixes tell the truth:
+        // the Wi-Fi lane shares the Mac's /64 and the cellular one does not.
+        let status = Status {
+            lanes: vec![
+                both("cell", "152.59.146.27", "2409:40e4:110a:6fcb:8000::"),
+                both("wifi", "152.59.168.85", "2409:40e4:2004:769a:4145:fce6:3676:33de"),
+            ],
+        };
+        let host = HostEgress {
+            v4: Some("152.59.170.29".into()),
+            v6: Some("2409:40e4:2004:769a:f81a:202c:25f6:c0f0".into()),
+        };
+
+        let same: Vec<&str> = duplicates_of(&status, &host).iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(same, vec!["wifi"], "the phone's Wi-Fi is the route this computer already has");
+    }
+
+    #[test]
     fn a_different_prefix_is_a_different_link() {
         let status =
             Status { lanes: vec![both("cell", "152.59.146.101", "2409:40e4:110a:6fcb:1:2:3:4")] };
