@@ -18,11 +18,11 @@ use anyhow::Result;
 use dl_core::budget::Budget;
 use dl_core::engine::{DownloadSpec, Engine, SourceFactory};
 use dl_core::lane::LaneSet;
-use dl_core::source::ByteSource;
 use dl_gui::{
-    InterfaceSetting, MainWindow, SettingsWindow, Tray, bridge, platform, settings, transfers,
+    InterfaceSetting, MainWindow, SettingsWindow, Tray, bridge, platform, relays, settings,
+    transfers,
 };
-use dl_net::{HttpConfig, HttpSource, InterfaceLanes, SystemInterfaces};
+use dl_net::{HttpConfig, HttpSource, SystemInterfaces};
 use slint::{ComponentHandle as _, Model as _};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -45,29 +45,47 @@ struct HttpFactory {
     default_lane: String,
 }
 
-struct SingleSource {
-    source: HttpSource,
-    label: String,
-}
+/// Which paths a transfer should use.
+///
+/// Pure, so the rule can be exercised without a network, an engine or a phone.
+/// The rule: every selected interface, then every enabled lane of every paired
+/// relay, and if that comes to nothing, the default route, because a transfer
+/// with no lanes is a transfer that silently does not happen.
+fn paths_for(
+    interfaces: &[String],
+    relays: &[relays::Paired],
+    default_lane: &str,
+) -> Vec<dl_net::path::Path> {
+    use dl_net::path::Path;
 
-impl LaneSet for SingleSource {
-    fn len(&self) -> usize {
-        1
+    let mut paths: Vec<Path> =
+        interfaces.iter().map(|name| Path::Interface(name.clone())).collect();
+
+    for paired in relays {
+        // A relay with no key has been seen, not authorised. Using it would
+        // earn a 407 for every chunk before the lane was finally parked.
+        if paired.relay.key.is_none() {
+            continue;
+        }
+        for network in &paired.enabled {
+            paths.push(Path::Relay { relay: paired.relay.clone(), network: network.clone() });
+        }
     }
-    fn source(&self, _lane: usize) -> &dyn ByteSource {
-        &self.source
+
+    if paths.is_empty() {
+        // The label the sidebar will show for it, which is the interface the
+        // OS will actually pick rather than an invented "default" NIC.
+        tracing::debug!(%default_lane, "no path chosen; letting the OS route");
+        paths.push(Path::Default);
     }
-    fn label(&self, _lane: usize) -> &str {
-        &self.label
-    }
+    paths
 }
 
 impl SourceFactory for HttpFactory {
     fn lanes_for(&self, spec: &DownloadSpec) -> dl_core::Result<Box<dyn LaneSet>> {
         // The spec wins if it named interfaces; otherwise the app-wide
-        // selection applies, and only if that is empty do we let the OS route.
-        // Read here rather than cached, so a change in Settings reaches the
-        // next transfer without a restart.
+        // selection applies. Read here rather than cached, so a change in
+        // Settings reaches the next transfer without a restart.
         let (allowed, config) = {
             let current = self.settings.read().ok();
             let allowed = match (&current, spec.interfaces.is_empty()) {
@@ -78,11 +96,12 @@ impl SourceFactory for HttpFactory {
             (allowed, config)
         };
 
-        if allowed.is_empty() {
-            let source = HttpSource::with_config(&config, &spec.url)?;
-            return Ok(Box::new(SingleSource { source, label: self.default_lane.clone() }));
-        }
-        Ok(Box::new(InterfaceLanes::from_names(&SystemInterfaces, &allowed, &spec.url, &config)?))
+        // Loaded per transfer for the same reason: a phone paired a minute ago
+        // should be usable now, not after a restart.
+        let paired = relays::load();
+        let paths = paths_for(&allowed, &paired, &self.default_lane);
+
+        Ok(Box::new(dl_net::path::PathLanes::build(&paths, &spec.url, &config, &SystemInterfaces)?))
     }
 }
 
@@ -1204,4 +1223,60 @@ fn main() -> Result<()> {
     wire_settings(&ui, config, usable);
     ui.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod factory_tests {
+    use super::*;
+    use dl_net::path::Path;
+
+    fn phone(key: Option<&str>, enabled: &[&str]) -> relays::Paired {
+        relays::Paired {
+            relay: dl_net::Relay::new("Pixel", "10.0.0.5:8710", key.map(str::to_string)),
+            device_id: "abc".into(),
+            enabled: enabled.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn selected_interfaces_and_enabled_relay_lanes_are_one_list() {
+        // The product claim: Ethernet, Wi-Fi and a phone at once. Were these
+        // separate lane sets, a transfer would have to choose between them.
+        let paths = paths_for(&["en0".into()], &[phone(Some("k"), &["cell", "wifi"])], "en0");
+        assert_eq!(paths.len(), 3);
+        assert!(matches!(&paths[0], Path::Interface(name) if name == "en0"));
+        assert!(matches!(&paths[1], Path::Relay { network, .. } if network == "cell"));
+        assert!(matches!(&paths[2], Path::Relay { network, .. } if network == "wifi"));
+    }
+
+    #[test]
+    fn a_relay_with_nothing_switched_on_contributes_nothing() {
+        let paths = paths_for(&["en0".into()], &[phone(Some("k"), &[])], "en0");
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn an_unpaired_relay_is_never_used() {
+        // No key means no authorisation, and sending traffic anyway earns a
+        // 407 per chunk before the lane is parked.
+        let paths = paths_for(&[], &[phone(None, &["cell"])], "en0");
+        assert_eq!(paths.len(), 1);
+        assert!(matches!(paths[0], Path::Default));
+    }
+
+    #[test]
+    fn nothing_selected_anywhere_still_downloads() {
+        // A laptop with one card and no phone, which is most of them.
+        let paths = paths_for(&[], &[], "en0");
+        assert_eq!(paths.len(), 1);
+        assert!(matches!(paths[0], Path::Default));
+    }
+
+    #[test]
+    fn several_phones_each_contribute_their_own_lanes() {
+        let mut spare = phone(Some("k2"), &["cell"]);
+        spare.relay.name = "Spare".into();
+        let paths = paths_for(&[], &[phone(Some("k"), &["cell"]), spare], "en0");
+        assert_eq!(paths.len(), 2);
+    }
 }
