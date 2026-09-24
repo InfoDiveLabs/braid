@@ -12,7 +12,7 @@ use crate::cancel::Cancel;
 use crate::error::{Error, Result};
 use crate::lane::{LaneReport, LaneSelector, LaneSet, SingleLane};
 use crate::model::{Progress, SourceInfo};
-use crate::regions::Regions;
+use crate::regions::{Regions, Run};
 use crate::source::{ByteSource, Fetch};
 use crate::store::journal::{Opened, ResourceId};
 use crate::store::layout::MIN_CHUNK_SIZE;
@@ -57,14 +57,6 @@ fn backoff_for(stated: Option<Duration>, attempts: u32) -> Duration {
     }
     let doublings = attempts.min(8);
     (BASE_BACKOFF * 2u32.saturating_pow(doublings)).min(MAX_BACKOFF)
-}
-
-fn attempts_for(index: u64, seen: &Mutex<BTreeMap<u64, u32>>) -> u32 {
-    seen.lock().unwrap().get(&index).copied().unwrap_or(0)
-}
-
-fn note_attempt(index: u64, seen: &Mutex<BTreeMap<u64, u32>>) {
-    *seen.lock().unwrap().entry(index).or_insert(0) += 1;
 }
 
 pub struct ResumeOptions {
@@ -501,10 +493,7 @@ async fn fetch_all(
         chunks_seen,
         transferred: &transferred,
         inflight: &inflight,
-        // How many times each chunk has been rate limited, so the backoff grows
-        // for a chunk that keeps being refused rather than restarting at the
-        // floor every time a worker picks it up.
-        backoffs: Mutex::new(BTreeMap::new()),
+        limits: Mutex::new(BTreeMap::new()),
         layout: *file.layout(),
         // Only completions are validated against the resource, so a strong
         // validator is carried on every chunk request.
@@ -513,6 +502,7 @@ async fn fetch_all(
         limit: options.limit.clone(),
         lane_limits: &options.lane_limits,
         sockets: RwLock::new(Vec::new()),
+        holders: AtomicUsize::new(0),
         endgame: Endgame::default(),
     };
 
@@ -638,6 +628,31 @@ async fn fetch_all(
 /// watching the sidebar feels like cause and effect.
 const LANE_POLL: Duration = Duration::from_secs(2);
 
+/// This lane's source, if it still has one.
+fn source_of<'a>(roster: &'a Roster<'a>, lane: usize) -> Option<LaneRef<'a>> {
+    roster.source(lane)
+}
+
+/// What a connection does after one stretch of the file.
+enum Step {
+    Continue,
+    Stop,
+}
+
+/// How long one request should keep a connection busy.
+///
+/// The whole point of a run: a request per chunk leaves the connection idle
+/// for a round trip between each one, which measured out at more than half the
+/// bandwidth on a real link. Long enough to stop that mattering, short enough
+/// that whoever holds the last stretch is not holding up the finish.
+const RUN_TARGET: Duration = Duration::from_secs(8);
+
+/// Chunks per request before a lane's speed is known.
+const OPENING_RUN: usize = 4;
+
+/// The most chunks one request may cover, whatever the lane is managing.
+const MAX_RUN: usize = 512;
+
 /// How often a chunk in flight looks at whether it has been called off.
 ///
 /// Bounds how long a paused transfer keeps pulling bytes, and how long the
@@ -754,13 +769,6 @@ impl Endgame {
     }
 }
 
-/// Whether a fetch owns its chunk or is a second copy of somebody else's.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Claim {
-    Owned,
-    Copy,
-}
-
 /// How many connections one lane has open, and how many it ought to have.
 ///
 /// Read by the lane's own connections so one can retire itself when the count
@@ -860,6 +868,7 @@ impl Ramp {
     }
 
     fn set(&mut self, sockets: &Sockets, count: usize) {
+        tracing::debug!(from = sockets.want.load(Ordering::Relaxed), to = count, "connections");
         sockets.want.store(count, Ordering::Relaxed);
         self.changed_at = Instant::now();
     }
@@ -941,7 +950,12 @@ struct Crew<'a> {
     /// still come back as a hand-back, and by then there would be nobody left
     /// to fetch it.
     inflight: &'a AtomicUsize,
-    backoffs: Mutex<BTreeMap<u64, u32>>,
+    /// How many times each lane has been rate limited, so the wait grows for
+    /// one that keeps being refused rather than restarting at the floor.
+    ///
+    /// Per lane rather than per chunk, because the lane is what gets parked:
+    /// an origin refusing us is refusing the path, not the offset.
+    limits: Mutex<BTreeMap<usize, u32>>,
     layout: crate::store::layout::ChunkLayout,
     validator: Option<String>,
     cancel: Cancel,
@@ -949,6 +963,9 @@ struct Crew<'a> {
     lane_limits: &'a [Option<Arc<Budget>>],
     /// How many connections each lane has, by lane index. Grows as lanes do.
     sockets: RwLock<Vec<Arc<Sockets>>>,
+    /// Hands each connection an id of its own, so the regions can tell two
+    /// connections on the same lane apart: they walk different stretches.
+    holders: AtomicUsize,
     endgame: Endgame,
 }
 
@@ -985,7 +1002,8 @@ impl<'a> Crew<'a> {
             let sockets = self.sockets(lane);
             while sockets.open.load(Ordering::Relaxed) < sockets.want.load(Ordering::Relaxed) {
                 sockets.open.fetch_add(1, Ordering::Relaxed);
-                running.push(Box::pin(self.work(lane, tx.clone())));
+                let holder = self.holders.fetch_add(1, Ordering::Relaxed);
+                running.push(Box::pin(self.work(lane, holder, tx.clone())));
             }
         }
     }
@@ -1008,6 +1026,7 @@ impl<'a> Crew<'a> {
     async fn work(
         &self,
         lane: usize,
+        holder: usize,
         tx: tokio::sync::mpsc::Sender<(u64, bytes::Bytes)>,
     ) -> Result<()> {
         let budget = self.budget(lane);
@@ -1059,7 +1078,7 @@ impl<'a> Crew<'a> {
                     // This lane is finished. Whatever it had left is handed
                     // back so another lane can walk it.
                     None => {
-                        self.regions.retire(lane);
+                        self.regions.retire(holder);
                         retire();
                         return Ok(());
                     }
@@ -1069,13 +1088,14 @@ impl<'a> Crew<'a> {
             let rate = self.selector.rate_of(lane).unwrap_or(0.0);
             // Its own stretch of the file first; failing that, a copy of a
             // chunk a slower lane is holding up the finish with.
-            let taken = match self.regions.take(lane, rate) {
-                Some(index) => Some((index, self.endgame.started(index, lane, rate), Claim::Owned)),
-                None => {
-                    self.endgame.join(lane, rate).map(|(index, stop)| (index, stop, Claim::Copy))
-                }
+            let taken = match self.regions.begin(holder, lane, rate, self.run_limit(rate)) {
+                Some(run) => Some((run, None)),
+                None => self
+                    .endgame
+                    .join(lane, rate)
+                    .map(|(index, stop)| (Run { first: index, end: index + 1 }, Some(stop))),
             };
-            let Some((index, stop, claim)) = taken else {
+            let Some((run, copy)) = taken else {
                 if self.regions.is_empty() && self.inflight.load(Ordering::Acquire) == 0 {
                     retire();
                     return Ok(());
@@ -1089,9 +1109,8 @@ impl<'a> Crew<'a> {
             };
 
             self.inflight.fetch_add(1, Ordering::AcqRel);
-            let outcome = self.fetch(lane, index, &budget, &tx, &stop, claim).await;
+            let outcome = self.stream(lane, holder, rate, run, copy, &budget, &tx).await;
             self.inflight.fetch_sub(1, Ordering::AcqRel);
-            self.endgame.finished(index, lane);
             match outcome {
                 Ok(Step::Continue) => continue,
                 Ok(Step::Stop) => {
@@ -1106,170 +1125,244 @@ impl<'a> Crew<'a> {
         }
     }
 
-    /// Fetch one chunk and hand it to the writer.
-    async fn fetch(
+    /// How many chunks one request should cover.
+    ///
+    /// Long enough that the round trip between requests stops mattering, short
+    /// enough that a connection holding the last of them is not holding up the
+    /// finish. Measured in time rather than bytes, so a phone on mobile data
+    /// asks for a stretch it can actually get through.
+    fn run_limit(&self, rate: f64) -> usize {
+        if rate <= 0.0 {
+            return OPENING_RUN;
+        }
+        let bytes = rate * RUN_TARGET.as_secs_f64();
+        ((bytes / self.layout.chunk_size().max(1) as f64).ceil() as usize).clamp(1, MAX_RUN)
+    }
+
+    /// Stream one stretch of the file over a single request, cutting chunks
+    /// out of it as the bytes pass.
+    ///
+    /// This is the difference between a download that holds a line open and
+    /// one that keeps knocking. A request per chunk leaves the connection idle
+    /// for a round trip between each, and on a real link that measured out at
+    /// more than half the available bandwidth. Chunks are still the unit the
+    /// journal and the per-chunk hash work in, because that is what makes
+    /// corruption local and a crash cheap; they no longer each cost a request.
+    ///
+    /// `copy` is set when this is a second copy of a chunk another lane is
+    /// already carrying, which happens only at the very end of a transfer.
+    ///
+    /// Exactly one chunk is this connection's at a time: the one being filled.
+    /// The rest of the run is still in its claim, which is what lets a faster
+    /// lane take the back of it mid-stream, and what means a failure hands
+    /// back one chunk rather than a stretch nobody else was waiting on.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream(
         &self,
         lane: usize,
-        index: u64,
+        holder: usize,
+        rate: f64,
+        run: Run,
+        copy: Option<Cancel>,
         budget: &BudgetChain,
         tx: &tokio::sync::mpsc::Sender<(u64, bytes::Bytes)>,
-        stop: &Cancel,
-        claim: Claim,
     ) -> Result<Step> {
-        let range = self.layout.range(index).expect("a pending index is in range");
+        let owned = copy.is_none();
+        let first = self.layout.range(run.first).expect("a pending index is in range");
+        let last = self.layout.range(run.end - 1).expect("a pending index is in range");
+        let span = crate::model::ByteRange::new(first.start, last.end);
+
+        let mut index = run.first;
+        let mut left = run.len();
         // A second copy leaves the grid alone: the chunk is already shown as
         // being fetched, by the lane that owns it.
-        let owned = claim == Claim::Owned;
         if owned {
             self.chunks_seen.started(index);
         }
-        // Handing a chunk back is only meaningful for the lane that holds it.
-        // A copy that fails simply stops; the owner is still fetching it.
-        let give_back = || {
+        let mut stop = match &copy {
+            Some(stop) => stop.clone(),
+            None => self.endgame.started(index, lane, rate),
+        };
+
+        // Give the chunk in hand back, and only that one. Everything after it
+        // in the run is still in the claim and will be offered again; handing
+        // those back too would put them in two places at once.
+        let drop_current = |index: u64| {
             if owned {
                 self.chunks_seen.released(index);
-                self.regions.give_back(index);
+                self.regions.give_back([index]);
             }
         };
 
-        let Some(source) = self.roster.source(lane) else {
-            give_back();
-            return Err(Error::NoRouteAvailable);
+        let mut body = match source_of(self.roster, lane) {
+            Some(source) => {
+                match source.get().open(Fetch::validated(span, self.validator.clone())).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        drop_current(index);
+                        self.endgame.finished(index, lane);
+                        return self.blame(lane, e);
+                    }
+                }
+            }
+            None => {
+                drop_current(index);
+                self.endgame.finished(index, lane);
+                return Err(Error::NoRouteAvailable);
+            }
         };
 
-        let body = match fetch_chunk(
-            source.get(),
-            range,
-            self.validator.clone(),
-            budget,
-            &self.cancel.or(stop),
-            &|bytes| self.selector.progressed(lane, bytes),
-        )
-        .await
-        {
-            Ok(body) => {
-                self.selector.completed(lane, range.len());
-                body
+        let mut want = self.layout.range(index).expect("in range").len();
+        let mut buffer: Vec<u8> = Vec::with_capacity(want as usize);
+        let mut had: u64 = 0;
+
+        loop {
+            // Checked as the body arrives, not only between chunks. Waiting
+            // for a chunk to finish means a pause keeps pulling on every lane
+            // at once, and on a borrowed mobile connection that is somebody's
+            // money being spent after they asked it to stop.
+            if self.cancel.is_cancelled() {
+                drop_current(index);
+                self.endgame.finished(index, lane);
+                return Err(Error::Cancelled);
             }
+            if stop.is_cancelled() {
+                // Another lane finished the chunk this stream is filling.
+                self.endgame.finished(index, lane);
+                if owned {
+                    self.chunks_seen.released(index);
+                }
+                return Ok(Step::Continue);
+            }
+
+            // On a clock as well as on arrival. Checking only when bytes land
+            // ties how fast a stream can be called off to how fast it is
+            // going, so the slowest lane, which is the one most likely to be
+            // paused or overtaken, is the slowest to notice.
+            let Ok(next) = tokio::time::timeout(CANCEL_POLL, body.next()).await else {
+                continue;
+            };
+            let part = match next {
+                Some(Ok(part)) => part,
+                Some(Err(e)) => {
+                    drop_current(index);
+                    self.endgame.finished(index, lane);
+                    return self.blame(lane, e);
+                }
+                None => break,
+            };
+            if had + buffer.len() as u64 + part.len() as u64 > span.len() {
+                drop_current(index);
+                self.endgame.finished(index, lane);
+                return Err(Error::OverlongBody { expected: span.len() });
+            }
+
+            // Charged after the bytes arrive, not before: the socket has
+            // already received them, and pacing here is what slows the sender
+            // down through TCP back-pressure.
+            let mut owed = part.len();
+            while owed > 0 {
+                owed -= budget.acquire(owed).await;
+            }
+            // Reported as they land rather than when a chunk ends, so a lane's
+            // rate is current.
+            self.selector.progressed(lane, part.len() as u64);
+            buffer.extend_from_slice(&part);
+
+            // Cut out every whole chunk the buffer now holds.
+            while buffer.len() as u64 >= want {
+                let rest = buffer.split_off(want as usize);
+                let whole = bytes::Bytes::from(std::mem::replace(&mut buffer, rest));
+
+                if !self.endgame.won(index) {
+                    // A copy landed first. Nothing to write and nothing owed.
+                    self.endgame.finished(index, lane);
+                    if owned {
+                        self.chunks_seen.released(index);
+                    }
+                    return Ok(Step::Continue);
+                }
+                self.selector.completed(lane, want);
+                // A chunk through means the lane is being served again, so the
+                // next refusal starts its wait at the floor.
+                self.limits.lock().unwrap().remove(&lane);
+                self.transferred.fetch_add(want, Ordering::Relaxed);
+                self.endgame.finished(index, lane);
+                had += want;
+                left -= 1;
+                if tx.send((index, whole)).await.is_err() {
+                    return Ok(Step::Stop);
+                }
+
+                index += 1;
+                if left == 0 {
+                    return Ok(Step::Continue);
+                }
+                // The back of a claim can be taken while it is being streamed,
+                // by a lane that has run out and is faster. Carrying on would
+                // fetch what somebody else is now fetching.
+                if owned && !self.regions.take_next(holder) {
+                    return Ok(Step::Continue);
+                }
+                want = self.layout.range(index).expect("in range").len();
+                if owned {
+                    self.chunks_seen.started(index);
+                }
+                stop = self.endgame.started(index, lane, rate);
+            }
+        }
+
+        // The body ended early. The part chunk in hand is discarded: nothing
+        // is journalled until it is whole, so abandoning one costs bytes and
+        // never correctness.
+        drop_current(index);
+        self.endgame.finished(index, lane);
+        self.blame(lane, Error::ShortBody { expected: span.len(), received: had })
+    }
+
+    /// Decide what a failure means for the lane it happened on.
+    fn blame(&self, lane: usize, error: Error) -> Result<Step> {
+        match error {
             // The origin asking us to slow down is not a failing path. Moving
-            // the chunk to another interface and trying again at once is what
+            // the work to another interface and trying again at once is what
             // turns one rate limit into a rate limit on every interface we own.
-            Err(Error::RateLimited { status, retry_after }) => {
-                let wait = backoff_for(retry_after, attempts_for(index, &self.backoffs));
+            Error::RateLimited { status, retry_after } => {
+                let refusals = {
+                    let mut limits = self.limits.lock().unwrap();
+                    let count = limits.entry(lane).or_insert(0);
+                    *count += 1;
+                    *count - 1
+                };
+                let wait = backoff_for(retry_after, refusals);
                 tracing::info!(
                     status,
-                    chunk = index,
                     wait_ms = wait.as_millis() as u64,
                     stated = retry_after.is_some(),
                     "rate limited; backing off"
                 );
                 self.selector.park_for(lane, wait);
-                give_back();
-                note_attempt(index, &self.backoffs);
-
                 if self.selector.all_parked_permanently() {
                     return Err(Error::RateLimited { status, retry_after });
                 }
-                return Ok(Step::Continue);
+                Ok(Step::Continue)
             }
-            // Another lane finished this chunk first. Not a failure, and not
-            // ours to hand back: the copy that won it has it.
-            Err(Error::Cancelled) if self.cancel.check().is_ok() => {
-                return Ok(Step::Continue);
-            }
-            Err(e) if e.is_retryable() => {
-                // A path that died mid-transfer should cost this chunk, not the
-                // download: hand it back for a healthier lane.
+            e if e.is_retryable() => {
+                // A path that died mid-transfer should cost its stretch, not
+                // the download: it has been handed back for a healthier lane.
                 self.selector.failed(lane);
-                give_back();
                 if self.selector.all_parked() {
                     return Err(e);
                 }
-                return Ok(Step::Continue);
+                Ok(Step::Continue)
             }
-            Err(e) => {
-                // The origin misbehaved, which every lane would hit
-                // identically. Not the lane's fault, so do not park it.
+            // The origin misbehaved, which every lane would hit identically.
+            // Not the lane's fault, so do not park it.
+            e => {
                 self.selector.released(lane);
-                give_back();
-                return Err(e);
+                Err(e)
             }
-        };
-
-        // Claimed before the bytes are counted, so two copies finishing
-        // together cannot both be written and leave the transfer reporting
-        // more bytes than the file holds.
-        if !self.endgame.won(index) {
-            return Ok(Step::Continue);
         }
-        self.transferred.fetch_add(range.len(), Ordering::Relaxed);
-        if tx.send((index, body)).await.is_err() {
-            return Ok(Step::Stop);
-        }
-        Ok(Step::Continue)
     }
-}
-
-/// What a worker does after one chunk.
-enum Step {
-    Continue,
-    Stop,
-}
-
-async fn fetch_chunk(
-    source: &dyn ByteSource,
-    range: crate::model::ByteRange,
-    validator: Option<String>,
-    budget: &BudgetChain,
-    cancel: &Cancel,
-    on_bytes: &(dyn Fn(u64) + Send + Sync),
-) -> Result<bytes::Bytes> {
-    let mut stream = source.open(Fetch::validated(range, validator)).await?;
-    let mut buffer = Vec::with_capacity(range.len() as usize);
-
-    loop {
-        // Checked as the body arrives, not only between chunks. Waiting for a
-        // chunk to finish means a pause keeps pulling on every lane at once,
-        // and on a borrowed mobile connection that is somebody's money being
-        // spent after they asked it to stop. The partial chunk is discarded
-        // and refetched later: nothing is journalled until it is whole, so
-        // abandoning one costs bytes and never correctness.
-        cancel.check()?;
-
-        // On a clock as well as on arrival. Checking only when bytes land ties
-        // how fast a chunk can be called off to how fast it is going, so the
-        // slowest lane, which is the one most likely to be paused or overtaken,
-        // is also the one that takes longest to notice.
-        let Ok(next) = tokio::time::timeout(CANCEL_POLL, stream.next()).await else {
-            continue;
-        };
-        let Some(chunk) = next else { break };
-
-        let chunk = chunk?;
-        if buffer.len() as u64 + chunk.len() as u64 > range.len() {
-            return Err(Error::OverlongBody { expected: range.len() });
-        }
-
-        // Charged after the bytes arrive, not before: the socket has already
-        // received them, and pacing here is what slows the sender down through
-        // TCP back-pressure. Charging in advance would only add latency.
-        let mut owed = chunk.len();
-        while owed > 0 {
-            owed -= budget.acquire(owed).await;
-        }
-
-        buffer.extend_from_slice(&chunk);
-        // Reported as they land rather than when the chunk ends, so a lane's
-        // rate is current and the assignment can move work off a path that
-        // has slowed while it is still slow.
-        on_bytes(chunk.len() as u64);
-    }
-
-    // Checked before the write so a short chunk is never journalled.
-    if buffer.len() as u64 != range.len() {
-        return Err(Error::ShortBody { expected: range.len(), received: buffer.len() as u64 });
-    }
-    Ok(bytes::Bytes::from(buffer))
 }
 
 /// Hash the assembled file by reading it back.
@@ -1539,15 +1632,17 @@ mod tests {
     }
 
     #[test]
-    fn attempts_are_counted_per_chunk_not_globally() {
-        // Otherwise one unlucky chunk pushes every other chunk's first retry
-        // to the cap.
-        let seen = Mutex::new(BTreeMap::new());
-        note_attempt(3, &seen);
-        note_attempt(3, &seen);
-        note_attempt(9, &seen);
-        assert_eq!(attempts_for(3, &seen), 2);
-        assert_eq!(attempts_for(9, &seen), 1);
-        assert_eq!(attempts_for(4, &seen), 0);
+    fn a_run_covers_about_eight_seconds_of_whatever_the_lane_manages() {
+        // Long enough that the round trip between requests stops mattering,
+        // short enough that whoever holds the last one is not holding up the
+        // finish. A phone and a gigabit card get very different stretches.
+        let layout = crate::store::layout::ChunkLayout::new(1 << 30, 4 << 20);
+        let chunks = |rate: f64| {
+            let bytes = rate * RUN_TARGET.as_secs_f64();
+            ((bytes / layout.chunk_size() as f64).ceil() as usize).clamp(1, MAX_RUN)
+        };
+        assert_eq!(chunks(400e3), 1, "a phone should ask for a stretch it can finish");
+        assert_eq!(chunks(36e6), 69);
+        assert_eq!(chunks(10e9), MAX_RUN, "a run is capped however fast the link is");
     }
 }
