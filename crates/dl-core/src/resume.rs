@@ -22,7 +22,7 @@ use futures_util::stream::FuturesUnordered;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// Enough chunks per connection that a slow one cannot hold up the finish.
@@ -74,6 +74,13 @@ pub struct ResumeOptions {
     pub durability: crate::store::Durability,
     /// Where the partial file and its journal live while the transfer runs.
     pub staging: crate::store::Staging,
+    /// The most connections one lane may open.
+    ///
+    /// A ceiling, not a target: each lane starts with one and earns more only
+    /// by going measurably faster with them. A transfer over several lanes can
+    /// therefore hold more sockets than this in total, which is the right way
+    /// round: the number is there to be polite to one origin over one route,
+    /// and each lane is a different route to it.
     pub connections: usize,
     pub expect: Option<crate::integrity::Digest>,
     pub progress_interval: Duration,
@@ -228,7 +235,12 @@ pub async fn download_over_lanes(
 
     let total = info.len.unwrap_or(0);
     let connections = options.connections.max(1);
-    let chunk_size = options.chunk_size.unwrap_or_else(|| choose_chunk_size(total, connections));
+    // Sized for every lane's connections, not one lane's: with four paths open
+    // the grid has to be fine enough for all of them to have something to walk,
+    // and a run of chunks is also what a lane steals in halves.
+    let chunk_size = options
+        .chunk_size
+        .unwrap_or_else(|| choose_chunk_size(total, connections.saturating_mul(lanes.len())));
 
     let mut file = ResumableFile::open_staged(
         destination,
@@ -500,6 +512,7 @@ async fn fetch_all(
         cancel: options.cancel.clone(),
         limit: options.limit.clone(),
         lane_limits: &options.lane_limits,
+        sockets: RwLock::new(Vec::new()),
     };
 
     // The sender lives with the supervisor and nowhere else, so the writer's
@@ -510,13 +523,18 @@ async fn fetch_all(
     let roster = &roster;
     let supervise = async move {
         let mut running: FuturesUnordered<BoxFuture<'_>> = FuturesUnordered::new();
-        let mut opened = 0usize;
-        for lane in 0..roster.len() {
-            opened += crew.staff(&mut running, lane, connections, roster.len(), &tx);
+        // Every lane starts with one connection and earns the rest. See
+        // `Ramp`: opening eight on a phone sharing mobile data spends its
+        // battery on connections that carry nothing.
+        let mut ramps: Vec<Ramp> = Vec::new();
+        for _ in 0..roster.len() {
+            ramps.push(Ramp::new());
         }
-        tracing::debug!(lanes = roster.len(), connections = opened, "lanes opened");
+        crew.resize(&mut running, &tx);
+        tracing::debug!(lanes = roster.len(), "lanes opened");
 
         let mut look = tokio::time::interval(LANE_POLL);
+        let mut tune = tokio::time::interval(RAMP_POLL);
         let mut results = Vec::new();
         while !running.is_empty() {
             tokio::select! {
@@ -525,6 +543,16 @@ async fn fetch_all(
                         results.push(outcome);
                     }
                 }
+                // Separate from the search for new lanes, and more often:
+                // finding a lane's connection count is the first few seconds
+                // of a transfer, and waiting two seconds a step to do it is
+                // most of a small download.
+                _ = tune.tick() => {
+                    for (lane, ramp) in ramps.iter_mut().enumerate() {
+                        ramp.consider(selector.rate_of(lane), &crew.sockets(lane), connections);
+                    }
+                    crew.resize(&mut running, &tx);
+                }
                 _ = look.tick() => {
                     for joined in roster.take_on() {
                         // The roster and the meter only ever grow by appending,
@@ -532,14 +560,13 @@ async fn fetch_all(
                         // will. Everything downstream reads lanes by number.
                         let lane = selector.join(joined.label.clone());
                         debug_assert_eq!(lane, joined.lane, "lane numbering came apart");
-                        let count = crew
-                            .staff(&mut running, joined.lane, connections, roster.len(), &tx);
+                        ramps.push(Ramp::new());
                         tracing::info!(
                             lane = %joined.label,
-                            connections = count,
                             "a path that appeared mid-transfer is now carrying chunks"
                         );
                     }
+                    crew.resize(&mut running, &tx);
                 }
             }
         }
@@ -616,23 +643,108 @@ const LANE_POLL: Duration = Duration::from_secs(2);
 /// waiting out a rate limit, so the cost is a handful of wakeups.
 const IDLE_POLL: Duration = Duration::from_millis(50);
 
-/// The fewest connections a lane is worth opening.
+/// How many connections one lane has open, and how many it ought to have.
 ///
-/// One connection makes a lane's throughput a function of round-trip time
-/// rather than of the link, which is exactly wrong for the slow paths this
-/// project exists to add up.
-const MIN_PER_LANE: usize = 2;
+/// Read by the lane's own connections so one can retire itself when the count
+/// comes down, and written only by the supervisor.
+#[derive(Debug, Default)]
+struct Sockets {
+    open: AtomicUsize,
+    want: AtomicUsize,
+}
 
-/// How many connections each lane gets.
+/// Finding out how many connections a lane is actually worth.
 ///
-/// `connections` is the transfer's budget, shared out between the lanes, but a
-/// lane is never opened with fewer than [`MIN_PER_LANE`]. A transfer with more
-/// lanes than connections therefore opens more sockets than were asked for,
-/// which is the right way round: the setting is there to be polite to one
-/// origin, and each lane is a different route to it.
-fn connections_per_lane(connections: usize, lanes: usize) -> usize {
-    let budget = connections.max(1);
-    (budget / lanes.max(1)).clamp(1, budget).max(MIN_PER_LANE.min(budget))
+/// Opening eight connections to every lane is the usual approach and it is
+/// wrong in both directions. A single connection to a distant origin is often
+/// held back by its own window rather than by the link, so one connection
+/// leaves most of a fast interface unused; and a phone sharing mobile data is
+/// frequently saturated by two, so the other six buy nothing and cost the
+/// phone battery, the origin connections, and this project the argument that
+/// it is being careful with someone else's data plan.
+///
+/// So the count is measured rather than assumed: double it, see whether the
+/// lane got faster, and stop when it did not. Doubling rather than stepping,
+/// because reaching eight one at a time would spend half a minute getting
+/// there on a link that could have had it in two moves.
+#[derive(Debug)]
+struct Ramp {
+    /// The fastest the lane has gone, and at how many connections.
+    best: f64,
+    best_at: usize,
+    /// Whether the search has finished. A lane that later falls well short of
+    /// its best starts again: the link changed, so the answer may have too.
+    settled: bool,
+    changed_at: Instant,
+}
+
+/// How much faster a lane has to get for another connection to be worth it.
+///
+/// Well above measurement noise, because the cost of being wrong in this
+/// direction is a connection that stays open for the rest of the transfer.
+const RAMP_GAIN: f64 = 1.15;
+
+/// How often a lane's connection count is reconsidered.
+const RAMP_POLL: Duration = Duration::from_secs(1);
+
+/// How long a lane runs at a new connection count before it is judged.
+///
+/// Long enough for the lane's own average to have caught up with the change,
+/// or the measurement describes the count before last. Just under [`RAMP_POLL`]
+/// so that every tick is allowed to decide something: a step that took two
+/// ticks would double the time a transfer spends finding its feet.
+const RAMP_SETTLE: Duration = Duration::from_millis(900);
+
+/// A drop this far below the best seen means the link itself changed, and the
+/// count that was right for it probably has not stayed right.
+const RAMP_RESET: f64 = 0.5;
+
+impl Ramp {
+    fn new() -> Self {
+        Self { best: 0.0, best_at: 1, settled: false, changed_at: Instant::now() }
+    }
+
+    /// Decide this lane's connection count from what it is currently doing.
+    fn consider(&mut self, rate: Option<f64>, sockets: &Sockets, ceiling: usize) {
+        let want = sockets.want.load(Ordering::Relaxed).max(1);
+        // Judging before the lane has settled at the count it was last given
+        // measures the previous count, not this one.
+        if self.changed_at.elapsed() < RAMP_SETTLE || sockets.open.load(Ordering::Relaxed) != want {
+            return;
+        }
+        let Some(rate) = rate.filter(|r| *r > 0.0) else { return };
+
+        if self.settled {
+            if rate < self.best * RAMP_RESET {
+                tracing::debug!(want, "a lane slowed down; looking for its connection count again");
+                self.settled = false;
+                self.best = rate;
+                self.best_at = want;
+                self.changed_at = Instant::now();
+            }
+            return;
+        }
+
+        if rate > self.best * RAMP_GAIN {
+            self.best = rate;
+            self.best_at = want;
+            if want < ceiling {
+                self.set(sockets, (want * 2).min(ceiling));
+                return;
+            }
+        }
+        // Either the extra connections bought nothing or there is no room for
+        // more. Fall back to the count that was fastest and stop asking.
+        self.settled = true;
+        if want != self.best_at {
+            self.set(sockets, self.best_at);
+        }
+    }
+
+    fn set(&mut self, sockets: &Sockets, count: usize) {
+        sockets.want.store(count, Ordering::Relaxed);
+        self.changed_at = Instant::now();
+    }
 }
 
 type BoxFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
@@ -718,23 +830,46 @@ struct Crew<'a> {
     cancel: Cancel,
     limit: Option<Arc<Budget>>,
     lane_limits: &'a [Option<Arc<Budget>>],
+    /// How many connections each lane has, by lane index. Grows as lanes do.
+    sockets: RwLock<Vec<Arc<Sockets>>>,
 }
 
 impl<'a> Crew<'a> {
-    /// Open this lane's connections. Returns how many.
-    fn staff(
+    /// This lane's connection counts, creating them if the lane is new.
+    fn sockets(&self, lane: usize) -> Arc<Sockets> {
+        {
+            let open = self.sockets.read().unwrap();
+            if let Some(found) = open.get(lane) {
+                return Arc::clone(found);
+            }
+        }
+        let mut open = self.sockets.write().unwrap();
+        while open.len() <= lane {
+            // One to begin with. The ramp adds more if they help.
+            let fresh = Sockets::default();
+            fresh.want.store(1, Ordering::Relaxed);
+            open.push(Arc::new(fresh));
+        }
+        Arc::clone(&open[lane])
+    }
+
+    /// Open whatever connections the ramps have asked for and not yet got.
+    ///
+    /// Taking one away is the connection's own job: it notices after its
+    /// current chunk and stops. Cancelling it here would abandon bytes that
+    /// have already been fetched.
+    fn resize(
         &'a self,
         running: &mut FuturesUnordered<BoxFuture<'a>>,
-        lane: usize,
-        connections: usize,
-        lanes: usize,
         tx: &tokio::sync::mpsc::Sender<(u64, bytes::Bytes)>,
-    ) -> usize {
-        let count = connections_per_lane(connections, lanes);
-        for _ in 0..count {
-            running.push(Box::pin(self.work(lane, tx.clone())));
+    ) {
+        for lane in 0..self.roster.len() {
+            let sockets = self.sockets(lane);
+            while sockets.open.load(Ordering::Relaxed) < sockets.want.load(Ordering::Relaxed) {
+                sockets.open.fetch_add(1, Ordering::Relaxed);
+                running.push(Box::pin(self.work(lane, tx.clone())));
+            }
         }
-        count
     }
 
     /// One chain per lane: the lane's own ceiling, then the download-wide cap.
@@ -758,8 +893,43 @@ impl<'a> Crew<'a> {
         tx: tokio::sync::mpsc::Sender<(u64, bytes::Bytes)>,
     ) -> Result<()> {
         let budget = self.budget(lane);
+        let sockets = self.sockets(lane);
+        // Every exit from here goes through `retire`, which is what keeps the
+        // open count honest: a lane that undercounts its connections opens
+        // more on the next tick and never stops.
+        let retire = || {
+            sockets.open.fetch_sub(1, Ordering::Relaxed);
+        };
+        // Stand down if the lane has more connections than it wants, claiming
+        // the place in the same step. Checking and then decrementing would let
+        // every connection on the lane see the same surplus and all leave.
+        let step_down = || {
+            let mut open = sockets.open.load(Ordering::Relaxed);
+            loop {
+                if open <= sockets.want.load(Ordering::Relaxed) {
+                    return false;
+                }
+                match sockets.open.compare_exchange_weak(
+                    open,
+                    open - 1,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(actual) => open = actual,
+                }
+            }
+        };
         loop {
-            self.cancel.check()?;
+            if let Err(e) = self.cancel.check() {
+                retire();
+                return Err(e);
+            }
+            // The ramp decided this lane does not need as many connections as
+            // it has. Between chunks is the only safe place to notice.
+            if step_down() {
+                return Ok(());
+            }
 
             if !self.selector.claim(lane) {
                 match self.selector.park_remaining(lane) {
@@ -772,6 +942,7 @@ impl<'a> Crew<'a> {
                     // back so another lane can walk it.
                     None => {
                         self.regions.retire(lane);
+                        retire();
                         return Ok(());
                     }
                 }
@@ -779,9 +950,11 @@ impl<'a> Crew<'a> {
 
             let Some(index) = self.regions.take(lane) else {
                 if self.regions.is_empty() && self.inflight.load(Ordering::Acquire) == 0 {
+                    retire();
                     return Ok(());
                 }
                 if self.selector.all_parked_permanently() {
+                    retire();
                     return Err(Error::NoRouteAvailable);
                 }
                 tokio::time::sleep(IDLE_POLL).await;
@@ -791,9 +964,16 @@ impl<'a> Crew<'a> {
             self.inflight.fetch_add(1, Ordering::AcqRel);
             let outcome = self.fetch(lane, index, &budget, &tx).await;
             self.inflight.fetch_sub(1, Ordering::AcqRel);
-            match outcome? {
-                Step::Continue => continue,
-                Step::Stop => return Ok(()),
+            match outcome {
+                Ok(Step::Continue) => continue,
+                Ok(Step::Stop) => {
+                    retire();
+                    return Ok(());
+                }
+                Err(e) => {
+                    retire();
+                    return Err(e);
+                }
             }
         }
     }
@@ -958,6 +1138,108 @@ fn rate(bytes: u64, elapsed: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lane whose speed is a function of how many connections it has, so a
+    /// ramp can be driven without a network.
+    fn ramp_to(speeds: &[f64], ceiling: usize) -> usize {
+        let sockets = Sockets::default();
+        sockets.want.store(1, Ordering::Relaxed);
+        let mut ramp = Ramp::new();
+
+        for _ in 0..12 {
+            let want = sockets.want.load(Ordering::Relaxed);
+            sockets.open.store(want, Ordering::Relaxed);
+            // Stand in for the wait, so the ramp judges what it just asked for.
+            ramp.changed_at = Instant::now() - RAMP_SETTLE * 2;
+            let rate = speeds.get(want - 1).copied().unwrap_or_else(|| speeds[speeds.len() - 1]);
+            ramp.consider(Some(rate), &sockets, ceiling);
+        }
+        sockets.want.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_lane_held_back_by_one_connection_gets_more() {
+        // The whole point: a single connection to a distant origin is limited
+        // by its own window, not by the link, and the only way to find out is
+        // to open another and see.
+        let speeds = [2e6, 4e6, 6e6, 8e6, 10e6, 12e6, 14e6, 16e6];
+        assert_eq!(ramp_to(&speeds, 8), 8);
+    }
+
+    #[test]
+    fn a_lane_that_stops_gaining_is_wound_back_to_where_it_did() {
+        // Four connections is as much as this link will take; the eighth is
+        // tried, found to buy nothing, and given up.
+        let speeds = [2e6, 4e6, 8e6, 16e6, 16e6, 16e6, 16e6, 16e6];
+        assert_eq!(ramp_to(&speeds, 8), 4);
+    }
+
+    #[test]
+    fn a_lane_that_is_already_saturated_stays_on_one_connection() {
+        // A phone sharing mobile data. Seven more connections would carry
+        // nothing and spend its battery doing it.
+        let speeds = [400e3, 405e3, 402e3, 398e3, 400e3, 400e3, 400e3, 400e3];
+        assert_eq!(ramp_to(&speeds, 8), 1);
+    }
+
+    #[test]
+    fn the_search_stops_at_the_count_that_was_fastest() {
+        // Two helps, four does not: the answer is two, not the four it had to
+        // try in order to find out.
+        let speeds = [1e6, 2e6, 2.05e6, 2.0e6, 2.0e6, 2.0e6, 2.0e6, 2.0e6];
+        assert_eq!(ramp_to(&speeds, 8), 2);
+    }
+
+    #[test]
+    fn the_ceiling_is_respected() {
+        let speeds = [1e6, 4e6, 16e6, 64e6, 256e6, 1e9, 4e9, 16e9];
+        assert_eq!(ramp_to(&speeds, 4), 4);
+        assert_eq!(ramp_to(&speeds, 1), 1);
+    }
+
+    #[test]
+    fn a_lane_that_slows_right_down_is_measured_again() {
+        // Switching from Wi-Fi to a tether changes the answer, and a count
+        // settled on the old link has no reason to suit the new one.
+        let sockets = Sockets::default();
+        sockets.want.store(4, Ordering::Relaxed);
+        sockets.open.store(4, Ordering::Relaxed);
+        let mut ramp = Ramp::new();
+        ramp.best = 10e6;
+        ramp.best_at = 4;
+        ramp.settled = true;
+        ramp.changed_at = Instant::now() - RAMP_SETTLE * 2;
+
+        ramp.consider(Some(9e6), &sockets, 8);
+        assert!(ramp.settled, "a small dip is not a different link");
+
+        ramp.consider(Some(1e6), &sockets, 8);
+        assert!(!ramp.settled, "a lane that fell to a tenth was never looked at again");
+    }
+
+    #[test]
+    fn a_count_is_not_judged_before_it_has_had_time_to_show() {
+        // Reading the rate straight after a change measures the count before
+        // last, and would talk the ramp into a number by accident.
+        let sockets = Sockets::default();
+        sockets.want.store(2, Ordering::Relaxed);
+        sockets.open.store(2, Ordering::Relaxed);
+        let mut ramp = Ramp::new();
+        ramp.consider(Some(50e6), &sockets, 8);
+        assert_eq!(sockets.want.load(Ordering::Relaxed), 2, "judged too early");
+    }
+
+    #[test]
+    fn nothing_happens_while_the_connections_asked_for_are_still_opening() {
+        let sockets = Sockets::default();
+        sockets.want.store(4, Ordering::Relaxed);
+        sockets.open.store(2, Ordering::Relaxed);
+        let mut ramp = Ramp::new();
+        ramp.changed_at = Instant::now() - RAMP_SETTLE * 2;
+        ramp.consider(Some(50e6), &sockets, 8);
+        assert_eq!(sockets.want.load(Ordering::Relaxed), 4);
+        assert!(!ramp.settled);
+    }
 
     #[test]
     fn chunk_size_scales_with_connection_count() {

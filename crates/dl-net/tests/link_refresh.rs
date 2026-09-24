@@ -264,14 +264,20 @@ async fn each_lane_resolves_its_own_address_bound_signature() {
 
 /// Sixteen connections discover the same dead link within microseconds. One
 /// refresh has to serve all of them; sixteen would invalidate each other.
+///
+/// The burst is made here rather than by running a download, because a
+/// transfer opens its connections one at a time as it learns how many the lane
+/// is worth, and would discover the dead link sixteen times in a row instead
+/// of all at once. Sequential refusals are not what this defends against.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_burst_of_expired_chunks_costs_far_fewer_refreshes_than_chunks() {
-    // The signature is spent by the probe, so every worker's first chunk
-    // request is refused at once.
+    use dl_core::source::Fetch;
+    use futures_util::StreamExt;
+
+    // The signature is spent by the probe, so every request that follows is
+    // refused at once.
     let scenario = Scenario::ExpiresAfterBytes { size: 1 << 20, after_bytes: 1 };
     let origin = Origin::spawn(scenario).await.unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let dest = dir.path().join(NAME);
 
     let lanes = RefreshingLanes::build(
         vec![LaneSpec {
@@ -285,9 +291,24 @@ async fn a_burst_of_expired_chunks_costs_far_fewer_refreshes_than_chunks() {
     )
     .unwrap();
 
-    download_over_lanes(&lanes, &dest, options(16, 64 << 10), None).await.unwrap();
+    let source = dl_core::lane::LaneSet::source(&lanes, 0);
+    source.probe().await.expect("the probe spends the signature");
 
-    assert_exact(&dest, scenario);
+    let burst = (0..16u64).map(|chunk| {
+        let start = chunk * (64 << 10);
+        let range = dl_core::model::ByteRange::new(start, start + (64 << 10));
+        async move {
+            let mut stream = source.open(Fetch::range(range)).await?;
+            while let Some(part) = stream.next().await {
+                part?;
+            }
+            Ok::<(), Error>(())
+        }
+    });
+    for result in futures_util::future::join_all(burst).await {
+        result.expect("a refreshed link must serve the chunk");
+    }
+
     assert!(origin.rejections() >= 8, "the burst never happened: {}", origin.rejections());
     assert!(
         lanes.resolves() < origin.rejections(),

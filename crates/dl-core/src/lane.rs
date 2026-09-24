@@ -343,6 +343,17 @@ impl LaneSelector {
         !state.is_empty() && state.iter().all(|s| s.parked && s.parked_until.is_none())
     }
 
+    /// One lane's current rate, in bytes per second.
+    ///
+    /// `None` until a window has closed on it, which is what tells a caller
+    /// the difference between a lane doing nothing and a lane not yet measured.
+    pub fn rate_of(&self, lane: usize) -> Option<f64> {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        Self::settle(&mut state, now);
+        state.get(lane).and_then(|entry| entry.throughput)
+    }
+
     /// Close every open window, however short it was.
     ///
     /// Called when a transfer ends. A download that finishes inside a single
