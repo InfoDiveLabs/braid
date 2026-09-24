@@ -173,6 +173,36 @@ fn download_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
+/// The sidebar entries for every switched-on lane of every paired phone.
+///
+/// Listed alongside the network cards so a phone's lane is visible at zero
+/// rather than appearing only once it happens to carry something. The id must
+/// be exactly the label `PathLanes` gives that lane, because the sidebar keys
+/// its meters on the lane label the engine reports.
+///
+/// The glyph is the neutral one: the id a phone chooses for a network is
+/// opaque, and guessing "cellular" from the word "cell" would put a mast icon
+/// on someone's home Wi-Fi.
+fn relay_lane_rows(paired: &[relays::Paired]) -> Vec<bridge::InterfaceInfo> {
+    let mut rows = Vec::new();
+    for entry in paired {
+        if entry.relay.key.is_none() {
+            continue;
+        }
+        for network in &entry.enabled {
+            let path =
+                dl_net::path::Path::Relay { relay: entry.relay.clone(), network: network.clone() };
+            let label = path.label(None);
+            rows.push(bridge::InterfaceInfo {
+                id: label.clone(),
+                label,
+                icon: "network".to_string(),
+            });
+        }
+    }
+    rows
+}
+
 /// One phone as the scan found it.
 ///
 /// Plain data on purpose. A Slint model is not `Send`, so nothing built from
@@ -1489,7 +1519,7 @@ fn main() -> Result<()> {
         tracing::warn!(%error, "single-instance handoff is not available");
     }
 
-    let interfaces: Vec<bridge::InterfaceInfo> = usable
+    let mut interfaces: Vec<bridge::InterfaceInfo> = usable
         .iter()
         .map(|i| bridge::InterfaceInfo {
             id: i.name.clone(),
@@ -1497,6 +1527,7 @@ fn main() -> Result<()> {
             icon: i.kind.icon().to_string(),
         })
         .collect();
+    interfaces.extend(relay_lane_rows(&relays::load()));
     tracing::debug!(?interfaces, "usable interfaces");
     bridge::spawn(&ui, engine.clone(), Some(tray.as_weak()), interfaces, config.clone());
 
@@ -1512,6 +1543,34 @@ fn main() -> Result<()> {
 mod factory_tests {
     use super::*;
     use dl_net::path::Path;
+
+    #[test]
+    fn a_paired_phone_is_listed_in_the_sidebar_before_it_carries_anything() {
+        // A lane that only appears once it is busy cannot be judged, and the
+        // reason to show throughput per lane is to see the ones doing nothing.
+        let rows = relay_lane_rows(&[phone(Some("k"), &["cell", "wifi"])]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "Pixel (cell)");
+        assert_eq!(rows[1].label, "Pixel (wifi)");
+    }
+
+    #[test]
+    fn the_sidebar_id_is_the_label_the_engine_will_report() {
+        // The meters are keyed on the lane label. If these ever drift apart,
+        // the phone's row sits at zero while its traffic is credited to a
+        // second row that appears from nowhere.
+        let paired = phone(Some("k"), &["cell"]);
+        let rows = relay_lane_rows(std::slice::from_ref(&paired));
+        let lane =
+            dl_net::path::Path::Relay { relay: paired.relay.clone(), network: "cell".into() };
+        assert_eq!(rows[0].id, lane.label(None));
+    }
+
+    #[test]
+    fn an_unpaired_phone_gets_no_sidebar_row() {
+        // It cannot serve, so a meter for it would sit at zero for ever.
+        assert!(relay_lane_rows(&[phone(None, &["cell"])]).is_empty());
+    }
 
     fn phone(key: Option<&str>, enabled: &[&str]) -> relays::Paired {
         relays::Paired {
