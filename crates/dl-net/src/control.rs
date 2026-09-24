@@ -433,6 +433,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ipv6_address_builds_a_url_the_client_accepts() {
+        // On an IPv6-only network every relay address is a v6 literal, so a
+        // URL that will not parse means discovery finds phones it can never
+        // speak to.
+        let url = format!("http://{}/braid/hello", "[2409:40e4:2004:769a::9ea5]:8710");
+        assert!(reqwest::Url::parse(&url).is_ok(), "{url} does not parse");
+    }
+
+    #[tokio::test]
+    async fn hello_over_ipv6_loopback_works_end_to_end() {
+        // The whole path, against a relay actually listening on ::1.
+        let relay = dl_testkit::Relay::spawn_phone_on_ipv6("Pixel", Vec::new()).await.unwrap();
+        let found = hello(&relay.addr().to_string()).await.expect("a v6 relay answers");
+        assert_eq!(found.name, "Pixel");
+    }
+
+    #[tokio::test]
     async fn hello_fails_on_something_that_is_not_a_relay() {
         // A port with nothing behind it. Discovery turns up addresses that are
         // routers and printers, and this is what tells them apart.

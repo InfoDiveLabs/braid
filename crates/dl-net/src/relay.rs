@@ -98,6 +98,18 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv6_address_keeps_its_brackets_through_the_proxy_url() {
+        // The address arrives already bracketed from discovery, and the
+        // credentials have to go in front of it without disturbing that.
+        let relay = Relay::new("Pixel", "[2409:40e4:2004:769a::9ea5]:8710", Some("k".into()));
+        assert_eq!(relay.proxy_url("cell"), "http://cell:k@[2409:40e4:2004:769a::9ea5]:8710");
+        assert!(
+            reqwest::Proxy::all(relay.proxy_url("cell")).is_ok(),
+            "the proxy URL must parse, or every lane through this phone fails"
+        );
+    }
+
+    #[test]
     fn the_network_travels_in_the_username() {
         // Two lanes on one phone differ only here, so it is the field that
         // decides which radio serves the request.

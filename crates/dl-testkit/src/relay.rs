@@ -24,6 +24,11 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct Relay {
     addr: SocketAddr,
     forwarded: Arc<AtomicU64>,
+    /// How many requests were answered with a 407.
+    ///
+    /// Lets a test ask the question that matters from the desktop's side: did
+    /// our client actually present its credentials, on this shape of request?
+    challenged: Arc<AtomicU64>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -31,6 +36,11 @@ impl Relay {
     /// Start one on an ephemeral loopback port.
     pub async fn spawn() -> std::io::Result<Self> {
         Self::start(None, None).await
+    }
+
+    /// How many requests this relay refused for want of a key.
+    pub fn challenged(&self) -> u64 {
+        self.challenged.load(Ordering::SeqCst)
     }
 
     /// The address it listens on, for a test that speaks to it directly.
@@ -45,7 +55,17 @@ impl Relay {
     /// a phone, the same way a fake interface provider tests multi-NIC code on
     /// a machine with one card.
     pub async fn spawn_phone(name: &str, lanes: Vec<Lane>) -> std::io::Result<Self> {
-        Self::start(None, Some(Identity::new(name, lanes, None))).await
+        Self::start_on("127.0.0.1:0", None, Some(Identity::new(name, lanes, None))).await
+    }
+
+    /// The same, listening on IPv6 loopback.
+    ///
+    /// An IPv6-only network is not exotic: a phone on an IPv6-only carrier,
+    /// sharing over a hotspot, gives a link with no IPv4 on it at all. Every
+    /// address the desktop then handles is a v6 literal, which has to be
+    /// bracketed to be a usable URL authority.
+    pub async fn spawn_phone_on_ipv6(name: &str, lanes: Vec<Lane>) -> std::io::Result<Self> {
+        Self::start_on("[::1]:0", None, Some(Identity::new(name, lanes, None))).await
     }
 
     /// A phone that has already been paired and will serve only that key.
@@ -67,12 +87,22 @@ impl Relay {
     }
 
     async fn start(cap: Option<u64>, identity: Option<Identity>) -> std::io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        Self::start_on("127.0.0.1:0", cap, identity).await
+    }
+
+    async fn start_on(
+        bind: &str,
+        cap: Option<u64>,
+        identity: Option<Identity>,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(bind).await?;
         let addr = listener.local_addr()?;
         let forwarded = Arc::new(AtomicU64::new(0));
+        let challenged = Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = tokio::sync::oneshot::channel();
 
         let counter = Arc::clone(&forwarded);
+        let challenges = Arc::clone(&challenged);
         tokio::spawn(async move {
             loop {
                 let accepted = tokio::select! {
@@ -82,19 +112,20 @@ impl Relay {
                 let Ok((client, _)) = accepted else { return };
                 let counter = Arc::clone(&counter);
                 let identity = identity.clone();
+                let challenge = Challenge(Arc::clone(&challenges));
                 tokio::spawn(async move {
                     let seen = counter.fetch_add(1, Ordering::SeqCst);
                     if cap.is_some_and(|cap| seen >= cap) {
                         return;
                     }
-                    if let Err(error) = forward(client, identity).await {
+                    if let Err(error) = forward(client, identity, challenge).await {
                         tracing::debug!(%error, "relay connection ended");
                     }
                 });
             }
         });
 
-        Ok(Self { addr, forwarded, shutdown: Some(tx) })
+        Ok(Self { addr, forwarded, challenged, shutdown: Some(tx) })
     }
 
     /// As a proxy URL, which is what `HttpConfig` wants.
@@ -124,6 +155,9 @@ impl Drop for Relay {
 /// desktop's parser is tested against an encoder that is not its own: the
 /// phone is a separate program in another language, and a field name that only
 /// agrees with itself would pass every test and fail on the first real device.
+#[derive(Clone)]
+struct Challenge(Arc<AtomicU64>);
+
 #[derive(Clone)]
 struct Identity {
     name: String,
@@ -219,7 +253,11 @@ fn quote(value: &str) -> String {
 /// A forward proxy receives the absolute URI on the request line: /// `GET http://host/path HTTP/1.1`: and sends the origin-form on. Everything
 /// else, headers and body alike, is copied through untouched: rewriting any of
 /// it here would hide a bug in what the engine actually sent.
-async fn forward(client: TcpStream, identity: Option<Identity>) -> std::io::Result<()> {
+async fn forward(
+    client: TcpStream,
+    identity: Option<Identity>,
+    challenge: Challenge,
+) -> std::io::Result<()> {
     let mut reader = BufReader::new(client);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
@@ -228,13 +266,6 @@ async fn forward(client: TcpStream, identity: Option<Identity>) -> std::io::Resu
     let method = parts.next().unwrap_or_default().to_string();
     let target = parts.next().unwrap_or_default().to_string();
     let version = parts.next().unwrap_or("HTTP/1.1").to_string();
-
-    // `CONNECT host:port` asks for a raw tunnel, which is how every HTTPS
-    // request through a proxy begins. Nothing inside it is ours to read: TLS
-    // starts immediately after the 200 and the proxy is a pipe from there on.
-    if method.eq_ignore_ascii_case("CONNECT") {
-        return tunnel(reader, &target).await;
-    }
 
     // An origin-form target is not proxy traffic. A real relay answers its
     // control plane on these paths, so a stand-in phone has to as well.
@@ -245,11 +276,8 @@ async fn forward(client: TcpStream, identity: Option<Identity>) -> std::io::Resu
         };
     }
 
-    let Some((host, path)) = split_absolute(&target) else {
-        let _ = reader.into_inner().write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-        return Ok(());
-    };
-
+    // Read the headers before branching, because both kinds of proxy request
+    // have to be authorised and a `CONNECT` carries its credentials here too.
     let mut headers = Vec::new();
     let mut proxy_headers = Vec::new();
     loop {
@@ -268,13 +296,28 @@ async fn forward(client: TcpStream, identity: Option<Identity>) -> std::io::Resu
         }
     }
 
-    // Proxy traffic from a desktop that has not paired is refused. Without
-    // this, anyone who can reach the port can spend the phone's data.
+    // Proxy traffic from a desktop that has not paired is refused, whichever
+    // shape it takes. Checking only the absolute-URI form would mean every
+    // test of "an unpaired desktop is refused" passed over a path that real
+    // traffic never takes, since a download from an HTTPS origin is a tunnel.
     if let Some(expected) = identity.as_ref().and_then(|i| i.key.as_deref())
         && !presents(&proxy_headers, expected)
     {
+        challenge.0.fetch_add(1, Ordering::SeqCst);
         return respond(reader.into_inner(), 407, "pair with this phone first").await;
     }
+
+    // `CONNECT host:port` asks for a raw tunnel, which is how every HTTPS
+    // request through a proxy begins. Nothing inside it is ours to read: TLS
+    // starts immediately after the 200 and the proxy is a pipe from there on.
+    if method.eq_ignore_ascii_case("CONNECT") {
+        return tunnel(reader, &target).await;
+    }
+
+    let Some((host, path)) = split_absolute(&target) else {
+        let _ = reader.into_inner().write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        return Ok(());
+    };
 
     let mut upstream = TcpStream::connect(&host).await?;
     let mut head = format!("{method} {path} {version}\r\n");
@@ -312,17 +355,7 @@ async fn forward(client: TcpStream, identity: Option<Identity>) -> std::io::Resu
 /// The reply must be sent before anything is forwarded, and the headers the
 /// client sent with the `CONNECT` are consumed and discarded: they belong to
 /// the proxy hop, not to whatever is tunnelled.
-async fn tunnel(mut reader: BufReader<TcpStream>, target: &str) -> std::io::Result<()> {
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
-            break;
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-    }
-
+async fn tunnel(reader: BufReader<TcpStream>, target: &str) -> std::io::Result<()> {
     let upstream = match TcpStream::connect(target).await {
         Ok(upstream) => upstream,
         Err(error) => {
@@ -479,6 +512,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unpaired_desktop_cannot_open_a_tunnel_either() {
+        // The path that matters. A download from an HTTPS origin is a CONNECT
+        // tunnel, so a stand-in phone that authorised only the absolute-URI
+        // form would let every desktop test of "unpaired is refused" pass over
+        // a path real traffic never takes.
+        let relay = Relay::spawn_paired_phone("Pixel", Vec::new(), "secret").await.unwrap();
+        let raw = raw_request(&relay, "CONNECT example.test:443 HTTP/1.1", "").await;
+        assert!(raw.starts_with("HTTP/1.1 407"), "expected a challenge, got {raw:?}");
+    }
+
+    #[tokio::test]
+    async fn a_paired_desktop_may_open_a_tunnel() {
+        // The other half: the key has to actually work on this path, or HTTPS
+        // downloads through a phone are refused for everyone.
+        let relay = Relay::spawn_paired_phone("Pixel", Vec::new(), "secret").await.unwrap();
+        let credentials = base64_encode("cell:secret");
+        let raw = raw_with_header(
+            &relay,
+            "CONNECT 127.0.0.1:9 HTTP/1.1",
+            &format!("Proxy-Authorization: Basic {credentials}"),
+        )
+        .await;
+        assert!(!raw.starts_with("HTTP/1.1 407"), "a paired desktop was challenged: {raw:?}");
+    }
+
+    #[tokio::test]
     async fn an_unpaired_desktop_cannot_use_the_proxy() {
         // Without this, anyone on the same Wi-Fi can spend the phone's data.
         let relay = Relay::spawn_paired_phone("Pixel", Vec::new(), "secret").await.unwrap();
@@ -500,6 +559,37 @@ mod tests {
         let relay = Relay::spawn().await.unwrap();
         let raw = raw_request(&relay, "GET /braid/hello HTTP/1.1", "").await;
         assert!(raw.starts_with("HTTP/1.1 404"), "got {raw:?}");
+    }
+
+    /// Send one request with an extra header and return the whole response.
+    async fn raw_with_header(relay: &Relay, line: &str, header: &str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(relay.addr()).await.unwrap();
+        let request = format!("{line}\r\nHost: relay\r\n{header}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        let _ = stream.read_to_string(&mut raw).await;
+        raw
+    }
+
+    /// Only used to build a test credential.
+    fn base64_encode(input: &str) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes = input.as_bytes();
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(TABLE[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
     }
 
     /// Send one request and return the body.

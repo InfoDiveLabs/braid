@@ -234,6 +234,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_key_is_presented_on_a_tunnel_and_not_only_on_a_plain_request() {
+        // Every download from an HTTPS origin begins with CONNECT, so if our
+        // client sent credentials only on absolute-URI requests, every real
+        // transfer through a phone would be refused while the tests passed.
+        // Asked of the relay rather than of the response, because the upstream
+        // here does not exist and the connection fails either way: the
+        // question is whether we were challenged, not whether we connected.
+        let phone =
+            dl_testkit::Relay::spawn_paired_phone("Pixel", Vec::new(), "secret").await.unwrap();
+        let relay = Relay::new("Pixel", phone.addr().to_string(), Some("secret".into()));
+        let paths = vec![Path::Relay { relay, network: "cell".into() }];
+        let lanes = PathLanes::build(
+            &paths,
+            "https://example.invalid/payload.bin",
+            &HttpConfig::default(),
+            &FakeInterfaces(Vec::new()),
+        )
+        .unwrap();
+
+        let _ = lanes.source(0).probe().await;
+        assert_eq!(phone.challenged(), 0, "our client did not authenticate its CONNECT");
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_without_a_key_is_challenged() {
+        // The control case. Without it the assertion above could pass because
+        // the relay never checks, which is exactly the gap it is testing for.
+        let phone =
+            dl_testkit::Relay::spawn_paired_phone("Pixel", Vec::new(), "secret").await.unwrap();
+        let relay = Relay::new("Pixel", phone.addr().to_string(), None);
+        let paths = vec![Path::Relay { relay, network: "cell".into() }];
+        let lanes = PathLanes::build(
+            &paths,
+            "https://example.invalid/payload.bin",
+            &HttpConfig::default(),
+            &FakeInterfaces(Vec::new()),
+        )
+        .unwrap();
+
+        let _ = lanes.source(0).probe().await;
+        assert!(phone.challenged() > 0, "an unpaired desktop opened a tunnel");
+    }
+
+    #[tokio::test]
     async fn an_unpaired_desktop_is_refused_by_a_phone_that_wants_a_key() {
         // The other half of the same claim. If this ever passes, the phone is
         // an open proxy and anyone nearby can spend its data.

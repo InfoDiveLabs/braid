@@ -73,6 +73,12 @@ pub struct Interface {
     /// A NIC with an address but no gateway cannot reach the internet, however
     /// "up" it claims to be.
     pub has_gateway: bool,
+    /// The IPv6 gateway, when the system reports one.
+    ///
+    /// Kept beside the IPv4 rather than instead of it: a phone tethering on an
+    /// IPv6-only carrier creates a link with no IPv4 on it at all, so looking
+    /// only at `gateway_ipv4` finds nothing to probe.
+    pub gateway_ipv6: Option<Ipv6Addr>,
     /// The gateway itself, when the system reports one.
     ///
     /// Kept rather than reduced to the flag above because a USB-tethered phone
@@ -98,6 +104,7 @@ impl Interface {
             is_loopback: false,
             has_gateway: false,
             gateway_ipv4: None,
+            gateway_ipv6: None,
             kind: InterfaceKind::default(),
             service_name: None,
         }
@@ -190,6 +197,7 @@ impl InterfaceProvider for SystemInterfaces {
                 is_up: i.is_up(),
                 has_gateway: i.gateway.is_some(),
                 gateway_ipv4: i.gateway.as_ref().and_then(|g| g.ipv4.first().copied()),
+                gateway_ipv6: i.gateway.as_ref().and_then(|g| g.ipv6.first().copied()),
                 kind: kind_of(i.if_type),
                 service_name: i.friendly_name.clone(),
                 name: i.name,
@@ -319,6 +327,7 @@ mod tests {
             is_loopback: loopback,
             has_gateway: !loopback,
             gateway_ipv4: (!loopback).then(|| "10.0.0.1".parse().unwrap()),
+            gateway_ipv6: None,
             kind: InterfaceKind::default(),
             service_name: None,
         }
@@ -337,6 +346,7 @@ mod tests {
             is_loopback: false,
             has_gateway: true,
             gateway_ipv4: None,
+            gateway_ipv6: None,
             kind: InterfaceKind::default(),
             service_name: None,
         };
@@ -355,6 +365,7 @@ mod tests {
             is_loopback: false,
             has_gateway: true,
             gateway_ipv4: None,
+            gateway_ipv6: None,
             kind: InterfaceKind::default(),
             service_name: None,
         };

@@ -7,6 +7,7 @@
 
 use crate::control::{self, Hello};
 use crate::iface::InterfaceProvider;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// The port the companion listens on.
@@ -35,9 +36,33 @@ pub fn tether_candidates(provider: &dyn InterfaceProvider) -> Vec<String> {
         .interfaces()
         .into_iter()
         .filter(|interface| !interface.is_loopback)
-        .filter_map(|interface| interface.gateway_ipv4)
-        .map(|gateway| format!("{gateway}:{RELAY_PORT}"))
+        .flat_map(|interface| {
+            // Both families. A phone tethering on an IPv6-only carrier creates
+            // a link carrying no IPv4 at all, so an IPv4-only search finds
+            // nothing on exactly the networks this feature is most useful on.
+            let v4 = interface.gateway_ipv4.map(IpAddr::from);
+            let v6 = interface.gateway_ipv6.map(IpAddr::from);
+            [v4, v6].into_iter().flatten()
+        })
+        .map(|gateway| endpoint(gateway, RELAY_PORT))
         .collect()
+}
+
+/// An address and port as a URL authority.
+///
+/// Through `SocketAddr` rather than by formatting, because an IPv6 literal has
+/// to be bracketed: `2409:db8::1:8710` is ambiguous and unusable, and
+/// `[2409:db8::1]:8710` is what every URL parser and proxy setting expects.
+fn endpoint(address: IpAddr, port: u16) -> String {
+    SocketAddr::new(address, port).to_string()
+}
+
+/// Addresses that only mean something with a scope attached.
+fn is_link_local(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
 }
 
 /// Browse the local network for companions.
@@ -53,7 +78,17 @@ pub async fn browse(timeout: Duration) -> Vec<Candidate> {
     while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, receiver.recv_async()).await {
         if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
             for address in info.get_addresses() {
-                addresses.push(format!("{address}:{}", info.get_port()));
+                // A link-local address would need its scope id to be usable,
+                // and a scope id is only meaningful on the machine that
+                // produced it. Skip them: a companion advertising a global or
+                // site address is reachable, and one advertising only
+                // link-local is a problem to report rather than to guess at.
+                let address = address.to_ip_addr();
+                if is_link_local(&address) {
+                    tracing::debug!(%address, "ignoring a link-local relay address");
+                    continue;
+                }
+                addresses.push(endpoint(address, info.get_port()));
             }
         }
     }
@@ -88,6 +123,50 @@ mod tests {
     use super::*;
     use crate::iface::{FakeInterfaces, Interface, InterfaceKind};
 
+    #[test]
+    fn an_ipv6_relay_address_is_bracketed() {
+        // `2409:db8::1:8710` is ambiguous and unusable as a URL authority, and
+        // an IPv6-only network is exactly where a phone's mobile data is worth
+        // borrowing, so getting this wrong breaks the feature where it matters
+        // most.
+        let address: IpAddr = "2409:40e4:2004:769a::9ea5".parse().unwrap();
+        assert_eq!(endpoint(address, RELAY_PORT), "[2409:40e4:2004:769a::9ea5]:8710");
+    }
+
+    #[test]
+    fn an_ipv4_relay_address_is_not_bracketed() {
+        let address: IpAddr = "192.168.42.129".parse().unwrap();
+        assert_eq!(endpoint(address, RELAY_PORT), "192.168.42.129:8710");
+    }
+
+    #[test]
+    fn a_tether_link_with_only_ipv6_is_still_probed() {
+        // A phone tethering on an IPv6-only carrier creates a link with no
+        // IPv4 on it at all. Looking only at the IPv4 gateway finds nothing.
+        let mut interface = interface("en5", None, false);
+        interface.gateway_ipv6 = Some("fd00::1".parse().unwrap());
+        let found = tether_candidates(&FakeInterfaces(vec![interface]));
+        assert_eq!(found, vec!["[fd00::1]:8710".to_string()]);
+    }
+
+    #[test]
+    fn a_dual_stack_tether_link_offers_both() {
+        let mut interface = interface("en5", Some("192.168.42.129"), false);
+        interface.gateway_ipv6 = Some("fd00::1".parse().unwrap());
+        let found = tether_candidates(&FakeInterfaces(vec![interface]));
+        assert_eq!(found, vec!["192.168.42.129:8710".to_string(), "[fd00::1]:8710".to_string()]);
+    }
+
+    #[test]
+    fn link_local_addresses_are_recognised() {
+        // Advertised by mDNS constantly, and unusable without a scope id that
+        // only means something on the machine that produced it.
+        assert!(is_link_local(&"fe80::1".parse().unwrap()));
+        assert!(is_link_local(&"169.254.1.1".parse().unwrap()));
+        assert!(!is_link_local(&"2409:40e4:2004:769a::1".parse().unwrap()));
+        assert!(!is_link_local(&"192.168.1.1".parse().unwrap()));
+    }
+
     fn interface(name: &str, gateway: Option<&str>, loopback: bool) -> Interface {
         Interface {
             name: name.into(),
@@ -98,6 +177,7 @@ mod tests {
             is_loopback: loopback,
             has_gateway: gateway.is_some(),
             gateway_ipv4: gateway.map(|g| g.parse().unwrap()),
+            gateway_ipv6: None,
             kind: InterfaceKind::default(),
             service_name: None,
         }
