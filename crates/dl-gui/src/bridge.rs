@@ -77,7 +77,11 @@ fn axis_max(rate: u64) -> u64 {
 }
 
 pub fn format_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    // Binary units with the labels that actually match them. Dividing by 1024
+    // and calling the result MB is the usual convention and still a lie: it
+    // reads seven percent low against the figure a download page quotes, and
+    // it disagreed with the phone companion, which counts the same transfer.
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = n as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -1403,8 +1407,8 @@ mod tests {
     #[test]
     fn byte_formatting() {
         assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1 << 30), "1.0 GB");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1 << 30), "1.0 GiB");
     }
 
     #[test]

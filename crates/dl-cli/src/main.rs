@@ -91,7 +91,7 @@ struct AddArgs {
     verify: Option<String>,
 
     /// How hard to work to survive a power cut: `safe` flushes on every
-    /// completed chunk, `balanced` on a 5 second or 64 MB floor, `fast` leaves
+    /// completed chunk, `balanced` on a 5 second or 64 MiB floor, `fast` leaves
     /// the journal flush to the operating system.
     ///
     /// Looser modes never risk a wrong file: only more re-downloading after a

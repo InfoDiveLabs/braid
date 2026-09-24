@@ -40,7 +40,7 @@ pub fn run() -> Result<()> {
         let path = root.join("target/release").join(format!("{bin}{EXE}"));
         let bytes =
             std::fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?.len();
-        println!("  {bin:<8} {bytes:>12} bytes ({:.2} MB)", bytes as f64 / 1_048_576.0);
+        println!("  {bin:<8} {bytes:>12} bytes ({:.2} MiB)", bytes as f64 / 1_048_576.0);
     }
 
     verify_release_is_clean()

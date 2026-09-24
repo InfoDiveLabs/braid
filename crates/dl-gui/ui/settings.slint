@@ -31,7 +31,7 @@ export struct InterfaceSetting {
     /// "up" | "metered" | "down"
     status: string,
     enabled: bool,
-    /// Rendered as typed: "Unlimited", "5 MB/s", or "-" when excluded.
+    /// Rendered as typed: "Unlimited", "5 MiB/s", or "-" when excluded.
     limit: string,
 }
 
@@ -718,7 +718,7 @@ export component SettingsWindow inherits Window {
                                     Field {
                                         width: 96px;
                                         text: root.limit-text;
-                                        placeholder: "MB/s";
+                                        placeholder: "MiB/s";
                                         enabled: root.limited;
                                         label: "Download limit";
                                         edited(v) => { root.set-limit(v); }
@@ -744,7 +744,7 @@ export component SettingsWindow inherits Window {
                                     Field {
                                         width: 96px;
                                         text: root.upload-limit-text;
-                                        placeholder: "MB/s";
+                                        placeholder: "MiB/s";
                                         enabled: root.upload-limited;
                                         label: "Upload limit";
                                         edited(v) => { root.set-upload-limit(v); }
@@ -934,7 +934,7 @@ export component SettingsWindow inherits Window {
                                             ? "Safe flushes on every completed chunk and survives a "
                                                 + "power cut at the cost of speed."
                                             : root.durability == 1
-                                            ? "Balanced flushes to disk every 5 seconds or 64 MB. "
+                                            ? "Balanced flushes to disk every 5 seconds or 64 MiB. "
                                                 + "A crash costs at most that much re-downloading."
                                             : "Fast leaves flushing to the operating system. A power "
                                                 + "cut can cost the whole transfer.";
@@ -1014,7 +1014,7 @@ export component SettingsWindow inherits Window {
                                 VerticalLayout {
                                     alignment: center;
                                     Dropdown {
-                                        options: ["Automatic", "1 MB", "4 MB", "16 MB", "64 MB"];
+                                        options: ["Automatic", "1 MiB", "4 MiB", "16 MiB", "64 MiB"];
                                         selected: root.chunk-size;
                                         label: "Chunk size";
                                         chose(i) => { root.set-chunk-size(i); }

@@ -243,10 +243,10 @@ component InterfaceRow inherits Rectangle {
         }
         Rectangle { }
         // Fixed, right-aligned: the figure changes width as it moves through
-        // "0 B/s" and "12.0 MB/s", and sized to its content it dragged the
+        // "0 B/s" and "12.0 MiB/s", and sized to its content it dragged the
         // label beside it about.
         Text {
-            // Wide enough for "948.7 KB/s"; at 64px the unit was clipped.
+            // Wide enough for "948.7 KiB/s"; at 64px the unit was clipped.
             width: 78px;
             horizontal-stretch: 0;
             text: root.rate;

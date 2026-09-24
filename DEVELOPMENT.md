@@ -129,8 +129,8 @@ which is why this uses femtovg rather than skia.
 ```console
 $ cargo run -p xtask -- size
 release binaries for aarch64-apple-darwin
-  dl            6191184 bytes (5.90 MB)
-  braid        16258496 bytes (15.51 MB)
+  dl            6191184 bytes (5.90 MiB)
+  braid        16258496 bytes (15.51 MiB)
 ```
 
 Reported per platform, not checked against a stored number: a macOS arm64

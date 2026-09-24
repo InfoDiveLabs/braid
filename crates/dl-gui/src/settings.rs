@@ -777,7 +777,11 @@ pub fn parse_rate(text: &str) -> Option<u64> {
 
 /// Render a rate back into the field it came from.
 pub fn format_rate(bytes_per_sec: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    // Binary units with the labels that actually match them. Dividing by 1024
+    // and calling the result MB is the usual convention and still a lie: it
+    // reads seven percent low against the figure a download page quotes, and
+    // it disagreed with the phone companion, which counts the same transfer.
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = bytes_per_sec as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -914,7 +918,7 @@ mod tests {
                 assert_eq!(parse_rate(&text), Some(rate), "{text} did not round-trip");
             }
         }
-        assert_eq!(format_rate_per_sec(20 << 20), "20 MB/s");
+        assert_eq!(format_rate_per_sec(20 << 20), "20 MiB/s");
     }
 
     #[test]

@@ -19,7 +19,7 @@
   <img alt="Platforms" src="https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-14110E?style=flat-square">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-D07A40?style=flat-square&logo=rust&logoColor=white">
   <img alt="Licence" src="https://img.shields.io/badge/GPL--3.0-3FA292?style=flat-square">
-  <img alt="Binary size" src="https://img.shields.io/badge/15.5%20to%2023.4%20MB-14110E?style=flat-square">
+  <img alt="Binary size" src="https://img.shields.io/badge/15.5%20to%2023.4%20MiB-14110E?style=flat-square">
 </p>
 
 ---
@@ -138,7 +138,7 @@ One build for every architecture, since it carries no native code.
 | | |
 |---|---|
 | Requires | Android 8.0 or newer |
-| Download | `braid-android-0.1.0.apk`, 523 KB, with `SHA256SUMS` |
+| Download | `braid-android-0.1.0.apk`, 511 KiB, with `SHA256SUMS` |
 | Signing key | `04:C0:0D:53:6A:D1:DB:AD:25:90:C8:43:3C:41:6B:EA:6A:66:4C:9E:2B:4C:B6:E5:49:C2:4F:80:B5:08:77:E2` |
 
 That repository is **private** for now, so the link works only for InfoDive Labs
@@ -233,8 +233,8 @@ they differ only in how often the pair happens.
 | Mode | Flushes | Journal |
 |---|---|---|
 | Safe | every chunk | waits for the drive |
-| Balanced | 5 s or 64 MB | waits for the drive |
-| Fast | 30 s or 512 MB | leaves it to the OS |
+| Balanced | 5 s or 64 MiB | waits for the drive |
+| Fast | 30 s or 512 MiB | leaves it to the OS |
 
 ---
 
