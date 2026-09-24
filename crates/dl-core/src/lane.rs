@@ -1,12 +1,17 @@
-//! Independent paths to the same bytes, and how work is spread across them.
+//! Independent paths to the same bytes, and what each of them is doing.
 //!
 //! A lane is usually one network interface, but the engine never learns that.
 //! It sees a set of sources that fetch the same resource at different speeds
 //! and fail independently, which is also the shape of multiple mirrors: so
 //! phase 7 reuses this rather than adding a parallel mechanism.
+//!
+//! Which lane carries which chunk is decided in [`crate::regions`], by giving
+//! each lane its own run of the file. This module keeps the account: how fast
+//! each lane is going, how much it has carried, and whether it is still fit to
+//! be handed work.
 
 use crate::source::ByteSource;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Weight given to each new measurement. Low enough to ride out one slow
@@ -16,6 +21,19 @@ const EWMA_ALPHA: f64 = 0.3;
 /// Consecutive failures before a lane is taken out of rotation.
 const FAILURES_BEFORE_PARKED: u32 = 3;
 
+/// How often a lane's rate is recalculated.
+///
+/// Short enough that the sidebar reads as live and a path that just degraded
+/// is noticed; long enough that a fast lane is not doing arithmetic on every
+/// socket read.
+pub const SAMPLE_WINDOW: Duration = Duration::from_millis(250);
+
+/// A lane that appeared after the transfer began.
+pub struct Joined {
+    pub label: String,
+    pub source: Arc<dyn ByteSource>,
+}
+
 pub trait LaneSet: Send + Sync {
     fn len(&self) -> usize;
     fn source(&self, lane: usize) -> &dyn ByteSource;
@@ -23,6 +41,22 @@ pub trait LaneSet: Send + Sync {
 
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Lanes that have become available since the transfer started, given how
+    /// many the caller already knows about.
+    ///
+    /// This is how a phone paired mid-download starts carrying bytes without
+    /// the transfer being restarted. The default is none, so a set whose
+    /// membership is fixed needs no code.
+    ///
+    /// Whatever is returned must serve the same resource as the lanes already
+    /// in use: these are not probed against the reference the way the original
+    /// lanes were, because by this point the file is half written and a
+    /// disagreement has nothing useful to say.
+    fn joined(&self, known: usize) -> Vec<Joined> {
+        let _ = known;
+        Vec::new()
     }
 }
 
@@ -50,13 +84,6 @@ impl LaneSet for SingleLane<'_> {
     }
 }
 
-/// How often a lane's rate is recalculated while a chunk is in flight.
-///
-/// Short enough that the sidebar reads as live and the assignment reacts to a
-/// path that just degraded; long enough that a fast lane is not sampling on
-/// every read.
-const SAMPLE_WINDOW: Duration = Duration::from_millis(250);
-
 /// Fold a rate observation into a lane's smoothed estimate.
 fn fold(entry: &mut LaneState, sample: f64) {
     entry.throughput = Some(match entry.throughput {
@@ -65,19 +92,37 @@ fn fold(entry: &mut LaneState, sample: f64) {
     });
 }
 
+/// Close the current measurement window if it has run its course.
+///
+/// Every byte a lane carries is counted here and nowhere else, so a lane's rate
+/// is bytes over wall-clock however many connections it has open. Folding a
+/// single chunk's rate separately, as this used to on completion, described one
+/// connection rather than the lane: with eight connections open the sidebar
+/// read a fraction of what the interface was really doing, and the per-lane
+/// figures no longer added up to the transfer's.
+///
+/// Also called when a lane is merely read, so a window that closes with no
+/// bytes in it folds a zero. Without that a lane that stops carrying anything
+/// keeps reporting whatever it last managed, which is how a paused transfer
+/// left speeds sitting on the screen.
+fn sample(entry: &mut LaneState, now: Instant) {
+    let Some(opened) = entry.live_at else { return };
+    let elapsed = now.duration_since(opened);
+    if elapsed < SAMPLE_WINDOW {
+        return;
+    }
+    fold(entry, entry.live_bytes as f64 / elapsed.as_secs_f64());
+    entry.live_bytes = 0;
+    entry.live_at = Some(now);
+}
+
 #[derive(Clone, Debug, Default)]
 struct LaneState {
+    label: String,
     /// Smoothed throughput in bytes per second. `None` until first measured.
     throughput: Option<f64>,
-    /// Configured ceiling in bytes per second, if this lane is capped.
-    cap: Option<f64>,
-    inflight: u32,
     bytes: u64,
-    /// Bytes seen since the last rate sample, and when that sample was taken.
-    ///
-    /// Without these a lane's rate was only recalculated when a chunk
-    /// finished, so a slow path reported a figure minutes old and the
-    /// assignment kept weighting it on what it used to be worth.
+    /// Bytes seen since the open window began, and when it began.
     live_bytes: u64,
     live_at: Option<Instant>,
     chunks: u64,
@@ -91,25 +136,6 @@ struct LaneState {
     parked_until: Option<Instant>,
 }
 
-impl LaneState {
-    /// Higher is better. Dividing by in-flight work stops the fastest lane
-    /// being handed every chunk while it is already saturated.
-    ///
-    /// A configured cap bounds the estimate and, before any measurement
-    /// exists, stands in for one. Otherwise a lane throttled to 100 KB/s would
-    /// be handed the same share as an unthrottled one until enough chunks had
-    /// crawled through it to teach the average otherwise.
-    fn score(&self) -> f64 {
-        let estimate = match (self.throughput, self.cap) {
-            (Some(measured), Some(cap)) => measured.min(cap),
-            (Some(measured), None) => measured,
-            (None, Some(cap)) => cap,
-            (None, None) => 0.0,
-        };
-        estimate / (self.inflight as f64 + 1.0)
-    }
-}
-
 /// What a lane has done so far, for the UI and for `dl interfaces`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaneReport {
@@ -121,16 +147,16 @@ pub struct LaneReport {
     pub parked: bool,
 }
 
-/// Chooses which lane should carry the next chunk.
+/// The running account of every lane in a transfer.
 pub struct LaneSelector {
-    labels: Vec<String>,
     state: Mutex<Vec<LaneState>>,
 }
 
 impl LaneSelector {
     pub fn new(labels: Vec<String>) -> Self {
-        let state = vec![LaneState::default(); labels.len()];
-        Self { labels, state: Mutex::new(state) }
+        let state =
+            labels.into_iter().map(|label| LaneState { label, ..Default::default() }).collect();
+        Self { state: Mutex::new(state) }
     }
 
     pub fn from_lanes(lanes: &dyn LaneSet) -> Self {
@@ -138,11 +164,21 @@ impl LaneSelector {
     }
 
     pub fn len(&self) -> usize {
-        self.labels.len()
+        self.state.lock().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.labels.is_empty()
+        self.len() == 0
+    }
+
+    /// Take on a lane that appeared after the transfer started.
+    ///
+    /// Returns its index, which callers rely on matching the index the same
+    /// lane has in the lane set: both grow only here and only by appending.
+    pub fn join(&self, label: String) -> usize {
+        let mut state = self.state.lock().unwrap();
+        state.push(LaneState { label, ..Default::default() });
+        state.len() - 1
     }
 
     /// Return any timed parks whose period has elapsed to service.
@@ -158,6 +194,20 @@ impl LaneSelector {
         }
     }
 
+    /// Whether this lane may be handed a chunk right now.
+    ///
+    /// The only reason to say no is that the lane is out of rotation: a
+    /// failure streak, a rate limit still running, or a probe it could not
+    /// answer.
+    pub fn claim(&self, lane: usize) -> bool {
+        let mut state = self.state.lock().unwrap();
+        // Checked here rather than on a timer: this is where the answer
+        // matters, so a lane cannot be left parked past its period by nobody
+        // having asked.
+        Self::expire_parks(&mut state, Instant::now());
+        state.get(lane).is_some_and(|entry| !entry.parked)
+    }
+
     /// Take a lane out of rotation for a stated period.
     ///
     /// Used for a rate limit, where the origin has told us how long to wait.
@@ -166,7 +216,6 @@ impl LaneSelector {
     pub fn park_for(&self, lane: usize, period: Duration) {
         let mut state = self.state.lock().unwrap();
         if let Some(entry) = state.get_mut(lane) {
-            entry.inflight = entry.inflight.saturating_sub(1);
             entry.parked = true;
             let until = Instant::now() + period;
             // Never shorten an existing wait: two limits arriving together
@@ -192,83 +241,58 @@ impl LaneSelector {
             .min()
     }
 
-    /// Claim a lane for one chunk, or `None` if every lane is parked.
+    /// How much longer a parked lane has to wait.
     ///
-    /// Unmeasured lanes are claimed first: a lane with no measurement has a
-    /// score of zero and would never be chosen on throughput alone, so the
-    /// fastest interface found first would keep all the work and the others
-    /// would never be tried.
-    pub fn acquire(&self) -> Option<usize> {
+    /// `None` means it is not coming back, which is a caller's cue to stop
+    /// offering it work. A lane that is not parked at all answers zero, so a
+    /// worker that lost a race here simply goes round again.
+    pub fn park_remaining(&self, lane: usize) -> Option<Duration> {
         let mut state = self.state.lock().unwrap();
-        // Checked here rather than on a timer: this is the only place the
-        // answer matters, so a lane cannot be left parked past its period by
-        // nobody having asked.
-        Self::expire_parks(&mut state, Instant::now());
-
-        let cold = state
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| !s.parked && s.throughput.is_none() && s.inflight == 0)
-            .map(|(i, _)| i)
-            .next();
-
-        let chosen = cold.or_else(|| {
-            state
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| !s.parked)
-                .max_by(|(_, a), (_, b)| {
-                    a.score().partial_cmp(&b.score()).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(i, _)| i)
-        })?;
-
-        state[chosen].inflight += 1;
-        Some(chosen)
+        let now = Instant::now();
+        Self::expire_parks(&mut state, now);
+        let entry = state.get(lane)?;
+        if !entry.parked {
+            return Some(Duration::ZERO);
+        }
+        entry.parked_until.map(|until| until.saturating_duration_since(now))
     }
 
-    /// Report a completed chunk and update the lane's measured throughput.
-    pub fn completed(&self, lane: usize, bytes: u64, elapsed: Duration) {
+    /// Report a completed chunk.
+    ///
+    /// The rate is not touched here: those bytes were counted by
+    /// [`Self::progressed`] as they arrived, and the window they belong to may
+    /// still be open for the lane's other connections.
+    pub fn completed(&self, lane: usize, bytes: u64) {
         let mut state = self.state.lock().unwrap();
         let Some(entry) = state.get_mut(lane) else { return };
-
-        entry.inflight = entry.inflight.saturating_sub(1);
         entry.bytes += bytes;
         entry.chunks += 1;
         entry.consecutive_failures = 0;
-        entry.live_bytes = 0;
-        entry.live_at = None;
-
-        let secs = elapsed.as_secs_f64();
-        if secs > 0.0 {
-            fold(entry, bytes as f64 / secs);
-        }
     }
 
     /// Bytes have arrived on a lane, mid-chunk.
     ///
-    /// Called as the body streams rather than when it ends, which is what
-    /// makes a rate current. The window keeps the cost to one sample every
-    /// [`SAMPLE_WINDOW`] however small the reads are, and the same figure
-    /// feeds the assignment, so work moves off a path that has just slowed
-    /// down instead of after its chunk eventually lands.
+    /// Called as the body streams rather than when it ends, which is what makes
+    /// a rate current: otherwise a slow path reports a figure minutes old.
     pub fn progressed(&self, lane: usize, bytes: u64) {
+        self.progressed_at(lane, bytes, Instant::now());
+    }
+
+    /// The same, with the clock supplied, so a test can measure a window
+    /// without sleeping through one.
+    pub fn progressed_at(&self, lane: usize, bytes: u64, now: Instant) {
         let mut state = self.state.lock().unwrap();
         let Some(entry) = state.get_mut(lane) else { return };
         entry.live_bytes += bytes;
+        entry.live_at.get_or_insert(now);
+        sample(entry, now);
+    }
 
-        let started = *entry.live_at.get_or_insert_with(Instant::now);
-        let elapsed = started.elapsed();
-        if elapsed < SAMPLE_WINDOW {
-            return;
+    /// Close any window that has run its course, whether or not bytes arrived.
+    fn settle(state: &mut [LaneState], now: Instant) {
+        for entry in state.iter_mut() {
+            sample(entry, now);
         }
-
-        let secs = elapsed.as_secs_f64();
-        if secs > 0.0 {
-            fold(entry, entry.live_bytes as f64 / secs);
-        }
-        entry.live_bytes = 0;
-        entry.live_at = Some(Instant::now());
     }
 
     /// Release a lane after a failure that was not the lane's fault.
@@ -277,12 +301,7 @@ impl LaneSelector {
     /// identically on every path. Counting those against the lane would park
     /// each interface in turn and then report "all paths failed" instead of
     /// the actual cause.
-    pub fn released(&self, lane: usize) {
-        let mut state = self.state.lock().unwrap();
-        if let Some(entry) = state.get_mut(lane) {
-            entry.inflight = entry.inflight.saturating_sub(1);
-        }
-    }
+    pub fn released(&self, _lane: usize) {}
 
     /// Report a failed chunk. Repeated failures park the lane so work migrates
     /// to the others instead of retrying a NIC that has gone away.
@@ -290,19 +309,9 @@ impl LaneSelector {
         let mut state = self.state.lock().unwrap();
         let Some(entry) = state.get_mut(lane) else { return };
 
-        entry.inflight = entry.inflight.saturating_sub(1);
         entry.consecutive_failures += 1;
         if entry.consecutive_failures >= FAILURES_BEFORE_PARKED {
             entry.parked = true;
-        }
-    }
-
-    /// Tell the selector a lane is capped, so assignment reflects the ceiling
-    /// from the first chunk rather than after learning it the slow way.
-    pub fn set_cap(&self, lane: usize, bytes_per_sec: Option<u64>) {
-        let mut state = self.state.lock().unwrap();
-        if let Some(entry) = state.get_mut(lane) {
-            entry.cap = bytes_per_sec.filter(|r| *r > 0).map(|r| r as f64);
         }
     }
 
@@ -334,14 +343,38 @@ impl LaneSelector {
         !state.is_empty() && state.iter().all(|s| s.parked && s.parked_until.is_none())
     }
 
+    /// Close every open window, however short it was.
+    ///
+    /// Called when a transfer ends. A download that finishes inside a single
+    /// sample window would otherwise report no rate at all, because no window
+    /// ever ran its course and nothing was ever folded: which is exactly the
+    /// case for a small file on a fast link.
+    pub fn close(&self) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        for entry in state.iter_mut() {
+            let Some(opened) = entry.live_at.take() else { continue };
+            let elapsed = now.duration_since(opened);
+            if entry.live_bytes > 0 && elapsed > Duration::ZERO {
+                fold(entry, entry.live_bytes as f64 / elapsed.as_secs_f64());
+            }
+            entry.live_bytes = 0;
+        }
+    }
+
     pub fn reports(&self) -> Vec<LaneReport> {
-        let state = self.state.lock().unwrap();
+        self.reports_at(Instant::now())
+    }
+
+    pub fn reports_at(&self, now: Instant) -> Vec<LaneReport> {
+        let mut state = self.state.lock().unwrap();
+        Self::settle(&mut state, now);
         state
             .iter()
             .enumerate()
             .map(|(lane, s)| LaneReport {
                 lane,
-                label: self.labels[lane].clone(),
+                label: s.label.clone(),
                 bytes: s.bytes,
                 chunks: s.chunks,
                 throughput: s.throughput,
@@ -352,8 +385,17 @@ impl LaneSelector {
 
     /// Combined throughput across every lane, which is the number that should
     /// exceed any single interface for aggregation to be worth anything.
+    ///
+    /// This is also the transfer's rate. Reporting it from here rather than
+    /// measuring the download separately is what makes the sidebar's figures
+    /// add up to the one in the header: there is one measurement, not two.
     pub fn aggregate_throughput(&self) -> f64 {
-        let state = self.state.lock().unwrap();
+        self.aggregate_throughput_at(Instant::now())
+    }
+
+    pub fn aggregate_throughput_at(&self, now: Instant) -> f64 {
+        let mut state = self.state.lock().unwrap();
+        Self::settle(&mut state, now);
         state.iter().filter(|s| !s.parked).filter_map(|s| s.throughput).sum()
     }
 }
@@ -366,69 +408,122 @@ mod tests {
         LaneSelector::new((0..n).map(|i| format!("lane{i}")).collect())
     }
 
-    /// Without this, the first lane measured would score highest and keep every
-    /// chunk, leaving the other interfaces idle forever.
+    /// Drive a lane as though `bytes` arrived over `span`, ending at `at`.
+    fn carried(s: &LaneSelector, lane: usize, bytes: u64, span: Duration, at: Instant) {
+        s.progressed_at(lane, bytes, at - span);
+        s.progressed_at(lane, 0, at);
+    }
+
+    fn rate_of(s: &LaneSelector, lane: usize, at: Instant) -> f64 {
+        s.reports_at(at)[lane].throughput.unwrap_or(0.0)
+    }
+
+    /// The bug the sidebar showed: four lanes reading well under what the
+    /// transfer as a whole was doing, because each lane's rate described one
+    /// connection rather than the interface.
     #[test]
-    fn every_lane_is_tried_before_throughput_decides() {
+    fn a_lanes_rate_is_what_the_interface_carried_not_what_one_chunk_did() {
+        let s = selector(1);
+        let now = Instant::now();
+        // Four connections, each carrying a megabyte over the same second.
+        for _ in 0..4 {
+            s.progressed_at(0, 1_000_000, now - Duration::from_secs(1));
+        }
+        s.progressed_at(0, 0, now);
+        s.completed(0, 1_000_000);
+
+        let measured = rate_of(&s, 0, now);
+        assert!(
+            (measured - 4_000_000.0).abs() < 1.0,
+            "the lane carried 4 MB in a second and reported {measured}"
+        );
+    }
+
+    #[test]
+    fn the_lanes_add_up_to_the_transfer() {
+        // The header and the sidebar are the same measurement read twice, so
+        // no arithmetic can put them out of step.
         let s = selector(3);
-        let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..3 {
-            let lane = s.acquire().expect("a lane should be available");
-            seen.insert(lane);
-            s.completed(lane, 1 << 20, Duration::from_millis(100));
+        let now = Instant::now();
+        for (lane, bytes) in [(0, 12_000_000u64), (1, 500_000), (2, 400_000)] {
+            carried(&s, lane, bytes, Duration::from_secs(1), now);
         }
-        assert_eq!(seen.len(), 3, "some lane was never tried: {seen:?}");
+        let reported: f64 = s.reports_at(now).iter().filter_map(|r| r.throughput).sum();
+        assert!((reported - s.aggregate_throughput_at(now)).abs() < 1.0);
+        assert!((reported - 12_900_000.0).abs() < 1.0, "got {reported}");
     }
 
     #[test]
-    fn a_faster_lane_receives_more_work() {
-        let s = selector(2);
-        // Lane 0 is ten times faster than lane 1.
-        s.acquire();
-        s.completed(0, 10 << 20, Duration::from_millis(100));
-        s.acquire();
-        s.completed(1, 1 << 20, Duration::from_millis(100));
+    fn a_lane_that_stops_carrying_anything_falls_to_nothing() {
+        // A paused transfer used to leave its last speeds on the screen,
+        // because nothing folded a zero when the bytes stopped.
+        let s = selector(1);
+        let start = Instant::now();
+        carried(&s, 0, 10_000_000, Duration::from_secs(1), start);
+        assert!(rate_of(&s, 0, start) > 9_000_000.0);
 
-        let mut counts = [0usize; 2];
-        for _ in 0..40 {
-            let lane = s.acquire().unwrap();
-            counts[lane] += 1;
-            let bytes = if lane == 0 { 10 << 20 } else { 1 << 20 };
-            s.completed(lane, bytes, Duration::from_millis(100));
+        let mut at = start;
+        for _ in 0..16 {
+            at += SAMPLE_WINDOW;
+            s.reports_at(at);
         }
-        assert!(counts[0] > counts[1], "the faster lane should get more chunks, got {counts:?}");
+        assert!(rate_of(&s, 0, at) < 100_000.0, "still reporting {}", rate_of(&s, 0, at));
     }
 
     #[test]
-    fn in_flight_work_stops_one_lane_hoarding_every_chunk() {
-        let s = selector(2);
-        s.acquire();
-        s.completed(0, 10 << 20, Duration::from_millis(100));
-        s.acquire();
-        s.completed(1, 5 << 20, Duration::from_millis(100));
+    fn a_transfer_shorter_than_one_window_still_reports_what_it_did() {
+        // A small file on a fast link is over before a window closes. Without
+        // this the lane reports nothing, which reads as an interface that did
+        // no work when it did all of it.
+        let s = selector(1);
+        s.progressed_at(0, 4_000_000, Instant::now());
+        assert_eq!(s.reports()[0].throughput, None, "the window is still open");
+        s.close();
+        assert!(s.reports()[0].throughput.unwrap() > 0.0);
+    }
 
-        // Claim without completing: the fast lane's score falls as its queue
-        // grows, so the slower lane eventually gets chosen.
-        let mut lanes = Vec::new();
-        for _ in 0..6 {
-            lanes.push(s.acquire().unwrap());
-        }
-        assert!(lanes.contains(&1), "a saturated fast lane should yield: {lanes:?}");
+    #[test]
+    fn closing_twice_does_not_count_the_same_bytes_again() {
+        let s = selector(1);
+        s.progressed_at(0, 4_000_000, Instant::now());
+        s.close();
+        let once = s.reports()[0].throughput.unwrap();
+        s.close();
+        assert_eq!(s.reports()[0].throughput.unwrap(), once);
+    }
+
+    #[test]
+    fn a_window_that_has_not_run_its_course_is_left_open() {
+        // Sampling on every read would divide a few bytes by a few
+        // microseconds and report gigabytes a second.
+        let s = selector(1);
+        let now = Instant::now();
+        s.progressed_at(0, 1_000, now);
+        assert_eq!(s.reports_at(now + Duration::from_millis(10))[0].throughput, None);
+    }
+
+    #[test]
+    fn a_lane_that_joins_mid_transfer_is_accounted_for_separately() {
+        let s = selector(1);
+        assert_eq!(s.join("Pixel 7 Pro (cell)".to_string()), 1);
+        assert_eq!(s.len(), 2);
+
+        let now = Instant::now();
+        carried(&s, 1, 400_000, Duration::from_secs(1), now);
+        let reports = s.reports_at(now);
+        assert_eq!(reports[1].label, "Pixel 7 Pro (cell)");
+        assert_eq!(reports[0].throughput, None, "the existing lane was disturbed");
+        assert!(reports[1].throughput.unwrap() > 0.0);
     }
 
     #[test]
     fn a_repeatedly_failing_lane_is_parked_and_work_migrates() {
         let s = selector(2);
         for _ in 0..FAILURES_BEFORE_PARKED {
-            s.acquire();
             s.failed(0);
         }
-        // Every subsequent acquisition must avoid the dead lane.
-        for _ in 0..10 {
-            let lane = s.acquire().expect("the healthy lane is still available");
-            assert_ne!(lane, 0, "work was sent to a parked lane");
-            s.completed(lane, 1 << 20, Duration::from_millis(50));
-        }
+        assert!(!s.claim(0), "work was offered to a dead lane");
+        assert!(s.claim(1));
         assert!(s.reports()[0].parked);
         assert!(!s.all_parked());
     }
@@ -439,96 +534,31 @@ mod tests {
     fn a_failure_that_is_not_the_lanes_fault_does_not_park_it() {
         let s = selector(1);
         for _ in 0..FAILURES_BEFORE_PARKED * 3 {
-            let lane = s.acquire().expect("the lane must stay available");
-            s.released(lane);
+            assert!(s.claim(0));
+            s.released(0);
         }
         assert!(!s.reports()[0].parked);
         assert!(!s.all_parked());
     }
 
     #[test]
-    fn released_lanes_do_not_leak_in_flight_slots() {
-        let s = selector(2);
-        for _ in 0..5 {
-            let lane = s.acquire().unwrap();
-            s.released(lane);
-        }
-        // With in-flight counts leaking, scores would decay to zero and the
-        // selector would spread work on stale information.
-        s.acquire();
-        s.completed(0, 1 << 20, Duration::from_millis(10));
-        assert!(s.reports()[0].throughput.unwrap() > 0.0);
-    }
-
-    #[test]
     fn one_success_clears_a_partial_failure_streak() {
         let s = selector(1);
-        s.acquire();
         s.failed(0);
-        s.acquire();
-        s.completed(0, 1 << 20, Duration::from_millis(10));
+        s.completed(0, 1_000_000);
 
         // A flaky chunk should not accumulate toward parking a working lane.
-        s.acquire();
         s.failed(0);
-        s.acquire();
         s.failed(0);
         assert!(!s.reports()[0].parked, "a lane was parked by non-consecutive failures");
-    }
-
-    /// The plan's requirement: a saturated interface cap must move work to the
-    /// other interfaces rather than throttle the whole download.
-    #[test]
-    fn a_capped_lane_receives_less_work_than_an_uncapped_one() {
-        let s = selector(2);
-        s.set_cap(0, Some(100 << 10));
-
-        let mut counts = [0usize; 2];
-        for _ in 0..60 {
-            let lane = s.acquire().unwrap();
-            counts[lane] += 1;
-            // Both lanes are physically equal; only the cap differs.
-            s.completed(lane, 8 << 20, Duration::from_millis(100));
-        }
-        assert!(counts[1] > counts[0] * 3, "the capped lane should carry far less: {counts:?}");
-        assert!(counts[0] > 0, "a capped lane is still useful and must not be abandoned");
-    }
-
-    #[test]
-    fn a_cap_is_used_as_the_estimate_before_anything_is_measured() {
-        let s = selector(2);
-        s.set_cap(0, Some(1 << 10));
-        s.set_cap(1, Some(10 << 20));
-
-        // Cold start: both lanes are tried once, then the faster ceiling wins.
-        s.acquire();
-        s.acquire();
-        let mut counts = [0usize; 2];
-        for _ in 0..10 {
-            counts[s.acquire().unwrap()] += 1;
-        }
-        assert!(counts[1] >= counts[0], "the higher ceiling should be preferred: {counts:?}");
-    }
-
-    #[test]
-    fn clearing_a_cap_restores_the_measured_estimate() {
-        let s = selector(1);
-        s.set_cap(0, Some(1000));
-        s.acquire();
-        s.completed(0, 10 << 20, Duration::from_secs(1));
-        s.set_cap(0, None);
-        assert!(s.reports()[0].throughput.unwrap() > 1000.0);
     }
 
     #[test]
     fn parking_a_lane_directly_takes_it_out_of_rotation() {
         let s = selector(2);
         s.park(1);
-        for _ in 0..8 {
-            let lane = s.acquire().expect("the other lane remains");
-            assert_ne!(lane, 1, "a parked lane was handed work");
-            s.completed(lane, 1 << 20, Duration::from_millis(10));
-        }
+        assert!(!s.claim(1));
+        assert!(s.claim(0));
         assert!(s.reports()[1].parked);
     }
 
@@ -537,41 +567,35 @@ mod tests {
         let s = selector(2);
         for lane in 0..2 {
             for _ in 0..FAILURES_BEFORE_PARKED {
-                s.acquire();
                 s.failed(lane);
             }
         }
         assert!(s.all_parked());
-        assert_eq!(s.acquire(), None, "a caller must be able to tell that no lane is left");
+        assert!(s.all_parked_permanently());
     }
 
     #[test]
-    fn aggregate_throughput_sums_live_lanes_only() {
+    fn aggregate_throughput_counts_live_lanes_only() {
         let s = selector(3);
+        let now = Instant::now();
         for lane in 0..3 {
-            s.acquire();
-            s.completed(lane, 1 << 20, Duration::from_secs(1));
+            carried(&s, lane, 1_000_000, Duration::from_secs(1), now);
         }
-        let all = s.aggregate_throughput();
-        assert!((all - 3.0 * (1 << 20) as f64).abs() < 1.0, "got {all}");
+        assert!((s.aggregate_throughput_at(now) - 3_000_000.0).abs() < 1.0);
 
         for _ in 0..FAILURES_BEFORE_PARKED {
-            s.acquire();
             s.failed(2);
         }
-        let live = s.aggregate_throughput();
-        assert!((live - 2.0 * (1 << 20) as f64).abs() < 1.0, "parked lane still counted: {live}");
+        let live = s.aggregate_throughput_at(now);
+        assert!((live - 2_000_000.0).abs() < 1.0, "parked lane still counted: {live}");
     }
 
     #[test]
     fn reports_track_bytes_and_chunks_per_lane() {
         let s = selector(2);
-        s.acquire();
-        s.completed(0, 500, Duration::from_millis(10));
-        s.acquire();
-        s.completed(0, 500, Duration::from_millis(10));
-        s.acquire();
-        s.completed(1, 200, Duration::from_millis(10));
+        s.completed(0, 500);
+        s.completed(0, 500);
+        s.completed(1, 200);
 
         let reports = s.reports();
         assert_eq!((reports[0].bytes, reports[0].chunks), (1000, 2));
@@ -585,12 +609,22 @@ mod tests {
         // rest of the transfer.
         let s = LaneSelector::new(vec!["en0".into()]);
         s.park_for(0, Duration::from_millis(40));
-        assert!(s.acquire().is_none(), "the lane should be out of rotation while it waits");
+        assert!(!s.claim(0), "the lane should be out of rotation while it waits");
         assert!(s.all_parked());
         assert!(!s.all_parked_permanently(), "it is waiting, not dead");
 
         std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(s.acquire(), Some(0), "the lane should be back after its period");
+        assert!(s.claim(0), "the lane should be back after its period");
+    }
+
+    #[test]
+    fn a_waiting_lane_says_how_long_and_a_dead_one_says_never() {
+        let s = LaneSelector::new(vec!["en0".into(), "en1".into()]);
+        s.park_for(0, Duration::from_secs(10));
+        s.park(1);
+        assert!(s.park_remaining(0).expect("en0 is coming back") > Duration::from_secs(5));
+        assert_eq!(s.park_remaining(1), None, "a dead lane must not be waited on");
+        assert_eq!(s.park_remaining(9), None, "an index that does not exist");
     }
 
     #[test]
@@ -624,13 +658,12 @@ mod tests {
         // parked for good would make a rate limit compound into a park.
         let s = LaneSelector::new(vec!["en0".into()]);
         for _ in 0..FAILURES_BEFORE_PARKED - 1 {
-            s.acquire();
             s.failed(0);
         }
         s.park_for(0, Duration::from_millis(30));
         std::thread::sleep(Duration::from_millis(50));
 
-        assert_eq!(s.acquire(), Some(0));
+        assert!(s.claim(0));
         s.failed(0);
         assert!(!s.reports()[0].parked, "one failure after a wait should not park the lane");
     }
@@ -639,10 +672,9 @@ mod tests {
     fn a_timed_park_does_not_count_as_a_failure() {
         // A rate limit is the origin being busy, not the interface being bad.
         let s = LaneSelector::new(vec!["en0".into()]);
-        s.acquire();
         s.park_for(0, Duration::from_millis(10));
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(s.reports()[0].chunks, 0);
-        assert_eq!(s.acquire(), Some(0));
+        assert!(s.claim(0));
     }
 }

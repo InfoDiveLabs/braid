@@ -292,7 +292,10 @@ fn row_for(snapshot: &dl_core::engine::DownloadSnapshot, order: &[String]) -> Tr
                 }
                 None => format_bytes(progress.downloaded),
             });
-            parts.push(format!("{}/s", format_bytes(progress.bytes_per_sec)));
+            // The smoothed figure, which is what the sidebar total and the
+            // tray are built from. A row quoting the raw reading beside a
+            // total quoting the smoothed one is two numbers for one transfer.
+            parts.push(format!("{}/s", format_bytes(progress.smoothed_bytes_per_sec)));
             parts.join(" · ")
         }
         "done" => format!("Completed · {}", format_bytes(progress.downloaded)),
@@ -1178,7 +1181,7 @@ fn apply_inspector(
     // HTTP download is a lie about what the transfer is.
     let mut stats = vec![InspectorStat {
         label: "Down".into(),
-        value: format!("{}/s", format_bytes(snapshot.progress.bytes_per_sec)).into(),
+        value: format!("{}/s", format_bytes(snapshot.progress.smoothed_bytes_per_sec)).into(),
     }];
     if let Some(t) = torrent {
         stats.push(InspectorStat {

@@ -106,7 +106,27 @@ impl SourceFactory for HttpFactory {
         let paired = relays::load();
         let paths = paths_for(&allowed, &paired, &self.default_lane);
 
-        Ok(Box::new(dl_net::path::PathLanes::build(&paths, &spec.url, &config, &SystemInterfaces)?))
+        // And re-read for the life of the transfer, not just at its start. A
+        // six gigabyte download runs for long enough that a phone gets paired,
+        // a cable gets plugged in, or a tether gets switched on while it is
+        // going; until this, none of those did anything until the next
+        // transfer.
+        let watch = {
+            let settings = Arc::clone(&self.settings);
+            let default_lane = self.default_lane.clone();
+            let pinned = spec.interfaces.clone();
+            Arc::new(move || {
+                let allowed = match settings.read() {
+                    Ok(current) if pinned.is_empty() => current.interfaces.clone(),
+                    _ => pinned.clone(),
+                };
+                paths_for(&allowed, &relays::load(), &default_lane)
+            })
+        };
+
+        let lanes = dl_net::path::PathLanes::build(&paths, &spec.url, &config, &SystemInterfaces)?
+            .watching(watch, Arc::new(SystemInterfaces));
+        Ok(Box::new(lanes))
     }
 }
 

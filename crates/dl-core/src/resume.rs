@@ -12,14 +12,16 @@ use crate::cancel::Cancel;
 use crate::error::{Error, Result};
 use crate::lane::{LaneReport, LaneSelector, LaneSet, SingleLane};
 use crate::model::{Progress, SourceInfo};
+use crate::regions::Regions;
 use crate::source::{ByteSource, Fetch};
 use crate::store::journal::{Opened, ResourceId};
 use crate::store::layout::MIN_CHUNK_SIZE;
 use crate::store::resumable::{DEFAULT_CHUNK_SIZE, ResumableFile};
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -199,9 +201,6 @@ pub async fn download_over_lanes(
         return Err(Error::Transport("no usable network path is available".into()));
     }
     let selector = Arc::new(LaneSelector::from_lanes(lanes));
-    for (lane, limit) in options.lane_limits.iter().enumerate() {
-        selector.set_cap(lane, limit.as_ref().map(|b| b.rate()));
-    }
     if let Some(observer) = options.on_lanes_ready.take() {
         observer(Arc::clone(&selector));
     }
@@ -285,6 +284,9 @@ pub async fn download_over_lanes(
         Ok(transferred) => transferred,
         Err(e) => return Err(abandon(&mut file, e, options.keep_partial).await),
     };
+    // Whatever window each lane had open is folded in now, so a transfer that
+    // was over inside one still reports what its lanes carried.
+    selector.close();
 
     let digest = match (&options.expect, options.always_hash) {
         (Some(expected), _) => {
@@ -447,10 +449,12 @@ async fn abandon(file: &mut ResumableFile, error: Error, keep_partial: bool) -> 
     error
 }
 
-/// Run `connections` workers pulling chunks from a shared queue.
+/// Give every lane its own stretch of the file and run connections on each.
 ///
-/// Work stealing rather than a static split: a connection that is slow, or one
-/// bound to a slower interface once phase 6 lands, simply claims fewer chunks.
+/// The split, the stealing, and why it is not a shared queue any more are in
+/// [`crate::regions`]. Here the job is to keep a set of connections attached to
+/// each lane, to notice a lane that turns up after the transfer began, and to
+/// hand finished chunks to the one task that writes them.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_all(
     lanes: &dyn LaneSet,
@@ -463,15 +467,14 @@ async fn fetch_all(
     on_progress: &mut Option<crate::download::ProgressFn>,
     chunks_seen: &Arc<crate::chunks::ChunkProgress>,
 ) -> Result<u64> {
-    let queue = Arc::new(tokio::sync::Mutex::new(file.remaining()));
-    if queue.lock().await.is_empty() {
+    let regions = Regions::new(file.remaining(), lanes.len());
+    if regions.is_empty() {
         return Ok(0);
     }
 
-    // Only completions are validated against the resource, so a strong
-    // validator is carried on every chunk request.
-    let validator = info.etag.clone();
-    let transferred = Arc::new(AtomicU64::new(0));
+    let roster = Roster::new(lanes);
+    let transferred = AtomicU64::new(0);
+    let inflight = AtomicUsize::new(0);
     let total = info.len.unwrap_or(0);
     let already_done = file.bytes_done();
 
@@ -479,164 +482,106 @@ async fn fetch_all(
     // rather than written from the worker tasks.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(connections * 2);
 
-    let layout = *file.layout();
+    let crew = Crew {
+        roster: &roster,
+        selector,
+        regions: &regions,
+        chunks_seen,
+        transferred: &transferred,
+        inflight: &inflight,
+        // How many times each chunk has been rate limited, so the backoff grows
+        // for a chunk that keeps being refused rather than restarting at the
+        // floor every time a worker picks it up.
+        backoffs: Mutex::new(BTreeMap::new()),
+        layout: *file.layout(),
+        // Only completions are validated against the resource, so a strong
+        // validator is carried on every chunk request.
+        validator: info.etag.clone(),
+        cancel: options.cancel.clone(),
+        limit: options.limit.clone(),
+        lane_limits: &options.lane_limits,
+    };
 
-    // One chain per lane: the lane's own ceiling, then the download-wide cap.
-    // Ordered innermost first so a lane blocked on its own ceiling does not
-    // first consume download allowance that other lanes could have used.
-    let budgets: Arc<Vec<BudgetChain>> = Arc::new(
-        (0..lanes.len())
-            .map(|lane| {
-                let mut chain = BudgetChain::default();
-                if let Some(Some(limit)) = options.lane_limits.get(lane) {
-                    chain.push(Arc::clone(limit));
-                }
-                if let Some(limit) = &options.limit {
-                    chain.push(Arc::clone(limit));
-                }
-                chain
-            })
-            .collect(),
-    );
-    // Built eagerly so every worker owns its sender before the original is
-    // dropped; the writer loop ends when the last one goes away.
-    // How many times each chunk has been rate limited, so the backoff grows
-    // for a chunk that keeps being refused rather than restarting at the floor
-    // every time a worker picks it up.
-    let backoffs: Arc<Mutex<BTreeMap<u64, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    // The sender lives with the supervisor and nowhere else, so the writer's
+    // channel closes exactly when the last connection has finished. Holding a
+    // spare anywhere outside it leaves the writer waiting on a chunk that is
+    // never coming.
+    let crew = &crew;
+    let roster = &roster;
+    let supervise = async move {
+        let mut running: FuturesUnordered<BoxFuture<'_>> = FuturesUnordered::new();
+        let mut opened = 0usize;
+        for lane in 0..roster.len() {
+            opened += crew.staff(&mut running, lane, connections, roster.len(), &tx);
+        }
+        tracing::debug!(lanes = roster.len(), connections = opened, "lanes opened");
 
-    let mut worker_futures = Vec::with_capacity(connections);
-    for _ in 0..connections {
-        let queue = Arc::clone(&queue);
-        let backoffs = Arc::clone(&backoffs);
-        let chunks_seen = Arc::clone(chunks_seen);
-        let transferred = Arc::clone(&transferred);
-        let selector = Arc::clone(selector);
-        let budgets = Arc::clone(&budgets);
-        let tx = tx.clone();
-        let validator = validator.clone();
-        let cancel = options.cancel.clone();
-        worker_futures.push(async move {
-            loop {
-                cancel.check()?;
-
-                let Some(index) = queue.lock().await.pop() else {
-                    return Ok::<(), Error>(());
-                };
-                let range = layout.range(index).expect("queued index is in range");
-                chunks_seen.started(index);
-
-                let Some(lane) = selector.acquire() else {
-                    // Every path has failed out of rotation. Put the chunk back
-                    // so the error, not a silently short file, is the outcome.
-                    chunks_seen.released(index);
-                    queue.lock().await.push(index);
-                    return Err(Error::NoRouteAvailable);
-                };
-
-                let began = Instant::now();
-                let body = match fetch_chunk(
-                    lanes.source(lane),
-                    range,
-                    validator.clone(),
-                    &budgets[lane],
-                    &cancel,
-                    &|bytes| selector.progressed(lane, bytes),
-                )
-                .await
-                {
-                    Ok(body) => {
-                        selector.completed(lane, range.len(), began.elapsed());
-                        body
+        let mut look = tokio::time::interval(LANE_POLL);
+        let mut results = Vec::new();
+        while !running.is_empty() {
+            tokio::select! {
+                finished = running.next() => {
+                    if let Some(outcome) = finished {
+                        results.push(outcome);
                     }
-                    // The origin asking us to slow down is not a failing
-                    // path. Moving the chunk to another interface and
-                    // trying again at once is what turns one rate limit
-                    // into a rate limit on every interface we own.
-                    Err(Error::RateLimited { status, retry_after }) => {
-                        let wait = backoff_for(retry_after, attempts_for(index, &backoffs));
+                }
+                _ = look.tick() => {
+                    for joined in roster.take_on() {
+                        // The roster and the meter only ever grow by appending,
+                        // so the index one hands out is the index the other
+                        // will. Everything downstream reads lanes by number.
+                        let lane = selector.join(joined.label.clone());
+                        debug_assert_eq!(lane, joined.lane, "lane numbering came apart");
+                        let count = crew
+                            .staff(&mut running, joined.lane, connections, roster.len(), &tx);
                         tracing::info!(
-                            status,
-                            chunk = index,
-                            wait_ms = wait.as_millis() as u64,
-                            stated = retry_after.is_some(),
-                            "rate limited; backing off"
+                            lane = %joined.label,
+                            connections = count,
+                            "a path that appeared mid-transfer is now carrying chunks"
                         );
-                        selector.park_for(lane, wait);
-                        chunks_seen.released(index);
-                        queue.lock().await.push(index);
-                        note_attempt(index, &backoffs);
-
-                        if selector.all_parked_permanently() {
-                            return Err(Error::RateLimited { status, retry_after });
-                        }
-                        // Sleep only if there is nowhere else to go; with a
-                        // free lane the work continues there while this one
-                        // waits out its period.
-                        if let Some(pause) = selector.time_until_unpark()
-                            && selector.all_parked()
-                        {
-                            tokio::time::sleep(pause.min(MAX_BACKOFF)).await;
-                        }
-                        continue;
                     }
-                    Err(e) if e.is_retryable() => {
-                        // A path that died mid-transfer should cost this chunk,
-                        // not the download: requeue it for a healthier lane.
-                        selector.failed(lane);
-                        chunks_seen.released(index);
-                        if !selector.all_parked() {
-                            queue.lock().await.push(index);
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        // The origin misbehaved, which every lane would hit
-                        // identically. Not the lane's fault, so do not park it.
-                        selector.released(lane);
-                        chunks_seen.released(index);
-                        return Err(e);
-                    }
-                };
-                transferred.fetch_add(range.len(), Ordering::Relaxed);
-
-                if tx.send((index, body)).await.is_err() {
-                    return Ok(());
                 }
             }
-        });
-    }
-    drop(tx);
-    let workers = futures_util::future::join_all(worker_futures);
+        }
+        results
+    };
 
-    let mut last_report = started;
     let writer = async {
-        while let Some((index, body)) = rx.recv().await {
-            file.write_chunk(index, body).await?;
-            // After the write, not after the fetch: a chunk is Have when it is
-            // on disk, and the grid must not show one the journal has never
-            // been told about.
-            chunks_seen.completed(index);
-
-            if let Some(report) = on_progress.as_mut() {
-                let now = Instant::now();
-                if now.duration_since(last_report) >= options.progress_interval {
-                    let done = transferred.load(Ordering::Relaxed);
-                    report(Progress {
-                        downloaded: already_done + done,
-                        total: Some(total),
-                        bytes_per_sec: rate(done, started.elapsed()),
-                        smoothed_bytes_per_sec: 0,
-                    });
-                    last_report = now;
+        // On a timer as well as on each chunk: a rate that only moves when a
+        // chunk lands reports nothing at all while a slow lane is mid-chunk,
+        // and stops dead the moment a transfer is paused.
+        let mut ticker = tokio::time::interval(options.progress_interval);
+        loop {
+            tokio::select! {
+                received = rx.recv() => {
+                    let Some((index, body)) = received else { break };
+                    file.write_chunk(index, body).await?;
+                    // After the write, not after the fetch: a chunk is Have
+                    // when it is on disk, and the grid must not show one the
+                    // journal has never been told about.
+                    chunks_seen.completed(index);
+                }
+                _ = ticker.tick() => {
+                    if let Some(report) = on_progress.as_mut() {
+                        report(Progress {
+                            downloaded: already_done + transferred.load(Ordering::Relaxed),
+                            total: Some(total),
+                            // The lanes' own measurement, summed. The figure in
+                            // the header and the figures in the sidebar are then
+                            // the same reading rather than two clocks that drift
+                            // apart and invite the user to spot the difference.
+                            bytes_per_sec: selector.aggregate_throughput() as u64,
+                            smoothed_bytes_per_sec: 0,
+                        });
+                    }
                 }
             }
         }
         Ok::<(), Error>(())
     };
 
-    let (results, written) = futures_util::future::join(workers, writer).await;
+    let (results, written) = futures_util::future::join(supervise, writer).await;
+    let _ = started;
 
     // A worker error is the cause; a writer error is often just the closed
     // channel that followed it, so worker failures are reported first. Among
@@ -656,6 +601,289 @@ async fn fetch_all(
     written?;
 
     Ok(transferred.load(Ordering::Relaxed))
+}
+
+/// How often the transfer looks for a lane that has appeared since it began.
+///
+/// Answering means reading the paired-phone list off disk, so this is slow
+/// enough not to be a poll loop and quick enough that pairing a phone and
+/// watching the sidebar feels like cause and effect.
+const LANE_POLL: Duration = Duration::from_secs(2);
+
+/// How long a worker with nothing to do waits before looking again.
+///
+/// It is only reached at the very end of a transfer, or while another lane is
+/// waiting out a rate limit, so the cost is a handful of wakeups.
+const IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// The fewest connections a lane is worth opening.
+///
+/// One connection makes a lane's throughput a function of round-trip time
+/// rather than of the link, which is exactly wrong for the slow paths this
+/// project exists to add up.
+const MIN_PER_LANE: usize = 2;
+
+/// How many connections each lane gets.
+///
+/// `connections` is the transfer's budget, shared out between the lanes, but a
+/// lane is never opened with fewer than [`MIN_PER_LANE`]. A transfer with more
+/// lanes than connections therefore opens more sockets than were asked for,
+/// which is the right way round: the setting is there to be polite to one
+/// origin, and each lane is a different route to it.
+fn connections_per_lane(connections: usize, lanes: usize) -> usize {
+    let budget = connections.max(1);
+    (budget / lanes.max(1)).clamp(1, budget).max(MIN_PER_LANE.min(budget))
+}
+
+type BoxFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+/// A lane's source, whichever side of the transfer's start it arrived on.
+enum LaneRef<'a> {
+    Fixed(&'a dyn ByteSource),
+    Added(Arc<dyn ByteSource>),
+}
+
+impl LaneRef<'_> {
+    fn get(&self) -> &dyn ByteSource {
+        match self {
+            Self::Fixed(source) => *source,
+            Self::Added(source) => source.as_ref(),
+        }
+    }
+}
+
+/// A lane that turned up after the transfer started, and the number it got.
+struct NewLane {
+    lane: usize,
+    label: String,
+}
+
+/// The lanes a transfer is using, including any that appeared along the way.
+///
+/// Lanes are numbered once and never renumbered: the meter, the regions and
+/// the journal all refer to them by index, and a set that reordered itself
+/// would silently reassign somebody else's work.
+struct Roster<'a> {
+    fixed: &'a dyn LaneSet,
+    added: Mutex<Vec<crate::lane::Joined>>,
+}
+
+impl<'a> Roster<'a> {
+    fn new(fixed: &'a dyn LaneSet) -> Self {
+        Self { fixed, added: Mutex::new(Vec::new()) }
+    }
+
+    fn len(&self) -> usize {
+        self.fixed.len() + self.added.lock().unwrap().len()
+    }
+
+    fn source(&self, lane: usize) -> Option<LaneRef<'a>> {
+        if lane < self.fixed.len() {
+            return Some(LaneRef::Fixed(self.fixed.source(lane)));
+        }
+        let added = self.added.lock().unwrap();
+        added.get(lane - self.fixed.len()).map(|l| LaneRef::Added(Arc::clone(&l.source)))
+    }
+
+    /// Adopt whatever the lane set has gained since this was last asked.
+    fn take_on(&self) -> Vec<NewLane> {
+        let mut added = self.added.lock().unwrap();
+        let known = self.fixed.len() + added.len();
+        let fresh = self.fixed.joined(known);
+        let mut out = Vec::with_capacity(fresh.len());
+        for lane in fresh {
+            out.push(NewLane { lane: self.fixed.len() + added.len(), label: lane.label.clone() });
+            added.push(lane);
+        }
+        out
+    }
+}
+
+/// Everything a connection needs, so the worker body is written once.
+struct Crew<'a> {
+    roster: &'a Roster<'a>,
+    selector: &'a Arc<LaneSelector>,
+    regions: &'a Regions,
+    chunks_seen: &'a Arc<crate::chunks::ChunkProgress>,
+    transferred: &'a AtomicU64,
+    /// Chunks handed out and not yet finished, across every lane.
+    ///
+    /// A worker that has run out of work cannot simply stop: one of these may
+    /// still come back as a hand-back, and by then there would be nobody left
+    /// to fetch it.
+    inflight: &'a AtomicUsize,
+    backoffs: Mutex<BTreeMap<u64, u32>>,
+    layout: crate::store::layout::ChunkLayout,
+    validator: Option<String>,
+    cancel: Cancel,
+    limit: Option<Arc<Budget>>,
+    lane_limits: &'a [Option<Arc<Budget>>],
+}
+
+impl<'a> Crew<'a> {
+    /// Open this lane's connections. Returns how many.
+    fn staff(
+        &'a self,
+        running: &mut FuturesUnordered<BoxFuture<'a>>,
+        lane: usize,
+        connections: usize,
+        lanes: usize,
+        tx: &tokio::sync::mpsc::Sender<(u64, bytes::Bytes)>,
+    ) -> usize {
+        let count = connections_per_lane(connections, lanes);
+        for _ in 0..count {
+            running.push(Box::pin(self.work(lane, tx.clone())));
+        }
+        count
+    }
+
+    /// One chain per lane: the lane's own ceiling, then the download-wide cap.
+    /// Ordered innermost first so a lane blocked on its own ceiling does not
+    /// first consume download allowance that other lanes could have used.
+    fn budget(&self, lane: usize) -> BudgetChain {
+        let mut chain = BudgetChain::default();
+        if let Some(Some(limit)) = self.lane_limits.get(lane) {
+            chain.push(Arc::clone(limit));
+        }
+        if let Some(limit) = &self.limit {
+            chain.push(Arc::clone(limit));
+        }
+        chain
+    }
+
+    /// One connection, fetching this lane's chunks until there are none.
+    async fn work(
+        &self,
+        lane: usize,
+        tx: tokio::sync::mpsc::Sender<(u64, bytes::Bytes)>,
+    ) -> Result<()> {
+        let budget = self.budget(lane);
+        loop {
+            self.cancel.check()?;
+
+            if !self.selector.claim(lane) {
+                match self.selector.park_remaining(lane) {
+                    // Waiting out a rate limit. The other lanes carry on.
+                    Some(wait) => {
+                        tokio::time::sleep(wait.clamp(IDLE_POLL, MAX_BACKOFF)).await;
+                        continue;
+                    }
+                    // This lane is finished. Whatever it had left is handed
+                    // back so another lane can walk it.
+                    None => {
+                        self.regions.retire(lane);
+                        return Ok(());
+                    }
+                }
+            }
+
+            let Some(index) = self.regions.take(lane) else {
+                if self.regions.is_empty() && self.inflight.load(Ordering::Acquire) == 0 {
+                    return Ok(());
+                }
+                if self.selector.all_parked_permanently() {
+                    return Err(Error::NoRouteAvailable);
+                }
+                tokio::time::sleep(IDLE_POLL).await;
+                continue;
+            };
+
+            self.inflight.fetch_add(1, Ordering::AcqRel);
+            let outcome = self.fetch(lane, index, &budget, &tx).await;
+            self.inflight.fetch_sub(1, Ordering::AcqRel);
+            match outcome? {
+                Step::Continue => continue,
+                Step::Stop => return Ok(()),
+            }
+        }
+    }
+
+    /// Fetch one chunk and hand it to the writer.
+    async fn fetch(
+        &self,
+        lane: usize,
+        index: u64,
+        budget: &BudgetChain,
+        tx: &tokio::sync::mpsc::Sender<(u64, bytes::Bytes)>,
+    ) -> Result<Step> {
+        let range = self.layout.range(index).expect("a pending index is in range");
+        self.chunks_seen.started(index);
+
+        let Some(source) = self.roster.source(lane) else {
+            self.chunks_seen.released(index);
+            self.regions.give_back(index);
+            return Err(Error::NoRouteAvailable);
+        };
+
+        let body = match fetch_chunk(
+            source.get(),
+            range,
+            self.validator.clone(),
+            budget,
+            &self.cancel,
+            &|bytes| self.selector.progressed(lane, bytes),
+        )
+        .await
+        {
+            Ok(body) => {
+                self.selector.completed(lane, range.len());
+                body
+            }
+            // The origin asking us to slow down is not a failing path. Moving
+            // the chunk to another interface and trying again at once is what
+            // turns one rate limit into a rate limit on every interface we own.
+            Err(Error::RateLimited { status, retry_after }) => {
+                let wait = backoff_for(retry_after, attempts_for(index, &self.backoffs));
+                tracing::info!(
+                    status,
+                    chunk = index,
+                    wait_ms = wait.as_millis() as u64,
+                    stated = retry_after.is_some(),
+                    "rate limited; backing off"
+                );
+                self.selector.park_for(lane, wait);
+                self.chunks_seen.released(index);
+                self.regions.give_back(index);
+                note_attempt(index, &self.backoffs);
+
+                if self.selector.all_parked_permanently() {
+                    return Err(Error::RateLimited { status, retry_after });
+                }
+                return Ok(Step::Continue);
+            }
+            Err(e) if e.is_retryable() => {
+                // A path that died mid-transfer should cost this chunk, not the
+                // download: hand it back for a healthier lane.
+                self.selector.failed(lane);
+                self.chunks_seen.released(index);
+                self.regions.give_back(index);
+                if self.selector.all_parked() {
+                    return Err(e);
+                }
+                return Ok(Step::Continue);
+            }
+            Err(e) => {
+                // The origin misbehaved, which every lane would hit
+                // identically. Not the lane's fault, so do not park it.
+                self.selector.released(lane);
+                self.chunks_seen.released(index);
+                self.regions.give_back(index);
+                return Err(e);
+            }
+        };
+
+        self.transferred.fetch_add(range.len(), Ordering::Relaxed);
+        if tx.send((index, body)).await.is_err() {
+            return Ok(Step::Stop);
+        }
+        Ok(Step::Continue)
+    }
+}
+
+/// What a worker does after one chunk.
+enum Step {
+    Continue,
+    Stop,
 }
 
 async fn fetch_chunk(

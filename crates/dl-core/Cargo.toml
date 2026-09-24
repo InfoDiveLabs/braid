@@ -28,7 +28,7 @@ md-5 = "0.10"
 fs4 = "1"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { workspace = true, features = ["rt", "sync", "time", "fs", "io-util", "process"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "fs", "io-util", "process"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

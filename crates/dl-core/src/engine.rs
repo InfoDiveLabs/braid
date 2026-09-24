@@ -235,7 +235,11 @@ struct Record {
 /// landing, a peer choking, a lane being parked: and showing that raw made the
 /// readout unreadable and let a single burst set the graph's axis so that
 /// everything after it drew as a flat line near zero.
-const RATE_TAU: Duration = Duration::from_millis(1500);
+///
+/// Short, because the HTTP path now smooths per lane before it reports: two
+/// filters in series took two and a half seconds to follow a change, which is
+/// long enough that switching networks looked like nothing had happened.
+const RATE_TAU: Duration = Duration::from_millis(600);
 
 impl Record {
     /// Fold a progress report into the smoothed rate.

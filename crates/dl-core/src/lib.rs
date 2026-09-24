@@ -14,6 +14,7 @@ pub mod integrity;
 pub mod lane;
 pub mod model;
 pub mod refresh;
+pub mod regions;
 pub mod resume;
 pub mod schedule;
 pub mod source;

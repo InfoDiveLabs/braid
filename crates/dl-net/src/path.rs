@@ -15,8 +15,9 @@ use crate::iface::InterfaceProvider;
 use crate::multi::InterfaceLanes;
 use crate::relay::Relay;
 use dl_core::error::{Error, Result};
-use dl_core::lane::LaneSet;
+use dl_core::lane::{Joined, LaneSet};
 use dl_core::source::ByteSource;
+use std::sync::{Arc, Mutex};
 
 /// How one lane reaches the origin.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,10 +51,71 @@ impl Path {
     }
 }
 
+/// Asked, while a transfer is running, which paths the app would use now.
+///
+/// A phone paired thirty seconds into a six gigabyte download is no use if the
+/// transfer captured its lane list at the start; this is how the answer is
+/// allowed to change.
+pub type Paths = Arc<dyn Fn() -> Vec<Path> + Send + Sync>;
+
+/// Everything needed to open a lane for a path that turns up later.
+struct Watch {
+    paths: Paths,
+    url: String,
+    config: HttpConfig,
+    provider: Arc<dyn InterfaceProvider>,
+    /// The paths already considered, in lane order, so the same one is not
+    /// opened twice.
+    taken: Mutex<Vec<Path>>,
+}
+
+/// Open one lane for one path.
+///
+/// Shared by the initial build and by anything that joins later, so a phone
+/// that arrives mid-transfer is opened exactly the way it would have been had
+/// it been there from the start.
+fn open(
+    path: &Path,
+    url: &str,
+    config: &HttpConfig,
+    provider: &dyn InterfaceProvider,
+) -> Result<(String, HttpSource)> {
+    match path {
+        Path::Default(_) => Ok((path.label(None), HttpSource::with_config(config, url)?)),
+        Path::Interface(name) => {
+            // Reuses the binding matrix rather than repeating it. That code is
+            // the least portable part of this project and the only part that
+            // cannot be checked on the machine it was written on, so it should
+            // exist exactly once.
+            let bound =
+                InterfaceLanes::from_names(provider, std::slice::from_ref(name), url, config)?;
+            let lane = bound
+                .into_lanes()
+                .pop()
+                .ok_or_else(|| Error::Transport(format!("no usable interface named {name:?}")))?;
+            // The binding actually achieved, not the one asked for: a silent
+            // fall back to a plain source-address bind has to be visible rather
+            // than assumed.
+            let label = path.label(Some(&lane.label()));
+            Ok((label, lane.into_source()))
+        }
+        Path::Relay { relay, network } => {
+            let config =
+                HttpConfig { proxy: ProxyMode::Manual(relay.proxy_url(network)), ..config.clone() };
+            Ok((path.label(None), HttpSource::with_config(&config, url)?))
+        }
+    }
+}
+
 /// The lanes a transfer will use, one per path.
 pub struct PathLanes {
     sources: Vec<HttpSource>,
     labels: Vec<String>,
+    /// Kept so a lane can be opened later on the same terms as these were.
+    url: String,
+    config: HttpConfig,
+    initial: Vec<Path>,
+    watch: Option<Watch>,
 }
 
 impl PathLanes {
@@ -78,43 +140,35 @@ impl PathLanes {
         let mut labels = Vec::with_capacity(paths.len());
 
         for path in paths {
-            match path {
-                Path::Default(_) => {
-                    sources.push(HttpSource::with_config(config, url)?);
-                    labels.push(path.label(None));
-                }
-                Path::Interface(name) => {
-                    // Reuses the binding matrix rather than repeating it. That
-                    // code is the least portable part of this project and the
-                    // only part that cannot be checked on the machine it was
-                    // written on, so it should exist exactly once.
-                    let bound = InterfaceLanes::from_names(
-                        provider,
-                        std::slice::from_ref(name),
-                        url,
-                        config,
-                    )?;
-                    let lane = bound.into_lanes().pop().ok_or_else(|| {
-                        Error::Transport(format!("no usable interface named {name:?}"))
-                    })?;
-                    // The binding actually achieved, not the one asked for: a
-                    // silent fall back to a plain source-address bind has to be
-                    // visible rather than assumed.
-                    labels.push(path.label(Some(&lane.label())));
-                    sources.push(lane.into_source());
-                }
-                Path::Relay { relay, network } => {
-                    let config = HttpConfig {
-                        proxy: ProxyMode::Manual(relay.proxy_url(network)),
-                        ..config.clone()
-                    };
-                    sources.push(HttpSource::with_config(&config, url)?);
-                    labels.push(path.label(None));
-                }
-            }
+            let (label, source) = open(path, url, config, provider)?;
+            labels.push(label);
+            sources.push(source);
         }
 
-        Ok(Self { sources, labels })
+        Ok(Self {
+            sources,
+            labels,
+            url: url.to_string(),
+            config: config.clone(),
+            initial: paths.to_vec(),
+            watch: None,
+        })
+    }
+
+    /// Keep watching `paths` for the life of the transfer.
+    ///
+    /// Without this a transfer's lanes are whatever existed when it started,
+    /// which is the difference between pairing a phone and pairing a phone
+    /// that does something. Anything `paths` reports and this set does not
+    /// already carry becomes a new lane; anything it stops reporting is left
+    /// alone, because a lane that has gone away fails its next chunk and is
+    /// parked, and taking it out from under the chunk in flight would not.
+    pub fn watching(mut self, paths: Paths, provider: Arc<dyn InterfaceProvider>) -> Self {
+        let url = self.url.clone();
+        let config = self.config.clone();
+        let taken = Mutex::new(self.initial.clone());
+        self.watch = Some(Watch { paths, url, config, provider, taken });
+        self
     }
 }
 
@@ -129,6 +183,30 @@ impl LaneSet for PathLanes {
 
     fn label(&self, lane: usize) -> &str {
         &self.labels[lane]
+    }
+
+    fn joined(&self, _known: usize) -> Vec<Joined> {
+        let Some(watch) = &self.watch else { return Vec::new() };
+        let mut taken = watch.taken.lock().unwrap();
+        let mut fresh = Vec::new();
+
+        for path in (watch.paths)() {
+            if taken.contains(&path) {
+                continue;
+            }
+            // Recorded whether or not it opens. A path that cannot be opened
+            // now is not going to open on the next half-second tick either,
+            // and retrying it forever would fill the log rather than the file.
+            taken.push(path.clone());
+            match open(&path, &watch.url, &watch.config, watch.provider.as_ref()) {
+                Ok((label, source)) => fresh.push(Joined { label, source: Arc::new(source) }),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "a path that appeared mid-transfer could not be opened"
+                ),
+            }
+        }
+        fresh
     }
 }
 

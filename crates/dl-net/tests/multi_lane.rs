@@ -252,6 +252,82 @@ async fn an_empty_lane_set_is_refused() {
 fn a_selector_with_no_lanes_reports_rather_than_blocking() {
     let selector = LaneSelector::new(vec![]);
     assert!(selector.is_empty());
-    assert_eq!(selector.acquire(), None);
+    assert!(!selector.claim(0), "there is no lane zero to hand work to");
     assert!(!selector.all_parked(), "an empty set is not the same as a failed one");
+}
+
+/// A lane set that gains a lane part way through a transfer.
+///
+/// The slow-stream scenario keeps the download running long enough for the new
+/// lane to be noticed; a loopback transfer of a few megabytes would otherwise
+/// be over before anything had a chance to join.
+struct LateLane {
+    first: HttpSource,
+    url: String,
+    labels: Vec<String>,
+    /// Set once the transfer has been going long enough to be joined.
+    open_at: std::time::Instant,
+    handed_over: std::sync::atomic::AtomicBool,
+}
+
+impl dl_core::lane::LaneSet for LateLane {
+    fn len(&self) -> usize {
+        1
+    }
+    fn source(&self, _lane: usize) -> &dyn ByteSource {
+        &self.first
+    }
+    fn label(&self, _lane: usize) -> &str {
+        &self.labels[0]
+    }
+    fn joined(&self, _known: usize) -> Vec<dl_core::lane::Joined> {
+        use std::sync::atomic::Ordering;
+        if std::time::Instant::now() < self.open_at || self.handed_over.swap(true, Ordering::SeqCst)
+        {
+            return Vec::new();
+        }
+        let source = HttpSource::with_config(&HttpConfig::default(), &self.url).unwrap();
+        vec![dl_core::lane::Joined { label: "late".into(), source: std::sync::Arc::new(source) }]
+    }
+}
+
+/// The complaint this was built for: a phone paired in the middle of a six
+/// gigabyte download did nothing at all until the next transfer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lane_that_appears_mid_transfer_carries_chunks() {
+    // Paced per connection, so four connections move a megabyte a second and
+    // the transfer runs for long enough to be joined.
+    let size = 6 << 20;
+    let origin =
+        Origin::spawn(Scenario::SlowStream { size, bytes_per_sec: 256 << 10 }).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("payload.bin");
+    let url = origin.url("payload.bin");
+
+    let lanes = LateLane {
+        first: HttpSource::with_config(&HttpConfig::default(), &url).unwrap(),
+        url: url.clone(),
+        labels: vec!["first".into()],
+        open_at: std::time::Instant::now() + std::time::Duration::from_millis(500),
+        handed_over: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    let outcome = download_over_lanes(
+        &lanes,
+        &dest,
+        ResumeOptions { connections: 4, chunk_size: Some(256 << 10), ..Default::default() },
+        None,
+    )
+    .await
+    .expect("a lane joining must not disturb the transfer");
+
+    assert_eq!(blake3::hash(&std::fs::read(&dest).unwrap()), fixtures::digest(SEED, size));
+    assert_eq!(outcome.lanes.len(), 2, "the new lane was never taken on");
+
+    let late = outcome.lanes.iter().find(|l| l.label == "late").expect("the new lane is listed");
+    assert!(late.bytes > 0, "the lane that joined carried nothing");
+    assert!(late.chunks > 0);
+
+    let carried: u64 = outcome.lanes.iter().map(|l| l.bytes).sum();
+    assert_eq!(carried, size, "the two lanes together should account for the whole file");
 }
