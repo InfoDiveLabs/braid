@@ -122,6 +122,12 @@ fn pair_code(out: &std::path::Path, port: u16) -> Result<()> {
     mcp.click(&add_phone)?;
     std::thread::sleep(std::time::Duration::from_millis(800));
 
+    // What the sheet looks like before anything is asked of it, which is what
+    // someone with a phone already paired sees when they open it.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    mcp.screenshot(&window, &out.join("phone-sheet.png"))?;
+    println!("captured phone-sheet.png");
+
     let sheet = mcp.root_element(&window)?;
     let Some((_, show)) = mcp.find_by_label(&sheet, |l| l == "Show code")? else {
         anyhow::bail!("the phone sheet has no Show code control");

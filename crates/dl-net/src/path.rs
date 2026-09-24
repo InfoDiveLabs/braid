@@ -21,8 +21,14 @@ use dl_core::source::ByteSource;
 /// How one lane reaches the origin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Path {
-    /// Whatever the routing table decides.
-    Default,
+    /// Whatever the routing table decides, carrying the name of the interface
+    /// it will decide on.
+    ///
+    /// The name is not decoration. Without it this lane is labelled "default
+    /// route" and appears in the sidebar as a card that does not exist,
+    /// carrying all the traffic while the interface actually doing the work
+    /// sits at zero beside it.
+    Default(String),
     /// Bound to a local interface by name.
     Interface(String),
     /// Through a relay, over one of the networks it offers.
@@ -37,7 +43,7 @@ impl Path {
     /// the whole reason to show throughput per lane is to tell them apart.
     pub fn label(&self, resolved: Option<&str>) -> String {
         match self {
-            Self::Default => resolved.unwrap_or("default route").to_string(),
+            Self::Default(name) => resolved.unwrap_or(name).to_string(),
             Self::Interface(name) => resolved.unwrap_or(name).to_string(),
             Self::Relay { relay, network } => format!("{} ({network})", relay.name),
         }
@@ -73,7 +79,7 @@ impl PathLanes {
 
         for path in paths {
             match path {
-                Path::Default => {
+                Path::Default(_) => {
                     sources.push(HttpSource::with_config(config, url)?);
                     labels.push(path.label(None));
                 }
@@ -161,11 +167,20 @@ mod tests {
         // The USB case: one cable, two of the phone's networks, two lanes the
         // scheduler weighs independently.
         let paths = vec![
-            Path::Default,
+            Path::Default("en0".into()),
             Path::Relay { relay: relay(), network: "cell".into() },
             Path::Relay { relay: relay(), network: "wifi".into() },
         ];
         assert_eq!(build(&paths).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_default_lane_is_named_after_the_interface_it_will_use() {
+        // Labelling it "default route" put a card in the sidebar that does not
+        // exist, credited with every byte, while the real interface sat at
+        // zero next to it and looked broken.
+        let lanes = build(&[Path::Default("en0".into())]).unwrap();
+        assert_eq!(lanes.label(0), "en0");
     }
 
     #[test]

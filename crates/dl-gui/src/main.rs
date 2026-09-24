@@ -74,10 +74,10 @@ fn paths_for(
     }
 
     if paths.is_empty() {
-        // The label the sidebar will show for it, which is the interface the
-        // OS will actually pick rather than an invented "default" NIC.
-        tracing::debug!(%default_lane, "no path chosen; letting the OS route");
-        paths.push(Path::Default);
+        // Named after the interface the OS will actually pick. An invented
+        // "default route" row would take the credit for every byte while the
+        // card doing the work showed nothing.
+        paths.push(Path::Default(default_lane.to_string()));
     }
     paths
 }
@@ -317,8 +317,7 @@ async fn scan_for_relays() -> Vec<Found> {
     let mut rows = Vec::new();
 
     for entry in &paired {
-        let reachable = found.iter().any(|c| c.address == entry.relay.address);
-        rows.push(row_for(entry, reachable, &ours).await);
+        rows.push(row_for(entry, &ours).await);
     }
 
     // Then anything discovered that is not paired yet, so there is something
@@ -339,14 +338,16 @@ async fn scan_for_relays() -> Vec<Found> {
 }
 
 /// One paired phone, with whatever it says it is offering.
-async fn row_for(
-    entry: &relays::Paired,
-    reachable: bool,
-    ours: &dl_net::control::HostEgress,
-) -> Found {
-    let status = dl_net::control::status(&entry.relay.address, entry.relay.key.as_deref())
-        .await
-        .unwrap_or_default();
+async fn row_for(entry: &relays::Paired, ours: &dl_net::control::HostEgress) -> Found {
+    // Reachable means it answered us, not that something advertised it.
+    // Judging by discovery reported a phone that was serving perfectly as not
+    // answering, because multicast was blocked while the phone was not.
+    let answered = dl_net::control::status(&entry.relay.address, entry.relay.key.as_deref()).await;
+    let reachable = answered.is_ok();
+    if let Err(error) = &answered {
+        tracing::warn!(address = %entry.relay.address, %error, "a paired phone did not answer");
+    }
+    let status = answered.unwrap_or_default();
     let duplicates = dl_net::control::duplicates_of(&status, ours);
 
     let lanes: Vec<FoundLane> = status
@@ -407,17 +408,52 @@ fn icon_for(kind: dl_net::control::LaneKind) -> &'static str {
 /// Shown on the phone's screen, so it has to mean something to the person
 /// holding it.
 fn whoami() -> String {
-    std::env::var("HOSTNAME")
+    // The name a person gave the machine, not the hostname. macOS keeps them
+    // separate: ComputerName is "Suraj's MacBook" while the hostname is
+    // "Surajs-MacBook-Pro.local". This string is read off a phone screen while
+    // deciding whether to trust a computer, so it should be the one they chose.
+    #[cfg(target_os = "macos")]
+    if let Some(name) = command("scutil", &["--get", "ComputerName"]) {
+        return name;
+    }
+
+    std::env::var("COMPUTERNAME")
         .ok()
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        })
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| command("hostname", &[]))
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "A computer".to_string())
+}
+
+/// One line of output, or nothing.
+fn command(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Which of a phone's lanes are worth switching on.
+///
+/// Everything it offers except a lane that leaves from this computer's own
+/// address, which would add a row to the sidebar and no bandwidth. On any
+/// failure this returns nothing rather than guessing, and the person can
+/// switch lanes on by hand.
+async fn usable_lanes(address: &str, key: &str) -> Vec<String> {
+    let Ok(status) = dl_net::control::status(address, Some(key)).await else {
+        return Vec::new();
+    };
+    let ours =
+        dl_net::control::host_egress(settings::EGRESS_SERVICE, settings::EGRESS_SERVICE_V6).await;
+    let duplicates = dl_net::control::duplicates_of(&status, &ours);
+    status
+        .lanes
+        .iter()
+        .filter(|lane| !duplicates.iter().any(|d| d.id == lane.id))
+        .map(|lane| lane.id.clone())
+        .collect()
 }
 
 /// Draw a pairing URI as a QR code.
@@ -565,6 +601,18 @@ fn wire_phones(ui: &MainWindow, runtime: tokio::runtime::Handle) {
                         paired.retain(|p| {
                             p.device_id != phone.device_id && p.relay.address != phone.address
                         });
+                        // Switch on what the phone offered, minus anything
+                        // that is the route this computer already has.
+                        //
+                        // Off by default was the wrong call. A person who has
+                        // installed the companion, chosen which networks to
+                        // offer on it, and pointed their camera at a code has
+                        // said yes three times; pairing and then doing nothing
+                        // reads as broken, which is exactly how it read. The
+                        // phone still owns its own data limit, so nothing here
+                        // overrides a decision made there.
+                        let enabled = usable_lanes(&phone.address, &phone.key).await;
+                        let count = enabled.len();
                         paired.push(relays::Paired {
                             relay: dl_net::Relay::new(
                                 phone.name.clone(),
@@ -572,11 +620,18 @@ fn wire_phones(ui: &MainWindow, runtime: tokio::runtime::Handle) {
                                 Some(phone.key.clone()),
                             ),
                             device_id: phone.device_id.clone(),
-                            // Nothing on by default, as with any pairing.
-                            enabled: Vec::new(),
+                            enabled,
                         });
                         relays::save(&paired);
-                        format!("{} is paired. Switch on the lanes you want.", phone.name)
+                        match count {
+                            0 => format!(
+                                "{} is paired, but every path it offers is the one this \
+                                 computer already uses.",
+                                phone.name
+                            ),
+                            1 => format!("{} is paired and lending one path.", phone.name),
+                            n => format!("{} is paired and lending {n} paths.", phone.name),
+                        }
                     }
                     None => "That code expired. Show another when you are ready.".to_string(),
                 };
@@ -1862,7 +1917,7 @@ mod factory_tests {
         // 407 per chunk before the lane is parked.
         let paths = paths_for(&[], &[phone(None, &["cell"])], "en0");
         assert_eq!(paths.len(), 1);
-        assert!(matches!(paths[0], Path::Default));
+        assert!(matches!(paths[0], Path::Default(_)));
     }
 
     #[test]
@@ -1870,7 +1925,8 @@ mod factory_tests {
         // A laptop with one card and no phone, which is most of them.
         let paths = paths_for(&[], &[], "en0");
         assert_eq!(paths.len(), 1);
-        assert!(matches!(paths[0], Path::Default));
+        // Named, so the sidebar credits the card that carried the bytes.
+        assert!(matches!(&paths[0], Path::Default(name) if name == "en0"));
     }
 
     #[test]

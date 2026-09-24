@@ -101,6 +101,34 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(4);
 /// A person has to pick the phone up and look at it.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Say what actually went wrong, including the cause.
+///
+/// reqwest's own message stops at "error sending request", which hides the one
+/// line that matters. That cost an afternoon here: a phone answering `curl`
+/// perfectly was reported as not answering, and the real reason sat three
+/// levels down the source chain.
+fn describe(address: &str, error: &reqwest::Error) -> String {
+    let mut cause: Option<&dyn std::error::Error> = std::error::Error::source(error);
+    let mut deepest = None;
+    while let Some(source) = cause {
+        deepest = Some(source.to_string());
+        cause = source.source();
+    }
+
+    match deepest {
+        // macOS refuses a connection to a local address from an application it
+        // has not been allowed to put on the local network, and reports it as
+        // though the network itself were broken. Nothing in the message
+        // suggests a permission, so it has to be said here.
+        Some(reason) if reason.contains("No route to host") => format!(
+            "{address} could not be reached ({reason}). If it answers from a terminal but \
+             not from here, allow this application under Privacy and Security, Local Network."
+        ),
+        Some(reason) => format!("reaching {address}: {reason}"),
+        None => format!("reaching {address}: {error}"),
+    }
+}
+
 /// Ask what is listening there.
 ///
 /// Unauthenticated on purpose: this is the call that decides whether an
@@ -135,7 +163,7 @@ pub async fn pair(address: &str, desktop: &str) -> Result<PairOutcome> {
         )
         .send()
         .await
-        .map_err(|e| Error::Transport(format!("reaching {address}: {e}")))?;
+        .map_err(|e| Error::Transport(describe(address, &e)))?;
 
     if !response.status().is_success() {
         return Err(Error::Transport(format!("{address} refused to pair: {}", response.status())));
@@ -170,8 +198,7 @@ async fn get<T: for<'de> Deserialize<'de>>(
         request = request.header("X-Braid-Key", key);
     }
 
-    let response =
-        request.send().await.map_err(|e| Error::Transport(format!("reaching {address}: {e}")))?;
+    let response = request.send().await.map_err(|e| Error::Transport(describe(address, &e)))?;
 
     if !response.status().is_success() {
         return Err(Error::Transport(format!("{address} answered {}", response.status())));
