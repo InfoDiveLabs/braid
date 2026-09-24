@@ -47,47 +47,24 @@ const INSPECTOR_EVERY: u32 = 5;
 const MAX_CELLS: usize = 18 * 32;
 const CHART_POINTS: usize = 60;
 
-/// Full scale for the sidebar meters until a reading needs more room, in bytes
-/// per second.
+/// What a full sidebar meter stands for, in bytes per second.
 ///
-/// The meters used to be normalised to whichever interface happened to be
-/// fastest on the current tick. That made the leader sit at full width whatever
-/// it was actually doing, and moved every other bar whenever the leader
-/// twitched: the column never held still and its lengths meant nothing. A
-/// fixed scale makes a bar's length a rate, comparable between interfaces and
-/// between ticks.
-const METER_FLOOR: u64 = 10_000_000;
+/// Fixed, and high: about eight hundred megabits, past what a home link does.
+/// A scale that moved with the readings meant the fastest interface always sat
+/// at full width whatever it was doing, and every other bar shifted whenever
+/// that one twitched. A bar means a rate now, comparable between interfaces
+/// and between ticks. Anything faster than this fills the bar, and the figure
+/// beside it still says what it really was.
+const METER_TOP: f32 = 100_000_000.0;
 
-/// The sidebar's full scale, held across ticks so it can resist changing.
+/// Where the scale stops being able to tell small rates apart.
 ///
-/// Doubling steps with a wide dead band: a scale that tracked the peak exactly
-/// would only move the jitter from the bars into the axis.
-#[derive(Debug)]
-struct MeterScale {
-    full: u64,
-}
-
-impl MeterScale {
-    fn new() -> Self {
-        Self { full: METER_FLOOR }
-    }
-
-    /// Grow as soon as a reading would overflow the bar; shrink only once it
-    /// is well inside the step below, so a rate sitting near a boundary cannot
-    /// flip the whole column back and forth.
-    fn fit(&mut self, peak: u64) -> u64 {
-        while peak > self.full {
-            let Some(doubled) = self.full.checked_mul(2) else { break };
-            self.full = doubled;
-        }
-        // Two fifths, not one half: at exactly half a step down the reading
-        // would land back on the boundary it just left.
-        while self.full > METER_FLOOR && peak < self.full / 5 * 2 {
-            self.full = (self.full / 2).max(METER_FLOOR);
-        }
-        self.full
-    }
-}
+/// The curve below is `ln(1 + rate/KNEE)`, so this is roughly the rate at
+/// which the meter is a third full. Set at one megabyte a second because that
+/// is the region worth reading carefully: it is what a phone sharing mobile
+/// data contributes, and the whole reason the sidebar lists lanes separately
+/// is to show that it is contributing at all.
+const METER_KNEE: f32 = 1_000_000.0;
 
 /// Smallest full-scale the throughput chart will use, in bytes per second.
 ///
@@ -424,9 +401,6 @@ pub fn spawn(
         // remembers how fast the last minute went.
         let mut history: VecDeque<Sample> = VecDeque::with_capacity(CHART_POINTS);
         let mut tick = 0u32;
-        // Lives here rather than in `Totals` for the same reason as the
-        // series: resisting a change needs memory of what was shown last.
-        let mut meters = MeterScale::new();
 
         // Which downloads have already had their completion announced. An
         // edge, not a state: the snapshot says "done" on every tick after the
@@ -445,9 +419,7 @@ pub fn spawn(
                     current.into_iter().map(|i| (i.id.clone(), i)).collect();
                 (keys, labels)
             };
-            let mut totals = Totals::from(&snapshots, &engine, &keys);
-            totals.meter_full =
-                meters.fit(totals.interfaces.iter().map(|(_, r)| *r).max().unwrap_or(0));
+            let totals = Totals::from(&snapshots, &engine, &keys);
             on_completions(&snapshots, &mut announced, &settings);
 
             if tick.is_multiple_of(SAMPLES_PER_POINT) {
@@ -693,8 +665,6 @@ struct Totals {
     done: i32,
     total: i32,
     interfaces: Vec<(String, u64)>,
-    /// What a full-width sidebar meter stands for, in bytes per second.
-    meter_full: u64,
 }
 
 impl Totals {
@@ -741,9 +711,6 @@ impl Totals {
             done: engine.count_in(State::Complete) as i32,
             total: snapshots.len() as i32,
             interfaces: interfaces.into_iter().collect(),
-            // Replaced by the poller, which is the only thing that lives long
-            // enough to hold a scale steady across ticks.
-            meter_full: METER_FLOOR,
         }
     }
 }
@@ -918,11 +885,7 @@ fn apply(
     );
     ui.set_interface_fills(
         Rc::new(VecModel::from(
-            totals
-                .interfaces
-                .iter()
-                .map(|(_, r)| meter_fill(*r, totals.meter_full))
-                .collect::<Vec<_>>(),
+            totals.interfaces.iter().map(|(_, r)| meter_fill(*r, METER_TOP)).collect::<Vec<_>>(),
         ))
         .into(),
     );
@@ -930,16 +893,20 @@ fn apply(
 
 /// How much of a sidebar meter a rate fills.
 ///
-/// Anything moving gets a visible sliver. A phone on mobile data beside a
-/// gigabit card is a couple of percent of the scale and would otherwise draw as
-/// nothing, which reads as "not connected" rather than "connected and slow":
-/// the difference the sidebar exists to show.
-fn meter_fill(rate: u64, full: u64) -> f32 {
+/// Not proportional, on purpose. Against a hundred megabytes a second, a phone
+/// on mobile data is half a percent: drawn to scale it is indistinguishable
+/// from an interface that is doing nothing, which is the one distinction the
+/// sidebar exists to make. So the scale compresses as it goes right, the way a
+/// speed test's dial does, and each stretch of the bar covers a larger range
+/// than the one before it.
+///
+/// Roughly: 0.5 MB/s fills a tenth, 1 a sixth, 10 a half, 36 four fifths.
+fn meter_fill(rate: u64, top: f32) -> f32 {
     if rate == 0 {
         return 0.0;
     }
-    let fraction = rate as f32 / full.max(1) as f32;
-    fraction.clamp(0.02, 1.0)
+    let curve = |value: f32| (1.0 + value / METER_KNEE).ln();
+    (curve(rate as f32) / curve(top.max(METER_KNEE))).clamp(0.0, 1.0)
 }
 
 /// Which id the arrow keys land on.
@@ -1484,49 +1451,51 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_scale_holds_still_while_a_rate_wanders() {
-        // The complaint this exists for: bars that moved on every tick because
-        // the scale moved with them.
-        let mut scale = MeterScale::new();
-        let first = scale.fit(6_000_000);
-        for peak in [6_400_000, 5_900_000, 7_100_000, 4_200_000, 9_900_000] {
-            assert_eq!(scale.fit(peak), first, "the scale moved for {peak} B/s");
+    fn a_slow_lane_reads_as_slow_rather_than_as_absent() {
+        // The complaint this exists for. Against a hundred megabytes a second
+        // a phone on mobile data is half a percent, and drawn to scale it is
+        // indistinguishable from an interface doing nothing at all.
+        let phone = meter_fill(450_000, METER_TOP);
+        assert!(phone > 0.05, "a working phone drew as {phone}");
+        assert!(phone < 0.2, "and it must not claim to be fast: {phone}");
+    }
+
+    #[test]
+    fn the_meter_is_still_an_order_of_the_rates() {
+        // Compressed, never out of order: a faster lane always draws longer.
+        assert_eq!(meter_fill(0, METER_TOP), 0.0);
+        let mut last = 0.0;
+        for rate in [1_000, 100_000, 450_000, 1_000_000, 10_000_000, 36_000_000] {
+            let fill = meter_fill(rate, METER_TOP);
+            assert!(fill > last, "{rate} B/s drew {fill}, no longer than {last}");
+            last = fill;
         }
     }
 
     #[test]
-    fn the_scale_never_goes_below_ten_megabytes() {
-        let mut scale = MeterScale::new();
-        assert_eq!(scale.fit(0), METER_FLOOR);
-        assert_eq!(scale.fit(12), METER_FLOOR);
+    fn the_scale_does_not_move_with_the_readings() {
+        // What the doubling ladder before it still got wrong: the fastest
+        // interface sat at full width whatever it was doing, so every bar
+        // moved whenever that one twitched.
+        let wifi = meter_fill(36_000_000, METER_TOP);
+        let phone = meter_fill(450_000, METER_TOP);
+        // The same rates, measured while something much faster is also running.
+        assert_eq!(meter_fill(36_000_000, METER_TOP), wifi);
+        assert_eq!(meter_fill(450_000, METER_TOP), phone);
     }
 
     #[test]
-    fn a_rate_past_the_top_gets_more_room_in_one_step() {
-        let mut scale = MeterScale::new();
-        assert_eq!(scale.fit(15_000_000), 20_000_000);
-        assert_eq!(scale.fit(21_000_000), 40_000_000);
-        // And a reading that would overflow several steps is caught in one go.
-        assert_eq!(scale.fit(700_000_000), 1_280_000_000);
+    fn an_idle_lane_is_empty_and_a_very_fast_one_is_full() {
+        assert_eq!(meter_fill(0, METER_TOP), 0.0, "an idle lane must read as idle");
+        assert_eq!(meter_fill(100_000_000, METER_TOP), 1.0);
+        assert_eq!(meter_fill(4_000_000_000, METER_TOP), 1.0, "past the top, not past the bar");
     }
 
     #[test]
-    fn a_reading_on_a_boundary_does_not_flip_the_scale_back_and_forth() {
-        // Half of a step is exactly the previous step's top, so shrinking
-        // there would grow again on the next tick and never settle.
-        let mut scale = MeterScale::new();
-        scale.fit(15_000_000);
-        assert_eq!(scale.fit(10_000_000), 20_000_000, "shrank at the boundary");
-        assert_eq!(scale.fit(7_000_000), 10_000_000, "never came back down");
-    }
-
-    #[test]
-    fn a_slow_lane_still_draws_as_something() {
-        // A phone at a fiftieth of the scale is what the sidebar is for; at
-        // its true width it would be indistinguishable from disconnected.
-        assert!(meter_fill(450_000, 20_000_000) >= 0.02);
-        assert_eq!(meter_fill(0, 20_000_000), 0.0, "an idle lane must read as idle");
-        assert_eq!(meter_fill(40_000_000, 20_000_000), 1.0);
+    fn the_middle_of_the_bar_is_around_ten_megabytes_a_second() {
+        // Where a home connection lives, so that is where the resolution goes.
+        let half = meter_fill(10_000_000, METER_TOP);
+        assert!((0.4..0.6).contains(&half), "ten megabytes a second drew {half}");
     }
 
     #[test]
