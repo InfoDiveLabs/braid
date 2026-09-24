@@ -142,6 +142,70 @@ component SourceRow inherits Rectangle {
     }
 }
 
+/// One network a paired phone is offering.
+export struct RelayLaneRow {
+    id: string,
+    label: string,
+    icon: string,
+    /// Whatever the phone said about itself. Shown, never parsed.
+    note: string,
+    on: bool,
+    /// Set when this lane leaves from the same address this computer does, so
+    /// it would add a name to the sidebar and no bandwidth.
+    duplicate: bool,
+}
+
+/// A phone, found or paired or both.
+export struct RelayRow {
+    name: string,
+    address: string,
+    paired: bool,
+    /// Answered the last scan. A paired phone in a pocket is not a forgotten
+    /// one, so it stays listed and says so.
+    reachable: bool,
+    lanes: [RelayLaneRow],
+}
+
+/// The row that opens the phone sheet, sitting under the interfaces because a
+/// phone becomes one.
+component AddPhoneRow inherits Rectangle {
+    callback clicked();
+    height: 26px;
+    background: touch.has-hover ? Theme.surface : transparent;
+    border-radius: Theme.radius-sm;
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 10px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            Text {
+                text: "+";
+                font-family: Theme.font;
+                font-size: 13px;
+                color: touch.has-hover ? Theme.accent : Theme.text-faint;
+                width: 15px;
+                horizontal-alignment: center;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: "Add phone";
+                font-family: Theme.font;
+                font-size: 12px;
+                color: touch.has-hover ? Theme.text : Theme.text-muted;
+            }
+        }
+    }
+}
+
 component InterfaceRow inherits Rectangle {
     in property <string> name;
     in property <string> rate;
@@ -421,6 +485,172 @@ component RemoveSheet inherits Rectangle {
 //
 // Sized from its content, never a constant: a fixed height silently clipped
 // the buttons off the bottom the moment the type got bigger.
+/// Pairing and lane selection for phones.
+///
+/// In the main window rather than in Settings because a phone's lanes show
+/// their throughput in the sidebar two inches away: pairing a device and
+/// judging whether it is worth using belong in the same place. Settings keeps
+/// what is app-wide, and a device is not.
+component PhoneSheet inherits Rectangle {
+    in property <[RelayRow]> relays;
+    in property <bool> scanning;
+    callback scan();
+    callback pair(int);
+    callback forget(int);
+    callback set-lane(int, string, bool);
+    callback cancel();
+
+    background: #00000088;
+    TouchArea {
+        clicked => { root.cancel(); }
+    }
+
+    Rectangle {
+        width: 520px;
+        height: card.preferred-height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: Theme.radius;
+        background: Theme.sidebar;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 40px;
+        drop-shadow-offset-y: 12px;
+        drop-shadow-color: #000000aa;
+
+        TouchArea { }
+
+        card := VerticalLayout {
+            width: parent.width;
+            padding: 20px;
+            spacing: 10px;
+
+            Text {
+                text: "Phones";
+                font-family: Theme.font;
+                font-size: 16px;
+                font-weight: 700;
+                color: Theme.text;
+            }
+            Text {
+                text: "A paired phone lends its networks as extra download paths. "
+                    + "It decides what it offers and how much of it you may use.";
+                font-family: Theme.font;
+                font-size: 11px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            for relay[relay-index] in root.relays: VerticalLayout {
+                spacing: 2px;
+                Rectangle { height: 1px; background: Theme.border; }
+                HorizontalLayout {
+                    height: 34px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: relay.name;
+                            font-family: Theme.font;
+                            font-size: 13px;
+                            color: Theme.text;
+                        }
+                        Text {
+                            text: relay.reachable
+                                ? relay.address
+                                : relay.address + "  not answering";
+                            font-family: Theme.mono;
+                            font-size: 10px;
+                            color: Theme.text-faint;
+                        }
+                    }
+                    Rectangle { }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Button {
+                            label: relay.paired ? "Forget" : "Pair";
+                            primary: !relay.paired;
+                            clicked => {
+                                if (relay.paired) {
+                                    root.forget(relay-index);
+                                } else {
+                                    root.pair(relay-index);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Lanes appear only once paired: an unpaired phone will not
+                // say what it has.
+                for lane in relay.lanes: HorizontalLayout {
+                    height: 28px;
+                    padding-left: 12px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: lane.label;
+                            font-family: Theme.font;
+                            font-size: 12px;
+                            color: lane.duplicate ? Theme.text-faint : Theme.text;
+                        }
+                        // The duplicate fact replaces whatever the phone
+                        // reported, because it is the more useful one: this
+                        // lane cannot add anything.
+                        Text {
+                            text: lane.duplicate
+                                ? "Same route as this computer"
+                                : lane.note;
+                            font-family: Theme.font;
+                            font-size: 10px;
+                            color: Theme.text-faint;
+                        }
+                    }
+                    Rectangle { }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Toggle {
+                            on: lane.on;
+                            label: lane.label;
+                            changed(v) => { root.set-lane(relay-index, lane.id, v); }
+                        }
+                    }
+                }
+            }
+
+            if root.relays.length == 0: Text {
+                text: root.scanning
+                    ? "Looking for phones on this network and down any cable."
+                    : "No phones yet. Install the Braid companion on a phone, put it "
+                      + "on this network or plug it in, then scan.";
+                font-family: Theme.font;
+                font-size: 11px;
+                color: Theme.text-faint;
+                wrap: word-wrap;
+            }
+
+            Rectangle { height: 4px; }
+            HorizontalLayout {
+                spacing: 8px;
+                Button {
+                    label: root.scanning ? "Scanning..." : "Scan";
+                    enabled: !root.scanning;
+                    clicked => { root.scan(); }
+                }
+                Rectangle { }
+                Button {
+                    label: "Done";
+                    primary: true;
+                    clicked => { root.cancel(); }
+                }
+            }
+        }
+    }
+}
+
 component AddSheet inherits Rectangle {
     in-out property <string> url;
     in-out property <int> connections;
@@ -856,6 +1086,16 @@ export component MainWindow inherits Window {
     in-out property <string> url-input;
     in-out property <int> connections: 8;
     in-out property <bool> sheet-open;
+    /// The phone sheet, opened from the sidebar rather than from Settings: a
+    /// phone's lanes report their throughput two inches away, so pairing one
+    /// and judging it belong together.
+    in-out property <bool> phones-open;
+    in property <[RelayRow]> relays;
+    in property <bool> scanning-phones;
+    callback scan-phones();
+    callback pair-phone(int);
+    callback forget-phone(int);
+    callback set-phone-lane(int, string, bool);
     /// The transfer awaiting a remove confirmation, or -1.
     in-out property <int> removing-id: -1;
     in property <string> removing-name;
@@ -1043,6 +1283,11 @@ export component MainWindow inherits Window {
                     rate: root.interface-rates[i];
                     fill: root.interface-fills[i];
                     tint: Theme.interface-colors[Math.mod(i, 5)];
+                }
+
+                Rectangle { height: 2px; }
+                AddPhoneRow {
+                    clicked => { root.phones-open = true; root.scan-phones(); }
                 }
 
                 Rectangle { }
@@ -1451,6 +1696,18 @@ export component MainWindow inherits Window {
     }
 
     // Last child, so it paints over the window rather than inside a column.
+    if root.phones-open: PhoneSheet {
+        width: 100%;
+        height: 100%;
+        relays: root.relays;
+        scanning: root.scanning-phones;
+        scan => { root.scan-phones(); }
+        pair(i) => { root.pair-phone(i); }
+        forget(i) => { root.forget-phone(i); }
+        set-lane(i, lane, on) => { root.set-phone-lane(i, lane, on); }
+        cancel => { root.phones-open = false; }
+    }
+
     if root.sheet-open: AddSheet {
         width: root.width;
         height: root.height;

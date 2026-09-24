@@ -13,6 +13,7 @@ use dl_core::lane::LaneReport;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::{
@@ -341,17 +342,22 @@ fn matches_filter(state: State, filter: &str) -> bool {
 /// than enumerated here so this module stays free of `dl-net`, and they are
 /// needed because lane reports only exist while something is transferring: /// without them the sidebar's whole reason for existing is blank on an idle
 /// window.
+/// The lanes the sidebar lists, shared with whatever can change them.
+///
+/// A phone paired a moment ago has to appear without a restart, so this cannot
+/// be a list captured when the window was built. Read once per tick, which is
+/// ten times a second and costs a lock on a handful of strings.
+pub type LaneNames = Arc<RwLock<Vec<InterfaceInfo>>>;
+
 pub fn spawn(
     ui: &MainWindow,
     engine: Engine,
     tray: Option<Weak<Tray>>,
-    interfaces: Vec<InterfaceInfo>,
+    interfaces: LaneNames,
     settings: crate::settings::Shared,
 ) {
     let weak = ui.as_weak();
-    let keys: Vec<String> = interfaces.iter().map(|i| i.id.clone()).collect();
-    let labels: std::collections::BTreeMap<String, InterfaceInfo> =
-        interfaces.iter().map(|i| (i.id.clone(), i.clone())).collect();
+    let lanes = Arc::clone(&interfaces);
     // The model is `Rc` and belongs to the UI thread, so it is never captured
     // by the polling task; it is looked up again inside the event loop.
     ui.set_rows(Rc::new(VecModel::<TransferRow>::default()).into());
@@ -375,6 +381,14 @@ pub fn spawn(
         loop {
             ticker.tick().await;
             let snapshots = engine.snapshot();
+            // Re-read rather than captured: pairing a phone adds lanes here.
+            let (keys, labels) = {
+                let current = lanes.read().map(|l| l.clone()).unwrap_or_default();
+                let keys: Vec<String> = current.iter().map(|i| i.id.clone()).collect();
+                let labels: std::collections::BTreeMap<String, InterfaceInfo> =
+                    current.into_iter().map(|i| (i.id.clone(), i)).collect();
+                (keys, labels)
+            };
             let totals = Totals::from(&snapshots, &engine, &keys);
             on_completions(&snapshots, &mut announced, &settings);
 
@@ -946,7 +960,7 @@ fn cells_for(report: &dl_core::ChunkReport) -> (Vec<InspectorCell>, u64) {
 /// The id is the key: it is what lane reports carry and what the socket
 /// option takes: and the rest is only ever drawn. See
 /// `dl_net::Interface::display_label`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceInfo {
     pub id: String,
     pub label: String,

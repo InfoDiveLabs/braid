@@ -169,15 +169,17 @@ fn main() -> anyhow::Result<()> {
         &ui,
         engine,
         None,
-        LANES
-            .iter()
-            .zip(["wifi", "ethernet", "cellular"])
-            .map(|(l, icon)| dl_gui::bridge::InterfaceInfo {
-                id: l.to_string(),
-                label: l.to_string(),
-                icon: icon.to_string(),
-            })
-            .collect(),
+        std::sync::Arc::new(std::sync::RwLock::new(
+            LANES
+                .iter()
+                .zip(["wifi", "ethernet", "cellular"])
+                .map(|(l, icon)| dl_gui::bridge::InterfaceInfo {
+                    id: l.to_string(),
+                    label: l.to_string(),
+                    icon: icon.to_string(),
+                })
+                .collect(),
+        )),
         std::sync::Arc::new(std::sync::RwLock::new(dl_gui::settings::Settings::new(
             std::env::temp_dir(),
         ))),

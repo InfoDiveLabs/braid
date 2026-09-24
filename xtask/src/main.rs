@@ -235,6 +235,32 @@ fn screenshots(out: &std::path::Path, port: u16, release: bool) -> Result<()> {
         println!("captured {shot}");
     }
 
+    // The phone sheet, which is the other modal branch. Reached from the
+    // sidebar rather than from Settings, so a click on that row is the only
+    // way in and the only thing that proves the row is wired to it.
+    let opened = mcp.root_element(&window)?;
+    let Some((_, add_phone)) = mcp.find_by_label(&opened, |l| l == "Add phone")? else {
+        anyhow::bail!("the sidebar has no Add phone row");
+    };
+    mcp.click(&add_phone)?;
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let sheet = mcp.root_element(&window)?;
+    for control in ["Scan", "Done"] {
+        anyhow::ensure!(
+            mcp.find_by_label(&sheet, |l| l == control)?.is_some(),
+            "the phone sheet has no {control:?} control"
+        );
+    }
+    mcp.screenshot(&window, &out.join("11-phones.png"))?;
+    println!("captured 11-phones.png");
+
+    let Some((_, done)) = mcp.find_by_label(&sheet, |l| l == "Done")? else {
+        anyhow::bail!("no Done in the phone sheet");
+    };
+    mcp.click(&done)?;
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
     // The add sheet is a modal branch that nothing else reaches, which is
     // exactly where a layout mistake sits unnoticed.
     let Some((_, add)) = mcp.find_by_label(&root, |l| l == "Add Download")? else {
@@ -313,7 +339,7 @@ fn settings(out: &std::path::Path, port: u16) -> Result<()> {
     let binary = app::HeadlessApp::build_example(false, "settings")?;
     std::fs::create_dir_all(out)?;
 
-    for page in ["general", "network", "relays", "bandwidth", "integrity", "advanced"] {
+    for page in ["general", "network", "bandwidth", "integrity", "advanced"] {
         let app = app::HeadlessApp::launch_with_args(&binary, port, &["--page", page])?;
         let window = app.mcp.first_window()?;
         let root = app.mcp.root_element(&window)?;

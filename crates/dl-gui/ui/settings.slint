@@ -17,33 +17,6 @@ import {
     Segmented, Button, Field, Dropdown,
 } from "controls.slint";
 
-/// One network a paired phone is offering.
-export struct RelayLaneRow {
-    /// Opaque, and what the callbacks carry.
-    id: string,
-    label: string,
-    /// Kind key for the glyph, shared with InterfaceSetting so a phone's
-    /// cellular lane looks like a cellular card.
-    icon: string,
-    /// Whatever the phone said about itself. Shown, never parsed.
-    note: string,
-    on: bool,
-    /// Set when this lane leaves from the same address this computer does, so
-    /// it would add a name to the sidebar and no bandwidth.
-    duplicate: bool,
-}
-
-/// A phone, found or paired or both.
-export struct RelayRow {
-    name: string,
-    address: string,
-    paired: bool,
-    /// Answered the last scan. A paired phone in a pocket is not a forgotten
-    /// one, so it stays listed and says so.
-    reachable: bool,
-    lanes: [RelayLaneRow],
-}
-
 export struct InterfaceSetting {
     /// The device id. The identity everywhere else in the app, and what the
     /// callbacks below carry.
@@ -317,14 +290,6 @@ export component SettingsWindow inherits Window {
     in property <bool> torrents-available;
     in-out property <bool> seed-after-complete;
 
-    // Relays
-    in property <[RelayRow]> relays;
-    in property <bool> scanning;
-    callback scan();
-    callback pair(int);
-    callback forget(int);
-    callback set-lane(int, string, bool);
-
     // Network
     in property <[InterfaceSetting]> interfaces;
     in-out property <int> proxy-mode;
@@ -420,10 +385,6 @@ export component SettingsWindow inherits Window {
                     clicked => { root.page = "network"; }
                 }
                 SettingsSource {
-                    label: "Phones"; icon: "cellular"; selected: root.page == "relays";
-                    clicked => { root.page = "relays"; }
-                }
-                SettingsSource {
                     label: "Bandwidth"; icon: "gauge"; selected: root.page == "bandwidth";
                     clicked => { root.page = "bandwidth"; }
                 }
@@ -450,7 +411,6 @@ export component SettingsWindow inherits Window {
                 Text {
                     text: root.page == "general" ? "General"
                         : root.page == "network" ? "Network"
-                        : root.page == "relays" ? "Phones"
                         : root.page == "bandwidth" ? "Bandwidth"
                         : root.page == "integrity" ? "Integrity" : "Advanced";
                     font-family: Theme.font;
@@ -738,128 +698,6 @@ export component SettingsWindow inherits Window {
                                 + "Unchecked interfaces are never used.";
                         }
 
-                        if root.page == "relays": Group {
-                            title: "PHONES";
-                            PageRow {
-                                label: "Find phones";
-                                detail: "Braid looks on this network and down any USB cable.";
-                                VerticalLayout {
-                                    alignment: center;
-                                    Button {
-                                        label: root.scanning ? "Looking..." : "Scan";
-                                        enabled: !root.scanning;
-                                        clicked => { root.scan(); }
-                                    }
-                                }
-                            }
-
-                            for relay[relay-index] in root.relays: VerticalLayout {
-                                Separator { }
-                                PageRow {
-                                    label: relay.name;
-                                    detail: relay.reachable
-                                        ? relay.address
-                                        : relay.address + " (not answering)";
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Button {
-                                            label: relay.paired ? "Forget" : "Pair";
-                                            primary: !relay.paired;
-                                            clicked => {
-                                                if (relay.paired) {
-                                                    root.forget(relay-index);
-                                                } else {
-                                                    root.pair(relay-index);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                // Lanes appear only once paired: an unpaired
-                                // phone will not say what it has.
-                                for lane in relay.lanes: PageRow {
-                                    label: lane.label;
-                                    // The duplicate fact replaces whatever the
-                                    // phone reported, because it is the more
-                                    // useful one: this lane cannot help.
-                                    detail: lane.duplicate
-                                        ? "Same route as this computer"
-                                        : lane.note;
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Toggle {
-                                            on: lane.on;
-                                            label: lane.label;
-                                            changed(v) => {
-                                                root.set-lane(relay-index, lane.id, v);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if root.relays.length == 0: PageRow {
-                                label: root.scanning ? "Looking for phones" : "No phones yet";
-                                detail: "Install the Braid companion on a phone, put it on this "
-                                    + "network or plug it in, then scan.";
-                            }
-                        }
-
-                        if root.page == "relays": Caption {
-                            text: "A phone serves whichever of its networks you switch on, and "
-                                + "decides its own data allowance. Braid shows what it reports "
-                                + "and never overrides it.";
-                        }
-
-                        if root.page == "network": Group {
-                            title: "PROXY";
-                            PageRow {
-                                label: "Proxy";
-                                VerticalLayout {
-                                    alignment: center;
-                                    Dropdown {
-                                        options: ["System settings", "None", "Manual"];
-                                        selected: root.proxy-mode;
-                                        label: "Proxy mode";
-                                        chose(i) => { root.set-proxy-mode(i); }
-                                    }
-                                }
-                            }
-                            Separator { }
-                            PageRow {
-                                label: "Proxy server";
-                                enabled: root.proxy-mode == 2;
-                                VerticalLayout {
-                                    alignment: center;
-                                    Field {
-                                        width: 180px;
-                                        text: root.proxy-server;
-                                        placeholder: "host:port";
-                                        enabled: root.proxy-mode == 2;
-                                        label: "Proxy server";
-                                        edited(v) => { root.set-proxy-server(v); }
-                                    }
-                                }
-                            }
-                        }
-
-                        if root.page == "network": Group {
-                            title: "DNS";
-                            PageRow {
-                                label: "Resolve hostnames on";
-                                VerticalLayout {
-                                    alignment: center;
-                                    Dropdown {
-                                        options: ["Fastest interface", "System resolver"];
-                                        selected: root.dns-mode;
-                                        label: "DNS interface";
-                                        chose(i) => { root.set-dns-mode(i); }
-                                    }
-                                }
-                            }
-                        }
-
-                        // -------------------------------------- Bandwidth
                         if root.page == "bandwidth": Group {
                             title: "LIMITS";
                             PageRow {
