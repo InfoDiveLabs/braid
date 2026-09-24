@@ -10,6 +10,7 @@
 <p align="center">
   <a href="#install">Install</a> &middot;
   <a href="#what-it-does">What it does</a> &middot;
+  <a href="#ways-to-connect">Ways to connect</a> &middot;
   <a href="#how-it-works">How it works</a> &middot;
   <a href="DEVELOPMENT.md">Development</a>
 </p>
@@ -67,8 +68,6 @@ Braid also notices when a phone's lane is the connection you already have, which
 usual case when both are on the same Wi-Fi, and leaves it switched off with a note
 saying so rather than offering you bandwidth that does not exist.
 
-The Android companion is not released yet. The desktop half is built and tested.
-
 ### It does not corrupt files
 
 Every chunk is hashed as it lands and the hash is journalled before the chunk is
@@ -98,6 +97,58 @@ bound to a source address are resolved once per interface, because each path lea
 from a different one.
 
 ---
+
+## Ways to connect
+
+<p align="center">
+  <img src="assets/ways-to-connect.jpg" alt="Three ways paths combine into one file" width="860">
+</p>
+
+Every combination below ends the same way: several paths pulling one file at once,
+each carrying the share it earns, and any of them able to disappear without costing
+the download.
+
+| Setup | What carries the file | Needs the companion |
+|---|---|---|
+| Computer alone | Every interface you select: Wi-Fi, Ethernet, a tethered phone appearing as a network card | no |
+| Phone on the same network | Your own connection, plus the phone's mobile data | yes |
+| Phone on a cable | Your own connection, plus the phone's mobile data, plus the phone's Wi-Fi as a separate path | yes |
+| Plain USB tethering | The phone appears as one network card and is used like any other | no |
+| Several phones | Each phone's networks are separate paths, weighted independently | yes |
+
+Two things are worth knowing because they surprise people.
+
+**A phone on your Wi-Fi is usually not a second path.** If the phone reaches the
+internet through the same router your computer does, it is your own connection wearing
+a second name. Braid detects this by comparing the address each path leaves from, and
+marks that lane "Not used" rather than pretending. Its mobile data is a real second
+path; its Wi-Fi generally is not.
+
+**A phone joins the next transfer, not one already running.** A transfer's paths are
+fixed when it starts, the same as your interface selection. Pair first, then download.
+
+## The Android companion
+
+The companion turns a phone into one of those paths. It forwards, the desktop
+downloads, and the phone never stores or verifies anything: every hard problem stays on
+the desktop, which already solves them.
+
+**Pairing is a code on screen.** Press **Add phone** in the sidebar, then **Show code**,
+and point the phone at it. Nothing is typed. The code carries this computer's address
+on the network the phone is actually on, and a token good for two minutes and one use.
+Discovery over mDNS and a typed address both still work, because multicast is dropped
+by plenty of networks and gated by some operating systems.
+
+**The phone owns its own policy.** Which networks it lends, and how much data it will
+spend, are set on the phone. Switch mobile sharing on there and the path appears on the
+desktop by itself: there is no second switch to agree with yourself. When a limit is
+reached, or the phone sleeps, or it walks out of range, that path stops and its work
+moves to the ones that remain.
+
+**It is not released yet.** The desktop half is built and tested, and the companion is
+written and running on hardware: cellular binding proven on a real carrier, per-path
+data limits, survival through screen lock and Doze, and QR pairing verified end to end.
+It is not yet published anywhere you can install it from.
 
 ## Screens
 
