@@ -180,7 +180,10 @@ export component Inspector inherits Rectangle {
         }
 
         // ------------------------------------------------------------- grid
-        if root.page == "pieces" || (root.page == "info" && root.cells.length > 0): VerticalLayout {
+        // The Pieces tab only. It used to draw on Info as well, which made the
+        // two tabs show the same thing and paid for the grid twice on a panel
+        // that redraws ten times a second.
+        if root.page == "pieces": VerticalLayout {
             spacing: 8px;
             vertical-stretch: 0;
 

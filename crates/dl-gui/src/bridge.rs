@@ -40,7 +40,11 @@ const INSPECTOR_EVERY: u32 = 5;
 ///
 /// A 60 GB torrent at 256 KB pieces is 240,000 pieces. No grid should attempt
 /// that, and silently drawing a prefix would be a lie about what is on disk.
-const MAX_CELLS: usize = 4_000;
+/// The grid is 18 columns wide and does not scroll, so anything past the
+/// bottom of the panel is laid out and never seen. Four thousand cells meant
+/// 223 rows, of which about thirty were visible, rebuilt on every tick: the
+/// panel stuttered and the work was wasted. This is what fits.
+const MAX_CELLS: usize = 18 * 32;
 const CHART_POINTS: usize = 60;
 
 /// Smallest full-scale the throughput chart will use, in bytes per second.
