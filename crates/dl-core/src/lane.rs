@@ -43,19 +43,25 @@ pub trait LaneSet: Send + Sync {
         self.len() == 0
     }
 
-    /// Lanes that have become available since the transfer started, given how
-    /// many the caller already knows about.
+    /// Lanes that should be carrying bytes and are not.
     ///
-    /// This is how a phone paired mid-download starts carrying bytes without
-    /// the transfer being restarted. The default is none, so a set whose
-    /// membership is fixed needs no code.
+    /// `live` says, for each lane this set has handed over so far, whether it
+    /// is still in rotation. That is what makes a path that went away and came
+    /// back different from one that is simply working: a phone whose owner
+    /// switched sharing off has a parked lane, and turning sharing back on has
+    /// to produce a new one rather than being ignored because the path is
+    /// familiar.
+    ///
+    /// This is also how a phone paired mid-download starts carrying bytes
+    /// without the transfer being restarted. The default is none, so a set
+    /// whose membership is fixed needs no code.
     ///
     /// Whatever is returned must serve the same resource as the lanes already
     /// in use: these are not probed against the reference the way the original
     /// lanes were, because by this point the file is half written and a
     /// disagreement has nothing useful to say.
-    fn joined(&self, known: usize) -> Vec<Joined> {
-        let _ = known;
+    fn joined(&self, live: &[bool]) -> Vec<Joined> {
+        let _ = live;
         Vec::new()
     }
 }
@@ -394,6 +400,17 @@ impl LaneSelector {
             .collect()
     }
 
+    /// Which lanes are still in rotation, by index.
+    ///
+    /// A lane waiting out a rate limit counts as live: it is coming back, and
+    /// replacing it would open a second connection to an origin that has just
+    /// asked for fewer.
+    pub fn live(&self) -> Vec<bool> {
+        let mut state = self.state.lock().unwrap();
+        Self::expire_parks(&mut state, Instant::now());
+        state.iter().map(|s| !s.parked || s.parked_until.is_some()).collect()
+    }
+
     /// Combined throughput across every lane, which is the number that should
     /// exceed any single interface for aggregation to be worth anything.
     ///
@@ -562,6 +579,17 @@ mod tests {
         s.failed(0);
         s.failed(0);
         assert!(!s.reports()[0].parked, "a lane was parked by non-consecutive failures");
+    }
+
+    #[test]
+    fn a_parked_lane_is_reported_as_needing_replacing_and_a_waiting_one_is_not() {
+        // A phone whose owner switched sharing off should be replaced when it
+        // comes back. A lane waiting out a rate limit should not: it is coming
+        // back by itself, and a second lane would just ask the origin again.
+        let s = selector(3);
+        s.park(0);
+        s.park_for(1, Duration::from_secs(30));
+        assert_eq!(s.live(), vec![false, true, true]);
     }
 
     #[test]

@@ -555,7 +555,7 @@ async fn fetch_all(
                     crew.resize(&mut running, &tx);
                 }
                 _ = look.tick() => {
-                    for joined in roster.take_on() {
+                    for joined in roster.take_on(&selector.live()) {
                         // The roster and the meter only ever grow by appending,
                         // so the index one hands out is the index the other
                         // will. Everything downstream reads lanes by number.
@@ -915,11 +915,10 @@ impl<'a> Roster<'a> {
         added.get(lane - self.fixed.len()).map(|l| LaneRef::Added(Arc::clone(&l.source)))
     }
 
-    /// Adopt whatever the lane set has gained since this was last asked.
-    fn take_on(&self) -> Vec<NewLane> {
+    /// Adopt whatever the lane set offers, given which lanes are still alive.
+    fn take_on(&self, live: &[bool]) -> Vec<NewLane> {
         let mut added = self.added.lock().unwrap();
-        let known = self.fixed.len() + added.len();
-        let fresh = self.fixed.joined(known);
+        let fresh = self.fixed.joined(live);
         let mut out = Vec::with_capacity(fresh.len());
         for lane in fresh {
             out.push(NewLane { lane: self.fixed.len() + added.len(), label: lane.label.clone() });

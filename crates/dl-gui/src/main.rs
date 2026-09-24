@@ -267,10 +267,12 @@ fn watch_lanes(lanes: bridge::LaneNames, runtime: &tokio::runtime::Handle) {
         loop {
             ticker.tick().await;
 
-            // The phones are asked less often than the system is. Each is a
-            // request to a device on battery, and a network being switched on
-            // is not something anyone expects to appear instantly.
-            if asked.elapsed() >= std::time::Duration::from_secs(15) {
+            // The phones are asked less often than the system is: each is a
+            // request to a device on battery. Not much less often, though.
+            // Someone who switches sharing on and watches the sidebar is
+            // waiting for this, and fifteen seconds of nothing reads as a
+            // feature that does not work.
+            if asked.elapsed() >= std::time::Duration::from_secs(5) {
                 follow_phones().await;
                 asked = tokio::time::Instant::now();
             }

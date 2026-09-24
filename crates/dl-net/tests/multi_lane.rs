@@ -280,7 +280,7 @@ impl dl_core::lane::LaneSet for LateLane {
     fn label(&self, _lane: usize) -> &str {
         &self.labels[0]
     }
-    fn joined(&self, _known: usize) -> Vec<dl_core::lane::Joined> {
+    fn joined(&self, _live: &[bool]) -> Vec<dl_core::lane::Joined> {
         use std::sync::atomic::Ordering;
         if std::time::Instant::now() < self.open_at || self.handed_over.swap(true, Ordering::SeqCst)
         {

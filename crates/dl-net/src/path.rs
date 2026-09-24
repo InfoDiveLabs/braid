@@ -18,6 +18,7 @@ use dl_core::error::{Error, Result};
 use dl_core::lane::{Joined, LaneSet};
 use dl_core::source::ByteSource;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// How one lane reaches the origin.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +52,22 @@ impl Path {
     }
 }
 
+/// The most lanes one transfer will open, counting replacements.
+///
+/// A path that comes and goes gets a new lane each time it comes back, and
+/// without a ceiling a phone flapping on a weak signal would add one for the
+/// length of the transfer. Generous enough that no honest setup reaches it.
+const MAX_LANES: usize = 32;
+
+/// How long to leave a path alone after replacing its lane.
+///
+/// A phone that is simply off keeps being offered, because the desktop
+/// remembers what it last said it had; without a wait, every time its
+/// replacement lane failed its chunks and parked, another would be opened.
+/// This turns that into one attempt a quarter of a minute, which is also about
+/// the right cadence for a phone that has gone out of range.
+const REOPEN_COOLDOWN: Duration = Duration::from_secs(15);
+
 /// Asked, while a transfer is running, which paths the app would use now.
 ///
 /// A phone paired thirty seconds into a six gigabyte download is no use if the
@@ -64,9 +81,17 @@ struct Watch {
     url: String,
     config: HttpConfig,
     provider: Arc<dyn InterfaceProvider>,
-    /// The paths already considered, in lane order, so the same one is not
-    /// opened twice.
-    taken: Mutex<Vec<Path>>,
+    /// The paths already considered, in lane order, so a path that is already
+    /// carrying a lane is not opened twice.
+    taken: Mutex<Vec<Opened>>,
+}
+
+/// One path this set has turned into a lane, and when.
+struct Opened {
+    path: Path,
+    /// When this lane replaced a dead one. `None` for the lanes the transfer
+    /// began with, which are never something to wait before retrying.
+    replaced_at: Option<Instant>,
 }
 
 /// Open one lane for one path.
@@ -166,7 +191,12 @@ impl PathLanes {
     pub fn watching(mut self, paths: Paths, provider: Arc<dyn InterfaceProvider>) -> Self {
         let url = self.url.clone();
         let config = self.config.clone();
-        let taken = Mutex::new(self.initial.clone());
+        let taken = Mutex::new(
+            self.initial
+                .iter()
+                .map(|path| Opened { path: path.clone(), replaced_at: None })
+                .collect(),
+        );
         self.watch = Some(Watch { paths, url, config, provider, taken });
         self
     }
@@ -185,19 +215,46 @@ impl LaneSet for PathLanes {
         &self.labels[lane]
     }
 
-    fn joined(&self, _known: usize) -> Vec<Joined> {
+    fn joined(&self, live: &[bool]) -> Vec<Joined> {
         let Some(watch) = &self.watch else { return Vec::new() };
         let mut taken = watch.taken.lock().unwrap();
         let mut fresh = Vec::new();
 
         for path in (watch.paths)() {
-            if taken.contains(&path) {
+            // `taken` is in lane order, so a path is already served if any lane
+            // built from it is still in rotation. Checking only whether the
+            // path is familiar was the bug: a phone whose owner switched
+            // sharing off left a parked lane behind, and switching it back on
+            // did nothing at all for the rest of the transfer, because the path
+            // had been seen before.
+            let served = taken
+                .iter()
+                .enumerate()
+                .any(|(lane, seen)| seen.path == path && live.get(lane).copied().unwrap_or(true));
+            if served {
                 continue;
             }
+            // Recently replaced, and the replacement is already gone. Waiting
+            // is the only useful thing left to do.
+            if taken.iter().any(|seen| {
+                seen.path == path
+                    && seen.replaced_at.is_some_and(|at| at.elapsed() < REOPEN_COOLDOWN)
+            }) {
+                continue;
+            }
+            if taken.len() >= MAX_LANES {
+                tracing::warn!(
+                    limit = MAX_LANES,
+                    "not opening another lane; a path is coming and going faster than it is useful"
+                );
+                break;
+            }
             // Recorded whether or not it opens. A path that cannot be opened
-            // now is not going to open on the next half-second tick either,
-            // and retrying it forever would fill the log rather than the file.
-            taken.push(path.clone());
+            // now is not going to open on the next tick either, and retrying it
+            // forever would fill the log rather than the file. It is still
+            // eligible to come back later: a failed open leaves no live lane,
+            // so the check above will offer it again.
+            taken.push(Opened { path: path.clone(), replaced_at: Some(Instant::now()) });
             match open(&path, &watch.url, &watch.config, watch.provider.as_ref()) {
                 Ok((label, source)) => fresh.push(Joined { label, source: Arc::new(source) }),
                 Err(e) => tracing::warn!(
@@ -226,6 +283,87 @@ mod tests {
             &HttpConfig::default(),
             &FakeInterfaces(Vec::new()),
         )
+    }
+
+    /// Build a watching set whose idea of "what paths exist now" is a slot a
+    /// test can change, the way pairing a phone or switching sharing off does.
+    fn watching(initial: &[Path], now: Arc<Mutex<Vec<Path>>>) -> PathLanes {
+        let live = Arc::clone(&now);
+        build(initial).unwrap().watching(
+            Arc::new(move || live.lock().unwrap().clone()),
+            Arc::new(FakeInterfaces(Vec::new())),
+        )
+    }
+
+    #[test]
+    fn a_path_that_appears_mid_transfer_becomes_a_lane() {
+        let local = Path::Default("en0".into());
+        let phone = Path::Relay { relay: relay(), network: "cell".into() };
+        let now = Arc::new(Mutex::new(vec![local.clone()]));
+        let lanes = watching(std::slice::from_ref(&local), Arc::clone(&now));
+
+        assert!(lanes.joined(&[true]).is_empty(), "nothing has changed yet");
+        now.lock().unwrap().push(phone);
+        let fresh = lanes.joined(&[true]);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].label, "Pixel (cell)");
+    }
+
+    #[test]
+    fn a_phone_that_comes_back_gets_a_new_lane() {
+        // The bug this exists for: switching sharing off parked the phone's
+        // lane, and switching it back on did nothing for the rest of the
+        // transfer, because the path had been seen before and was skipped.
+        let local = Path::Default("en0".into());
+        let phone = Path::Relay { relay: relay(), network: "cell".into() };
+        let now = Arc::new(Mutex::new(vec![local.clone(), phone.clone()]));
+        let lanes = watching(&[local.clone(), phone.clone()], Arc::clone(&now));
+
+        // Both lanes healthy: nothing to do.
+        assert!(lanes.joined(&[true, true]).is_empty());
+
+        // Sharing goes off, the lane fails its chunks and is parked. The phone
+        // is still listed, because the desktop remembers what it offered.
+        let back = lanes.joined(&[true, false]);
+        assert_eq!(back.len(), 1, "the phone was never brought back");
+        assert_eq!(back[0].label, "Pixel (cell)");
+
+        // And the replacement is not itself replaced on the next sweep, nor is
+        // a third opened the moment the second one dies too.
+        assert!(lanes.joined(&[true, false, true]).is_empty());
+        assert!(lanes.joined(&[true, false, false]).is_empty(), "no wait before trying again");
+    }
+
+    #[test]
+    fn a_path_nobody_offers_any_more_is_not_reopened() {
+        // Unpairing a phone must not be undone by its lane then being parked.
+        let local = Path::Default("en0".into());
+        let phone = Path::Relay { relay: relay(), network: "cell".into() };
+        let now = Arc::new(Mutex::new(vec![local.clone()]));
+        let lanes = watching(&[local, phone], Arc::clone(&now));
+        assert!(lanes.joined(&[true, false]).is_empty());
+    }
+
+    #[test]
+    fn a_flapping_path_cannot_open_lanes_without_end() {
+        let local = Path::Default("en0".into());
+        let phone = Path::Relay { relay: relay(), network: "cell".into() };
+        let now = Arc::new(Mutex::new(vec![local.clone(), phone.clone()]));
+        let lanes = watching(&[local, phone], Arc::clone(&now));
+
+        let mut live = vec![true, false];
+        for _ in 0..MAX_LANES * 2 {
+            let fresh = lanes.joined(&live);
+            live.extend(std::iter::repeat_n(false, fresh.len()));
+        }
+        assert_eq!(live.len(), 3, "a dead path was retried on every sweep: {}", live.len());
+    }
+
+    #[test]
+    fn a_set_that_is_not_watching_never_gains_a_lane() {
+        // Every lane set but the app's own is fixed, and must stay that way.
+        let lanes = build(&[Path::Default("en0".into())]).unwrap();
+        assert!(lanes.joined(&[false]).is_empty());
     }
 
     #[test]

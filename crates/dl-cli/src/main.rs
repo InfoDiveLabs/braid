@@ -147,6 +147,17 @@ struct AddArgs {
     #[arg(long)]
     no_resume: bool,
 
+    /// Route a lane through a paired phone, as the proxy URL pairing
+    /// produced: `http://<network>:<key>@<host>:<port>`. Repeatable.
+    ///
+    /// This is the same value the desktop app keeps in `relays.conf`, so a
+    /// phone paired there can be used here by copying the line across. The
+    /// key is an argument, which means anything that can read this machine's
+    /// process list can read it; that is the trade for not having a second
+    /// place to store pairings.
+    #[arg(long = "relay", value_name = "URL")]
+    relays: Vec<String>,
+
     /// Another URL for the same file. Repeatable; each becomes a lane.
     ///
     /// Mirrors must agree on length and validator. One serving different
@@ -353,6 +364,33 @@ async fn add(args: AddArgs) -> Result<()> {
         println!("  schedule: {} window(s) active", args.windows.len());
     }
 
+    // A phone turns the lane list into a mix of local cards and borrowed
+    // connections, which is what `PathLanes` exists to express. Interfaces
+    // alone still go through `InterfaceLanes` below, so nothing changes for a
+    // download that has no phone in it.
+    let through_phones = if args.relays.is_empty() {
+        None
+    } else {
+        let mut paths = Vec::new();
+        if interfaces.is_empty() {
+            paths.push(dl_net::path::Path::Default(default_lane_name()));
+        }
+        for interface in &interfaces {
+            paths.push(dl_net::path::Path::Interface(interface.name.clone()));
+        }
+        for relay in &args.relays {
+            let (relay, network) = parse_relay(relay)?;
+            println!("  relay: {} over {network}", relay.address);
+            paths.push(dl_net::path::Path::Relay { relay, network });
+        }
+        Some(dl_net::path::PathLanes::build(
+            &paths,
+            &info.final_url,
+            &HttpConfig::default(),
+            &SystemInterfaces,
+        )?)
+    };
+
     if resumable {
         let bound = match (refreshing.is_some(), interfaces.is_empty()) {
             (false, false) => {
@@ -368,12 +406,16 @@ async fn add(args: AddArgs) -> Result<()> {
         }
 
         let single = dl_core::SingleLane::new(&source);
-        let lane_set: &dyn dl_core::LaneSet = match (&refreshing, &bound) {
-            (Some(lanes), _) => lanes,
-            (None, Some(lanes)) => lanes,
-            (None, None) => &single,
+        let lane_set: &dyn dl_core::LaneSet = match (&through_phones, &refreshing, &bound) {
+            (Some(lanes), _, _) => lanes,
+            (None, Some(lanes), _) => lanes,
+            (None, None, Some(lanes)) => lanes,
+            (None, None, None) => &single,
         };
 
+        // Per-interface caps do not apply once a phone is in the list: a
+        // relay lane is not an interface, and pretending otherwise would put
+        // somebody else's ceiling on it.
         let lane_interfaces: Vec<Option<String>> = match (&refreshing, &bound) {
             (Some(_), _) => {
                 specs.iter().map(|s| s.interface.as_ref().map(|i| i.name.clone())).collect()
@@ -508,6 +550,41 @@ async fn probe(url: &str) -> Result<()> {
     let info = source.probe().await.context("probing the url")?;
     println!("{}", human::describe_source(&info, url));
     Ok(())
+}
+
+/// Read `--relay`, which is a proxy URL with the network as its username.
+///
+/// The same shape `dl_net::Relay::proxy_url` produces, read back: that keeps
+/// one spelling for a pairing across the app, the config file and here.
+fn parse_relay(text: &str) -> Result<(dl_net::Relay, String)> {
+    let (scheme, rest) =
+        text.split_once("://").ok_or_else(|| anyhow::anyhow!("{text:?} is not a relay URL"))?;
+    let (credentials, host) = rest
+        .rsplit_once('@')
+        .ok_or_else(|| anyhow::anyhow!("a relay URL needs `<network>:<key>@` credentials"))?;
+    let (network, key) = credentials
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("a relay URL needs both a network and a key"))?;
+    if network.is_empty() || key.is_empty() || host.is_empty() {
+        bail!("a relay URL needs a network, a key and a host");
+    }
+    Ok((
+        dl_net::Relay::new(host, format!("{scheme}://{host}"), Some(key.to_string())),
+        network.to_string(),
+    ))
+}
+
+/// What to call the lane the routing table picks.
+///
+/// The name of the interface it will pick, not the word "default": otherwise
+/// the report invents a card that does not exist.
+fn default_lane_name() -> String {
+    SystemInterfaces
+        .usable()
+        .into_iter()
+        .find(|i| i.has_gateway && i.has_routable_address())
+        .map(|i| i.name)
+        .unwrap_or_else(|| "default route".to_string())
 }
 
 fn interfaces() -> Result<()> {
