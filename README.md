@@ -128,13 +128,26 @@ a dead link produce exactly one refresh.
 
 ## The Android companion
 
-The phone forwards; the desktop downloads. The phone never stores, verifies or
-resumes anything, so every hard problem stays where it is already solved.
+The phone forwards; the desktop downloads. The phone never stores, verifies or resumes
+anything, so every hard problem stays where it is already solved.
 
-**Not released yet.** It is written and running on hardware, with cellular binding
-proven on a real carrier, per-path data limits, survival through screen lock and Doze,
-and QR pairing verified end to end. It is not yet published anywhere you can install
-it from.
+**Braid for Android 0.1.0** is a signed APK from
+[InfoDiveLabs/braid-android](https://github.com/InfoDiveLabs/braid-android).
+One build for every architecture, since it carries no native code.
+
+| | |
+|---|---|
+| Requires | Android 8.0 or newer |
+| Download | `braid-android-0.1.0.apk`, 511 KB, with `SHA256SUMS` |
+| Signing key | `04:C0:0D:53:6A:D1:DB:AD:25:90:C8:43:3C:41:6B:EA:6A:66:4C:9E:2B:4C:B6:E5:49:C2:4F:80:B5:08:77:E2` |
+
+That repository is **private** for now, so the link works only for InfoDive Labs
+members. The signing certificate above is the same for every future release: an APK
+that does not match it did not come from us.
+
+Checked on a Pixel 7 Pro against a real carrier: a socket bound to the cellular radio
+genuinely leaves by it, per-path session limits cut a lane when they are reached,
+sharing survives the screen locking and Doze, and pairing by code works end to end.
 
 ---
 
@@ -193,6 +206,7 @@ application (`braid`) and the command-line tool (`dl`) are installed.
 | Debian, Ubuntu | `braid_x.y.z_amd64.deb` | `sudo apt install ./braid_*.deb` |
 | Fedora, RHEL | `braid-x.y.z.x86_64.rpm` | `sudo dnf install ./braid-*.rpm` |
 | Windows 10+ | `braid-x.y.z.msi` | Multi-NIC is unverified on hardware |
+| Android 8+ | `braid-android-x.y.z.apk` | The companion, from [braid-android](https://github.com/InfoDiveLabs/braid-android) |
 
 ```console
 $ dl add https://releases.ubuntu.com/24.04/ubuntu-24.04-desktop-amd64.iso \
