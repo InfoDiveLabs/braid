@@ -26,6 +26,27 @@ pub const SLOTS_PER_DAY: usize = (24 / SLOT_HOURS) as usize;
 /// Used only to notice that a phone is offering the route this computer
 /// already has. Failing to reach it costs nothing: no lane is marked as a
 /// duplicate, which shows one lane too many rather than hiding a useful one.
+///
+/// **This hostname is part of the relay protocol, not an implementation
+/// detail.** The companion asks the same service and reports the answer as a
+/// lane's `egress`; the desktop compares the two as strings. Both sides must
+/// therefore answer the same question the same way, and changing this here
+/// without changing it on the phone breaks duplicate detection silently: the
+/// strings simply stop matching, no lane is ever flagged, and the symptom is
+/// one lane too many rather than an error anyone would report.
+///
+/// `api.ipify.org` specifically, and not `api64.ipify.org`. This host
+/// publishes no real AAAA record: every IPv6 answer seen for it is `64:ff9b::/96`
+/// DNS64 synthesis that decodes back to the same A records, so it is reached
+/// over IPv4 on any path and echoes an IPv4 address even through NAT64. A
+/// dual-stack service would let one side answer in IPv6 and the other in IPv4,
+/// and the comparison would never match again.
+///
+/// Known limit: on a carrier-grade NAT the echoed address belongs to the
+/// translator rather than to the device, so two genuinely separate paths behind
+/// one operator's gateway can report the same address and be flagged as
+/// duplicates of each other. That is why a lane flagged this way is shown
+/// switched off rather than hidden: the person can still turn it on.
 pub const EGRESS_SERVICE: &str = "https://api.ipify.org";
 
 pub const SCHEDULE_CELLS: usize = 7 * SLOTS_PER_DAY;
