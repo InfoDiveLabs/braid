@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod http;
 pub mod iface;
 pub mod multi;
+pub mod pairing;
 pub mod path;
 pub mod refreshing;
 pub mod relay;

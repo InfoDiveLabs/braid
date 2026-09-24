@@ -1652,6 +1652,7 @@ dependencies = [
  "dl-core",
  "dl-testkit",
  "futures-util",
+ "getrandom 0.3.4",
  "libc",
  "mdns-sd",
  "netdev",
