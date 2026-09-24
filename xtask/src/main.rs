@@ -255,6 +255,19 @@ fn screenshots(out: &std::path::Path, port: u16, release: bool) -> Result<()> {
     mcp.screenshot(&window, &out.join("11-phones.png"))?;
     println!("captured 11-phones.png");
 
+    // The QR branch, which nothing else reaches. A code that renders as an
+    // empty square is indistinguishable from a working one until someone
+    // points a camera at it, so capture it and look.
+    let Some((_, show_code)) = mcp.find_by_label(&sheet, |l| l == "Show code")? else {
+        anyhow::bail!("the phone sheet has no Show code control");
+    };
+    mcp.click(&show_code)?;
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    mcp.screenshot(&window, &out.join("12-pair-code.png"))?;
+    println!("captured 12-pair-code.png");
+
+    let sheet = mcp.root_element(&window)?;
+
     let Some((_, done)) = mcp.find_by_label(&sheet, |l| l == "Done")? else {
         anyhow::bail!("no Done in the phone sheet");
     };

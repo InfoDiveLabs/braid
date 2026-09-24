@@ -501,6 +501,12 @@ component PhoneSheet inherits Rectangle {
     callback add-by-address(string);
     callback cancel();
     in-out property <string> manual-address;
+    in property <image> qr-code;
+    /// Empty until a code is showing, which is what the sheet switches on.
+    in property <string> qr-uri;
+    in property <string> qr-note;
+    in property <string> qr-address;
+    callback show-code();
     /// What the last scan came to, so an empty list is explained rather than
     /// just empty.
     in property <string> scan-note;
@@ -635,6 +641,68 @@ component PhoneSheet inherits Rectangle {
                 font-size: 11px;
                 color: Theme.text-faint;
                 wrap: word-wrap;
+            }
+
+            Rectangle { height: 4px; }
+            Rectangle { height: 1px; background: Theme.border; }
+
+            // The fast path. Pointing a phone's camera at a code is quicker
+            // than any amount of searching, and it does not depend on
+            // multicast surviving the network or the operating system's
+            // permissions.
+            if root.qr-uri == "": HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "Pair by showing a code the phone reads.";
+                        font-family: Theme.font;
+                        font-size: 11px;
+                        color: Theme.text-muted;
+                    }
+                }
+                Rectangle { }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    Button {
+                        label: "Show code";
+                        primary: true;
+                        clicked => { root.show-code(); }
+                    }
+                }
+            }
+
+            if root.qr-uri != "": VerticalLayout {
+                spacing: 8px;
+                alignment: center;
+                HorizontalLayout {
+                    alignment: center;
+                    Image {
+                        source: root.qr-code;
+                        width: 190px;
+                        height: 190px;
+                        image-rendering: pixelated;
+                    }
+                }
+                Text {
+                    text: root.qr-note;
+                    font-family: Theme.font;
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                // The address is shown as well as encoded. A code that a
+                // camera will not read is still useful if someone can type
+                // what it says.
+                Text {
+                    text: root.qr-address;
+                    font-family: Theme.mono;
+                    font-size: 10px;
+                    color: Theme.text-faint;
+                    horizontal-alignment: center;
+                }
             }
 
             Rectangle { height: 4px; }
@@ -1170,6 +1238,11 @@ export component MainWindow inherits Window {
     in property <bool> scanning-phones;
     in property <string> phone-scan-note;
     in-out property <string> phone-manual-address;
+    in property <image> phone-qr-code;
+    in property <string> phone-qr-uri;
+    in property <string> phone-qr-note;
+    in property <string> phone-qr-address;
+    callback show-phone-code();
     callback scan-phones();
     callback add-phone-by-address(string);
     callback pair-phone(int);
@@ -1781,6 +1854,11 @@ export component MainWindow inherits Window {
         relays: root.relays;
         scanning: root.scanning-phones;
         scan-note: root.phone-scan-note;
+        qr-code: root.phone-qr-code;
+        qr-uri: root.phone-qr-uri;
+        qr-note: root.phone-qr-note;
+        qr-address: root.phone-qr-address;
+        show-code => { root.show-phone-code(); }
         manual-address <=> root.phone-manual-address;
         scan => { root.scan-phones(); }
         add-by-address(a) => { root.add-phone-by-address(a); }

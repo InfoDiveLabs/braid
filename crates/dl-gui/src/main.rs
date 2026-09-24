@@ -420,6 +420,49 @@ fn whoami() -> String {
         .unwrap_or_else(|| "A computer".to_string())
 }
 
+/// Draw a pairing URI as a QR code.
+///
+/// Into a pixel buffer rather than a file: the code is good for two minutes
+/// and there is no reason for a bearer token to touch the disk.
+///
+/// The quiet zone is not decoration. A code drawn flush to the edge of a dark
+/// panel is unreadable by most scanners, and the failure looks like a broken
+/// camera rather than a missing margin.
+fn qr_image(uri: &str) -> Option<slint::Image> {
+    const SCALE: u32 = 6;
+    const QUIET: u32 = 4;
+
+    let code = qrcode::QrCode::new(uri.as_bytes()).ok()?;
+    let modules = code.width() as u32;
+    let side = (modules + QUIET * 2) * SCALE;
+
+    // White paper, black ink, whatever the application's theme is doing. A
+    // scanner reads contrast, and inverting a QR defeats plenty of them.
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(side, side);
+    for pixel in buffer.make_mut_slice() {
+        *pixel = slint::Rgba8Pixel { r: 255, g: 255, b: 255, a: 255 };
+    }
+
+    let colors = code.to_colors();
+    let pixels = buffer.make_mut_slice();
+    for y in 0..modules {
+        for x in 0..modules {
+            if colors[(y * modules + x) as usize] != qrcode::Color::Dark {
+                continue;
+            }
+            for dy in 0..SCALE {
+                for dx in 0..SCALE {
+                    let px = (x + QUIET) * SCALE + dx;
+                    let py = (y + QUIET) * SCALE + dy;
+                    pixels[(py * side + px) as usize] =
+                        slint::Rgba8Pixel { r: 0, g: 0, b: 0, a: 255 };
+                }
+            }
+        }
+    }
+    Some(slint::Image::from_rgba8(buffer))
+}
+
 /// Connect the phone sheet.
 ///
 /// On the main window rather than in Settings: a phone's lanes report their
@@ -458,6 +501,92 @@ fn wire_phones(ui: &MainWindow, runtime: tokio::runtime::Handle) {
                     ui.set_relays(std::rc::Rc::new(slint::VecModel::from(to_rows(found))).into());
                     ui.set_phone_scan_note(note.into());
                     ui.set_scanning_phones(false);
+                });
+            });
+        }
+    });
+
+    ui.on_show_phone_code({
+        let weak = ui.as_weak();
+        let handle = runtime.clone();
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if !ui.get_phone_qr_uri().is_empty() {
+                return;
+            }
+
+            let Some(host) = dl_net::pairing::host_for_offer(&SystemInterfaces) else {
+                ui.set_phone_scan_note("This computer has no address a phone could reach.".into());
+                return;
+            };
+            let desktop = whoami();
+            let weak = weak.clone();
+
+            handle.spawn(async move {
+                let offer = match dl_net::pairing::Offer::open(&desktop, &host).await {
+                    Ok(offer) => offer,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not open a pairing port");
+                        return;
+                    }
+                };
+                let uri = offer.uri.clone();
+                let shown = host.clone();
+
+                {
+                    let uri = uri.clone();
+                    let weak = weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(ui) = weak.upgrade() else { return };
+                        if let Some(image) = qr_image(&uri) {
+                            ui.set_phone_qr_code(image);
+                        }
+                        ui.set_phone_qr_uri(uri.into());
+                        ui.set_phone_qr_note(
+                            "Open Braid on your phone, tap Add this phone to a computer, \
+                             and point it here. The code lasts two minutes."
+                                .into(),
+                        );
+                        ui.set_phone_qr_address(shown.into());
+                    });
+                }
+
+                // Blocks until a phone registers or the code expires, which is
+                // why it is here and not on the event loop.
+                let registered = offer.accept().await;
+
+                let note = match &registered {
+                    Some(phone) => {
+                        let mut paired = relays::load();
+                        // Keyed on the device, not the address: a phone that
+                        // moved to a new lease is the same phone, and pairing
+                        // it again should replace the old row rather than
+                        // leaving a dead one beside it.
+                        paired.retain(|p| {
+                            p.device_id != phone.device_id && p.relay.address != phone.address
+                        });
+                        paired.push(relays::Paired {
+                            relay: dl_net::Relay::new(
+                                phone.name.clone(),
+                                phone.address.clone(),
+                                Some(phone.key.clone()),
+                            ),
+                            device_id: phone.device_id.clone(),
+                            // Nothing on by default, as with any pairing.
+                            enabled: Vec::new(),
+                        });
+                        relays::save(&paired);
+                        format!("{} is paired. Switch on the lanes you want.", phone.name)
+                    }
+                    None => "That code expired. Show another when you are ready.".to_string(),
+                };
+
+                let rows = scan_for_relays().await;
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak.upgrade() else { return };
+                    ui.set_relays(std::rc::Rc::new(slint::VecModel::from(to_rows(rows))).into());
+                    ui.set_phone_qr_uri("".into());
+                    ui.set_phone_scan_note(note.into());
                 });
             });
         }
@@ -1650,6 +1779,29 @@ fn main() -> Result<()> {
 mod factory_tests {
     use super::*;
     use dl_net::path::Path;
+
+    #[test]
+    fn a_pairing_code_is_drawn_at_a_size_a_camera_can_read() {
+        // A real URI, of the length one actually reaches: an IPv6 host
+        // percent-encodes to something long, and the token is 64 characters.
+        let uri = "braid://pair?v=1&h=%5B2409%3A40e4%3A2004%3A769a%3A106f%3Aae98%3Adf51%3A42d3%5D\
+                   &p=54965&t=11d6bef929fdbf6606d7989e47612667f4767799c5e7e2ba32c344b0a761822c\
+                   &n=Suraj%27s%20MacBook";
+        let image = qr_image(uri).expect("that uri fits in a QR code");
+        let size = image.size();
+        assert_eq!(size.width, size.height, "a QR code is square");
+        // 53 modules for this length, plus four of quiet zone each side, at
+        // six pixels a module. A code drawn without the quiet zone scans on a
+        // white page and fails on a dark panel, which is where this one lives.
+        assert_eq!(size.width, (53 + 8) * 6);
+    }
+
+    #[test]
+    fn a_uri_too_long_to_encode_is_refused_rather_than_drawn_wrong() {
+        // Better no code than a code that cannot be read.
+        let huge = "braid://pair?n=".to_string() + &"x".repeat(8000);
+        assert!(qr_image(&huge).is_none());
+    }
 
     #[test]
     fn a_paired_phone_is_listed_in_the_sidebar_before_it_carries_anything() {

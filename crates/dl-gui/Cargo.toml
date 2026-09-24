@@ -92,6 +92,9 @@ devtools = ["dep:dl-testkit", "dl-core/devtools"]
 native-shell = ["slint/unstable-winit-030", "dep:i-slint-backend-winit"]
 
 [dependencies]
+# Drawn into a buffer rather than rendered to SVG or a file: the code lives
+# for two minutes and never touches disk.
+qrcode = { version = "0.14", default-features = false }
 dl-core.workspace = true
 dl-net.workspace = true
 dl-testkit = { workspace = true, optional = true }
