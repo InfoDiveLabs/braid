@@ -994,6 +994,34 @@ fn inspector_tabs(is_torrent: bool) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+/// Update the piece grid in place.
+///
+/// Replacing the model made Slint tear down and rebuild every cell, and this
+/// runs on every tick: several hundred elements destroyed and recreated ten
+/// times a second, which is felt as the whole window going sluggish the
+/// moment the grid is on screen. Cells change state one at a time, so the
+/// model is kept and only the cells that differ are written.
+fn update_cells(ui: &MainWindow, cells: Vec<InspectorCell>) {
+    let current = ui.get_inspector_cells();
+    if let Some(model) = current.as_any().downcast_ref::<VecModel<InspectorCell>>()
+        && model.row_count() == cells.len()
+    {
+        for (index, cell) in cells.into_iter().enumerate() {
+            let same = model
+                .row_data(index)
+                .is_some_and(|old| old.state == cell.state && old.fill == cell.fill);
+            if !same {
+                model.set_row_data(index, cell);
+            }
+        }
+        return;
+    }
+
+    // A different length means a different transfer or a re-bucketed grid,
+    // which is the one case where rebuilding is the cheaper answer.
+    ui.set_inspector_cells(Rc::new(VecModel::from(cells)).into());
+}
+
 /// Fill the Inspector for the selected transfer.
 ///
 /// Gated twice over: nothing happens with the panel closed or nothing
@@ -1049,17 +1077,27 @@ fn apply_inspector(
     };
     ui.set_inspector_have(have.into());
 
-    match &report {
-        Some(report) => {
-            let (cells, bucket) = cells_for(report);
-            ui.set_inspector_cells(Rc::new(VecModel::from(cells)).into());
-            ui.set_inspector_bucket(bucket as i32);
-        }
-        // A finished or queued transfer has no live map. An empty grid says so
-        // better than a stale one from the last transfer that had one.
-        None => {
-            ui.set_inspector_cells(Rc::new(VecModel::<InspectorCell>::default()).into());
-            ui.set_inspector_bucket(1);
+    // Only while the grid is on screen: building it for a tab nobody is
+    // looking at is hundreds of elements of work, ten times a second, thrown
+    // away. Deliberately not an early return, because everything below fills
+    // the other tabs and sets the page itself: skipping it would leave the
+    // panel stuck on whichever tab it was showing.
+    //
+    // The page read here is the one set at the end of the previous tick, so
+    // the grid starts filling a tenth of a second after the tab is chosen.
+    if ui.get_inspector_page() == "pieces" {
+        match &report {
+            Some(report) => {
+                let (cells, bucket) = cells_for(report);
+                update_cells(ui, cells);
+                ui.set_inspector_bucket(bucket as i32);
+            }
+            // A finished or queued transfer has no live map. An empty grid
+            // says so better than a stale one from the last transfer.
+            None => {
+                update_cells(ui, Vec::new());
+                ui.set_inspector_bucket(1);
+            }
         }
     }
 
