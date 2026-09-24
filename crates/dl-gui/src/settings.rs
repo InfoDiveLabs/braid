@@ -49,6 +49,19 @@ pub const SLOTS_PER_DAY: usize = (24 / SLOT_HOURS) as usize;
 /// switched off rather than hidden: the person can still turn it on.
 pub const EGRESS_SERVICE: &str = "https://api.ipify.org";
 
+/// The same question in IPv6, which on some networks is the only useful answer.
+///
+/// Measured on an IPv6-only carrier: a laptop and a phone sharing one hotspot,
+/// demonstrably on the same link, were handed different public IPv4 addresses,
+/// because NAT64 allocates one per source address. The same device's IPv4 also
+/// changed within minutes. So on those networks the IPv4 is not a property of
+/// the route and cannot identify it; the IPv6 prefix is and can.
+///
+/// `api6.ipify.org` is the IPv6-only sibling of the host above. It fails on a
+/// network with no IPv6, which costs nothing: the comparison then falls back
+/// to IPv4 alone, which is what every IPv4 network needs anyway.
+pub const EGRESS_SERVICE_V6: &str = "https://api6.ipify.org";
+
 pub const SCHEDULE_CELLS: usize = 7 * SLOTS_PER_DAY;
 
 /// How often the schedule is re-evaluated. Windows have minute resolution, so

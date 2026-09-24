@@ -52,10 +52,18 @@ pub struct OfferedLane {
     pub kind: LaneKind,
     /// Shown in the sidebar.
     pub label: String,
-    /// The public address this lane leaves from, when the phone knows it.
-    /// Used to notice that a lane and the desktop share an upstream.
+    /// The public IPv4 address this lane leaves from, when the phone knows it.
     #[serde(default)]
     pub egress: Option<String>,
+    /// The global IPv6 address this lane leaves from.
+    ///
+    /// Carried as well as the IPv4 because on an IPv6-only carrier the IPv4 is
+    /// not a property of the route at all: NAT64 hands out a public IPv4 per
+    /// source address, so two devices on one link get two different ones, and
+    /// the same device gets a different one a few minutes later. The IPv6
+    /// prefix is stable and is shared by everything on the link.
+    #[serde(default)]
+    pub egress6: Option<String>,
     /// Whatever the phone wants to say about itself: an allowance left, a
     /// warning that it is hot. Displayed verbatim, never parsed.
     #[serde(default)]
@@ -175,6 +183,16 @@ async fn get<T: for<'de> Deserialize<'de>>(
         .map_err(|e| Error::Transport(format!("{address} is not a relay we understand: {e}")))
 }
 
+/// What this computer looks like from outside, in both families.
+///
+/// Either half may be absent: a network with no IPv6, or an echo service that
+/// cannot be reached. Absent means no claim, never a guess.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostEgress {
+    pub v4: Option<String>,
+    pub v6: Option<String>,
+}
+
 /// This computer's own public address, asked of a service that echoes it.
 ///
 /// Used only to notice that a phone is offering the route we already have. A
@@ -184,13 +202,33 @@ async fn get<T: for<'de> Deserialize<'de>>(
 /// The service is a parameter rather than a constant so that it is testable,
 /// and so a person can point it at something they trust instead of whatever
 /// this project chose.
-pub async fn host_egress(service: &str) -> Option<String> {
+pub async fn host_egress(v4_service: &str, v6_service: &str) -> HostEgress {
+    HostEgress { v4: echo(v4_service).await, v6: echo(v6_service).await }
+}
+
+async fn echo(service: &str) -> Option<String> {
     let client = control_client(CONTROL_TIMEOUT).ok()?;
     let body = client.get(service).send().await.ok()?.text().await.ok()?;
-    // Whatever it returns has to look like an address. A captive portal
+    // Whatever comes back has to look like an address. A captive portal
     // answering with a login page must not become "our" egress and switch off
     // every lane as a duplicate.
     body.trim().parse::<std::net::IpAddr>().ok().map(|address| address.to_string())
+}
+
+/// Whether two IPv6 addresses sit on the same /64.
+///
+/// The prefix, not the address: both ends use privacy addresses whose low 64
+/// bits rotate, while everything on one link shares the top 64. A /64 is
+/// delegated by one provider, so a match is strong evidence of one link and
+/// therefore one upstream. A mismatch proves nothing, which is why it only
+/// ever adds a duplicate and never clears one.
+fn same_prefix(ours: &str, theirs: &str) -> bool {
+    let (Ok(ours), Ok(theirs)) =
+        (ours.parse::<std::net::Ipv6Addr>(), theirs.parse::<std::net::Ipv6Addr>())
+    else {
+        return false;
+    };
+    ours.octets()[..8] == theirs.octets()[..8]
 }
 
 /// The offered lanes that leave from the same address this computer does.
@@ -203,18 +241,114 @@ pub async fn host_egress(service: &str) -> Option<String> {
 /// with a reason instead of quietly dropping something the phone said it had.
 /// An unknown address on either side means no claim is made: guessing would
 /// switch off what might be the only useful lane.
-pub fn duplicates_of<'a>(status: &'a Status, host_egress: Option<&str>) -> Vec<&'a OfferedLane> {
-    let Some(ours) = host_egress else { return Vec::new() };
+pub fn duplicates_of<'a>(status: &'a Status, host: &HostEgress) -> Vec<&'a OfferedLane> {
     status
         .lanes
         .iter()
-        .filter(|lane| lane.egress.as_deref().is_some_and(|theirs| theirs == ours))
+        .filter(|lane| {
+            // Either signal is enough. They fail in opposite conditions: the
+            // IPv4 is useless behind NAT64, which hands one out per source
+            // address, and the IPv6 is absent on networks that have none.
+            let same_v4 = match (&host.v4, &lane.egress) {
+                (Some(ours), Some(theirs)) => ours == theirs,
+                _ => false,
+            };
+            let same_v6 = match (&host.v6, &lane.egress6) {
+                (Some(ours), Some(theirs)) => same_prefix(ours, theirs),
+                _ => false,
+            };
+            same_v4 || same_v6
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lane offering both families, as a phone that knows where it is will.
+    fn both(id: &str, egress: &str, egress6: &str) -> OfferedLane {
+        OfferedLane {
+            id: id.into(),
+            kind: LaneKind::Unknown,
+            label: id.into(),
+            egress: Some(egress.into()),
+            egress6: Some(egress6.into()),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn a_shared_link_is_caught_even_when_the_public_ipv4_differs() {
+        // Measured on a Pixel 7 Pro and a Mac sharing one hotspot on an
+        // IPv6-only carrier. Both are on the same link, verified by router and
+        // prefix, yet NAT64 handed each a different public IPv4, because it
+        // allocates per source address. Matching on IPv4 alone declared the
+        // phone's Wi-Fi lane a separate path when it is exactly the desktop's
+        // own route: the placebo lane this whole check exists to catch.
+        let status =
+            Status { lanes: vec![both("wifi", "152.59.168.122", "2409:40e4:2004:769a:1:2:3:4")] };
+        let host = HostEgress {
+            v4: Some("152.59.170.6".into()),
+            v6: Some("2409:40e4:2004:769a:aaaa:bbbb:cccc:dddd".into()),
+        };
+        assert_eq!(duplicates_of(&status, &host).len(), 1, "the shared link was missed");
+    }
+
+    #[test]
+    fn a_different_prefix_is_a_different_link() {
+        let status =
+            Status { lanes: vec![both("cell", "152.59.146.101", "2409:40e4:110a:6fcb:1:2:3:4")] };
+        let host = HostEgress {
+            v4: Some("152.59.170.6".into()),
+            v6: Some("2409:40e4:2004:769a:aaaa:bbbb:cccc:dddd".into()),
+        };
+        assert!(duplicates_of(&status, &host).is_empty(), "two links were merged into one");
+    }
+
+    #[test]
+    fn the_low_bits_are_ignored_because_they_rotate() {
+        // Privacy addresses change on both ends while the link does not.
+        assert!(same_prefix(
+            "2409:40e4:2004:769a:0000:0000:0000:0001",
+            "2409:40e4:2004:769a:ffff:ffff:ffff:fffe"
+        ));
+    }
+
+    #[test]
+    fn matching_ipv4_still_counts_on_a_network_with_no_ipv6() {
+        // The original rule has to keep working: most networks are still
+        // IPv4-only, and there the public address is a real identity.
+        let status = Status { lanes: vec![offered("wifi", Some("203.0.113.7"))] };
+        assert_eq!(duplicates_of(&status, &v4("203.0.113.7")).len(), 1);
+    }
+
+    #[test]
+    fn a_phone_that_reports_no_ipv6_is_judged_on_ipv4_alone() {
+        // An older companion, or one on a network with no v6. Absence must not
+        // be read as a mismatch and clear a duplicate the v4 rule found.
+        let status = Status { lanes: vec![offered("wifi", Some("203.0.113.7"))] };
+        let host = HostEgress {
+            v4: Some("203.0.113.7".into()),
+            v6: Some("2409:40e4:2004:769a::1".into()),
+        };
+        assert_eq!(duplicates_of(&status, &host).len(), 1);
+    }
+
+    #[test]
+    fn something_that_is_not_an_address_never_matches() {
+        // A captive portal answering with HTML must not make every lane a
+        // duplicate and switch the feature off.
+        assert!(!same_prefix("not an address", "not an address"));
+    }
+
+    #[test]
+    fn an_older_phone_still_parses() {
+        // No egress6 field at all, which is what every phone sends today.
+        let json = r#"{"lanes":[{"id":"w","kind":"wifi","label":"Home","egress":"203.0.113.7"}]}"#;
+        let status: Status = serde_json::from_str(json).expect("the field is optional");
+        assert_eq!(status.lanes[0].egress6, None);
+    }
 
     #[tokio::test]
     async fn our_own_address_comes_from_whatever_service_is_named() {
@@ -223,14 +357,18 @@ mod tests {
         // The origin serves bytes, not an address, which is the case that
         // matters: anything that is not an address must be refused rather
         // than believed.
-        assert_eq!(host_egress(&origin.url("payload.bin")).await, None);
+        let found = host_egress(&origin.url("payload.bin"), &origin.url("payload.bin")).await;
+        assert_eq!(found, HostEgress::default());
     }
 
     #[tokio::test]
     async fn a_service_that_is_not_there_costs_nothing() {
         // Offline, or the service is down. No lane is marked duplicate, which
         // is the safe direction.
-        assert_eq!(host_egress("http://127.0.0.1:9/ip").await, None);
+        assert_eq!(
+            host_egress("http://127.0.0.1:9/ip", "http://127.0.0.1:9/ip").await,
+            HostEgress::default()
+        );
     }
 
     fn offered(id: &str, egress: Option<&str>) -> OfferedLane {
@@ -239,8 +377,13 @@ mod tests {
             kind: LaneKind::Unknown,
             label: id.into(),
             egress: egress.map(str::to_string),
+            egress6: None,
             note: None,
         }
+    }
+
+    fn v4(address: &str) -> HostEgress {
+        HostEgress { v4: Some(address.into()), v6: None }
     }
 
     #[test]
@@ -251,7 +394,7 @@ mod tests {
                 offered("cell", Some("198.51.100.4")),
             ],
         };
-        let same = duplicates_of(&status, Some("203.0.113.7"));
+        let same = duplicates_of(&status, &v4("203.0.113.7"));
         assert_eq!(same.len(), 1);
         assert_eq!(same[0].id, "wifi");
     }
@@ -260,14 +403,14 @@ mod tests {
     fn nothing_is_a_duplicate_when_we_do_not_know_our_own_address() {
         // Guessing here would switch off a phone's only useful lane.
         let status = Status { lanes: vec![offered("wifi", Some("203.0.113.7"))] };
-        assert!(duplicates_of(&status, None).is_empty());
+        assert!(duplicates_of(&status, &HostEgress::default()).is_empty());
     }
 
     #[test]
     fn a_lane_that_will_not_say_where_it_leaves_from_is_not_a_duplicate() {
         // Silence is not evidence.
         let status = Status { lanes: vec![offered("wifi", None)] };
-        assert!(duplicates_of(&status, Some("203.0.113.7")).is_empty());
+        assert!(duplicates_of(&status, &v4("203.0.113.7")).is_empty());
     }
 
     #[test]
@@ -278,7 +421,7 @@ mod tests {
         let status = Status {
             lanes: vec![offered("wifi", Some("203.0.113.7")), offered("cell", Some("203.0.113.7"))],
         };
-        assert_eq!(duplicates_of(&status, Some("203.0.113.7")).len(), 2);
+        assert_eq!(duplicates_of(&status, &v4("203.0.113.7")).len(), 2);
     }
 
     #[tokio::test]
@@ -337,6 +480,7 @@ mod tests {
                 kind: LaneKind::Cellular,
                 label: "Jio 4G".into(),
                 egress: Some("203.0.113.7".into()),
+                egress6: Some("2409:40e4:110a:6fcb::1".into()),
                 note: Some("1.4 GB left this month".into()),
             }],
         };
@@ -344,6 +488,7 @@ mod tests {
         assert_eq!(back.lanes.len(), 1);
         assert_eq!(back.lanes[0].id, "cell");
         assert_eq!(back.lanes[0].kind, LaneKind::Cellular);
+        assert_eq!(back.lanes[0].egress6.as_deref(), Some("2409:40e4:110a:6fcb::1"));
         assert_eq!(back.lanes[0].note.as_deref(), Some("1.4 GB left this month"));
     }
 

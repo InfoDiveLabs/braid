@@ -268,12 +268,13 @@ async fn scan_for_relays() -> Vec<Found> {
     }
 
     let paired = relays::load();
-    let ours = dl_net::control::host_egress(settings::EGRESS_SERVICE).await;
+    let ours =
+        dl_net::control::host_egress(settings::EGRESS_SERVICE, settings::EGRESS_SERVICE_V6).await;
     let mut rows = Vec::new();
 
     for entry in &paired {
         let reachable = found.iter().any(|c| c.address == entry.relay.address);
-        rows.push(row_for(entry, reachable, ours.as_deref()).await);
+        rows.push(row_for(entry, reachable, &ours).await);
     }
 
     // Then anything discovered that is not paired yet, so there is something
@@ -294,7 +295,11 @@ async fn scan_for_relays() -> Vec<Found> {
 }
 
 /// One paired phone, with whatever it says it is offering.
-async fn row_for(entry: &relays::Paired, reachable: bool, ours: Option<&str>) -> Found {
+async fn row_for(
+    entry: &relays::Paired,
+    reachable: bool,
+    ours: &dl_net::control::HostEgress,
+) -> Found {
     let status = dl_net::control::status(&entry.relay.address, entry.relay.key.as_deref())
         .await
         .unwrap_or_default();
