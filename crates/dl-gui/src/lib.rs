@@ -4,6 +4,7 @@ pub mod bridge;
 pub mod ipc;
 pub mod openurl;
 pub mod platform;
+pub mod relays;
 pub mod settings;
 pub mod transfers;
 

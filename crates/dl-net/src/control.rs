@@ -175,9 +175,76 @@ async fn get<T: for<'de> Deserialize<'de>>(
         .map_err(|e| Error::Transport(format!("{address} is not a relay we understand: {e}")))
 }
 
+/// The offered lanes that leave from the same address this computer does.
+///
+/// Such a lane is the route we already have, wearing a second name. Throughput
+/// will not reveal it: a duplicate lane splits the same pipe and looks like it
+/// is working.
+///
+/// Reported rather than hidden, so the settings page can show it switched off
+/// with a reason instead of quietly dropping something the phone said it had.
+/// An unknown address on either side means no claim is made: guessing would
+/// switch off what might be the only useful lane.
+pub fn duplicates_of<'a>(status: &'a Status, host_egress: Option<&str>) -> Vec<&'a OfferedLane> {
+    let Some(ours) = host_egress else { return Vec::new() };
+    status
+        .lanes
+        .iter()
+        .filter(|lane| lane.egress.as_deref().is_some_and(|theirs| theirs == ours))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offered(id: &str, egress: Option<&str>) -> OfferedLane {
+        OfferedLane {
+            id: id.into(),
+            kind: LaneKind::Unknown,
+            label: id.into(),
+            egress: egress.map(str::to_string),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn a_lane_leaving_from_our_own_address_is_the_route_we_already_have() {
+        let status = Status {
+            lanes: vec![
+                offered("wifi", Some("203.0.113.7")),
+                offered("cell", Some("198.51.100.4")),
+            ],
+        };
+        let same = duplicates_of(&status, Some("203.0.113.7"));
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].id, "wifi");
+    }
+
+    #[test]
+    fn nothing_is_a_duplicate_when_we_do_not_know_our_own_address() {
+        // Guessing here would switch off a phone's only useful lane.
+        let status = Status { lanes: vec![offered("wifi", Some("203.0.113.7"))] };
+        assert!(duplicates_of(&status, None).is_empty());
+    }
+
+    #[test]
+    fn a_lane_that_will_not_say_where_it_leaves_from_is_not_a_duplicate() {
+        // Silence is not evidence.
+        let status = Status { lanes: vec![offered("wifi", None)] };
+        assert!(duplicates_of(&status, Some("203.0.113.7")).is_empty());
+    }
+
+    #[test]
+    fn a_phone_behind_the_same_router_on_every_lane_is_all_duplicates() {
+        // The case that makes this worth doing: a phone on the desk, on the
+        // same Wi-Fi, with mobile data off. Every lane it offers is the
+        // connection we already have.
+        let status = Status {
+            lanes: vec![offered("wifi", Some("203.0.113.7")), offered("cell", Some("203.0.113.7"))],
+        };
+        assert_eq!(duplicates_of(&status, Some("203.0.113.7")).len(), 2);
+    }
 
     #[tokio::test]
     async fn hello_reads_a_phone_that_is_there() {
