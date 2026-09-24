@@ -46,6 +46,29 @@ migrated, and an interface you cap is a ceiling rather than a suggestion.
 The bar under each transfer is split by interface, so aggregation is something you can
 see rather than something the marketing claims.
 
+### It can borrow your phone's connection
+
+A laptop with one Wi-Fi card has one path. The phone next to it has another, over
+mobile data, and Braid can use it as an extra lane: the phone forwards, the desktop
+downloads, and both paths pull at once.
+
+Pairing is a code on screen. Open the phone sheet from the sidebar, press **Show code**,
+and point the phone at it. No address typed, no discovery to fail, and it works on a
+network with no IPv4 on it at all. Each of the phone's networks becomes its own lane
+with its own speed in the sidebar, so a lane that is quietly contributing nothing is
+visibly contributing nothing.
+
+**The phone decides what it lends.** Which of its networks it offers, and how much data
+it will spend, are the phone's to set. Braid displays what it is told and enforces
+nothing. A phone that goes out of range, sleeps, or hits its own limit simply stops
+serving, and its work moves to the paths that remain.
+
+Braid also notices when a phone's lane is the connection you already have, which is the
+usual case when both are on the same Wi-Fi, and leaves it switched off with a note
+saying so rather than offering you bandwidth that does not exist.
+
+The Android companion is not released yet. The desktop half is built and tested.
+
 ### It does not corrupt files
 
 Every chunk is hashed as it lands and the hash is journalled before the chunk is
@@ -94,6 +117,10 @@ not.
 **The torrent's swarm is simulated.** Its peer count, throughput and file list
 come from a stand-in backend rather than from a real swarm.
 
+The pairing screen is the exception to both: it is the real application, driven to
+that screen and captured there, showing a genuine code for the machine it was taken
+on.
+
 Everything else is what it appears to be. The transfers are genuine downloads
 performed by the engine against a local test server, which is why the inspector
 reports `127.0.0.1`, and the piece grid is the journal's own bitmap rather than
@@ -121,6 +148,15 @@ rather than assumed.
 Braid runs unlimited, and the schedule reaches a running transfer rather than the next
 one.
 </td>
+<td width="50%">
+<img src="assets/screenshots/pair-phone.png" alt="Pairing a phone"><br>
+<b>Point a phone at the screen.</b> The code carries this computer's address on the
+network the phone is actually on, and a token good for two minutes and one use. The
+address is printed underneath, because a camera that will not focus should not be the
+end of it.
+</td>
+</tr>
+<tr>
 <td width="50%">
 <img src="assets/screenshots/add-transfer.png" alt="Add transfer"><br>
 <b>A URL, a magnet link or a .torrent.</b> For HTTP it asks the server first: size,
