@@ -513,6 +513,7 @@ async fn fetch_all(
         limit: options.limit.clone(),
         lane_limits: &options.lane_limits,
         sockets: RwLock::new(Vec::new()),
+        endgame: Endgame::default(),
     };
 
     // The sender lives with the supervisor and nowhere else, so the writer's
@@ -637,11 +638,128 @@ async fn fetch_all(
 /// watching the sidebar feels like cause and effect.
 const LANE_POLL: Duration = Duration::from_secs(2);
 
+/// How often a chunk in flight looks at whether it has been called off.
+///
+/// Bounds how long a paused transfer keeps pulling bytes, and how long the
+/// finish waits on a copy that has already been beaten.
+const CANCEL_POLL: Duration = Duration::from_millis(25);
+
 /// How long a worker with nothing to do waits before looking again.
 ///
 /// It is only reached at the very end of a transfer, or while another lane is
 /// waiting out a rate limit, so the cost is a handful of wakeups.
 const IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// How much faster a lane has to be before it will fetch a second copy of a
+/// chunk somebody else is already on.
+const ENDGAME_GAIN: f64 = 1.5;
+
+/// The most copies of one chunk that may be in flight at once.
+const ENDGAME_COPIES: usize = 2;
+
+/// Chunks in flight, and who is racing for them.
+///
+/// At the end of a transfer every lane but one has run out of work, and the
+/// finish time belongs to whoever is still mid-chunk. On a phone that is ten
+/// seconds for four megabytes while a gigabit card sits idle waiting for it,
+/// and no amount of dividing the file up beforehand helps, because the chunk
+/// was already in flight when the last of the work ran out.
+///
+/// So a lane with nothing left may fetch its own copy of a chunk a slower lane
+/// is already carrying. The first copy to land is kept and the other is called
+/// off where it stands. BitTorrent has called this the endgame for twenty
+/// years, for this exact reason.
+///
+/// Only a measurably faster lane may join a race, and only two lanes per
+/// chunk, so it cannot turn into every lane fetching everything. That
+/// restraint matters more here than it does in a swarm: a duplicate over a
+/// phone's mobile data is somebody's money, and the lane that would be
+/// duplicating is by construction not the phone.
+#[derive(Default)]
+struct Endgame {
+    racing: Mutex<BTreeMap<u64, Contest>>,
+}
+
+struct Contest {
+    /// Lanes fetching this chunk right now.
+    lanes: Vec<usize>,
+    /// The best rate among them, which is what a newcomer has to beat.
+    best: f64,
+    /// Cancelled by whichever copy lands first.
+    landed: Cancel,
+}
+
+impl Endgame {
+    /// Note that a lane has started a chunk it owns, and hand back the token
+    /// its fetch should run under.
+    fn started(&self, chunk: u64, lane: usize, rate: f64) -> Cancel {
+        let mut racing = self.racing.lock().unwrap();
+        let contest = racing.entry(chunk).or_insert_with(|| Contest {
+            lanes: Vec::new(),
+            best: 0.0,
+            landed: Cancel::new(),
+        });
+        contest.lanes.push(lane);
+        contest.best = contest.best.max(rate);
+        contest.landed.clone()
+    }
+
+    /// A chunk worth racing for a lane going at `rate`, if there is one.
+    ///
+    /// Joins the race as well as finding it, under one lock, so two idle lanes
+    /// asking at the same moment cannot both decide to be the second copy.
+    fn join(&self, lane: usize, rate: f64) -> Option<(u64, Cancel)> {
+        let mut racing = self.racing.lock().unwrap();
+        let chunk = racing
+            .iter()
+            .find(|(_, contest)| {
+                contest.lanes.len() < ENDGAME_COPIES
+                    && !contest.lanes.contains(&lane)
+                    && !contest.landed.is_cancelled()
+                    && rate > contest.best * ENDGAME_GAIN
+            })
+            .map(|(chunk, _)| *chunk)?;
+        let contest = racing.get_mut(&chunk)?;
+        contest.lanes.push(lane);
+        contest.best = contest.best.max(rate);
+        Some((chunk, contest.landed.clone()))
+    }
+
+    /// Claim the chunk for the copy that just finished it.
+    ///
+    /// `false` means another copy got there first and this one is to be thrown
+    /// away. Decided under the lock so exactly one copy is ever written: two
+    /// finishing together would otherwise both be counted, and the transfer
+    /// would report more bytes downloaded than the file has.
+    fn won(&self, chunk: u64) -> bool {
+        let mut racing = self.racing.lock().unwrap();
+        let Some(contest) = racing.get_mut(&chunk) else { return true };
+        if contest.landed.is_cancelled() {
+            return false;
+        }
+        contest.landed.cancel();
+        true
+    }
+
+    /// This lane is done with the chunk, however it went.
+    fn finished(&self, chunk: u64, lane: usize) {
+        let mut racing = self.racing.lock().unwrap();
+        let Some(contest) = racing.get_mut(&chunk) else { return };
+        if let Some(at) = contest.lanes.iter().position(|holder| *holder == lane) {
+            contest.lanes.remove(at);
+        }
+        if contest.lanes.is_empty() {
+            racing.remove(&chunk);
+        }
+    }
+}
+
+/// Whether a fetch owns its chunk or is a second copy of somebody else's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    Owned,
+    Copy,
+}
 
 /// How many connections one lane has open, and how many it ought to have.
 ///
@@ -832,6 +950,7 @@ struct Crew<'a> {
     lane_limits: &'a [Option<Arc<Budget>>],
     /// How many connections each lane has, by lane index. Grows as lanes do.
     sockets: RwLock<Vec<Arc<Sockets>>>,
+    endgame: Endgame,
 }
 
 impl<'a> Crew<'a> {
@@ -948,7 +1067,16 @@ impl<'a> Crew<'a> {
                 }
             }
 
-            let Some(index) = self.regions.take(lane) else {
+            let rate = self.selector.rate_of(lane).unwrap_or(0.0);
+            // Its own stretch of the file first; failing that, a copy of a
+            // chunk a slower lane is holding up the finish with.
+            let taken = match self.regions.take(lane, rate) {
+                Some(index) => Some((index, self.endgame.started(index, lane, rate), Claim::Owned)),
+                None => {
+                    self.endgame.join(lane, rate).map(|(index, stop)| (index, stop, Claim::Copy))
+                }
+            };
+            let Some((index, stop, claim)) = taken else {
                 if self.regions.is_empty() && self.inflight.load(Ordering::Acquire) == 0 {
                     retire();
                     return Ok(());
@@ -962,8 +1090,9 @@ impl<'a> Crew<'a> {
             };
 
             self.inflight.fetch_add(1, Ordering::AcqRel);
-            let outcome = self.fetch(lane, index, &budget, &tx).await;
+            let outcome = self.fetch(lane, index, &budget, &tx, &stop, claim).await;
             self.inflight.fetch_sub(1, Ordering::AcqRel);
+            self.endgame.finished(index, lane);
             match outcome {
                 Ok(Step::Continue) => continue,
                 Ok(Step::Stop) => {
@@ -985,13 +1114,27 @@ impl<'a> Crew<'a> {
         index: u64,
         budget: &BudgetChain,
         tx: &tokio::sync::mpsc::Sender<(u64, bytes::Bytes)>,
+        stop: &Cancel,
+        claim: Claim,
     ) -> Result<Step> {
         let range = self.layout.range(index).expect("a pending index is in range");
-        self.chunks_seen.started(index);
+        // A second copy leaves the grid alone: the chunk is already shown as
+        // being fetched, by the lane that owns it.
+        let owned = claim == Claim::Owned;
+        if owned {
+            self.chunks_seen.started(index);
+        }
+        // Handing a chunk back is only meaningful for the lane that holds it.
+        // A copy that fails simply stops; the owner is still fetching it.
+        let give_back = || {
+            if owned {
+                self.chunks_seen.released(index);
+                self.regions.give_back(index);
+            }
+        };
 
         let Some(source) = self.roster.source(lane) else {
-            self.chunks_seen.released(index);
-            self.regions.give_back(index);
+            give_back();
             return Err(Error::NoRouteAvailable);
         };
 
@@ -1000,7 +1143,7 @@ impl<'a> Crew<'a> {
             range,
             self.validator.clone(),
             budget,
-            &self.cancel,
+            &self.cancel.or(stop),
             &|bytes| self.selector.progressed(lane, bytes),
         )
         .await
@@ -1022,8 +1165,7 @@ impl<'a> Crew<'a> {
                     "rate limited; backing off"
                 );
                 self.selector.park_for(lane, wait);
-                self.chunks_seen.released(index);
-                self.regions.give_back(index);
+                give_back();
                 note_attempt(index, &self.backoffs);
 
                 if self.selector.all_parked_permanently() {
@@ -1031,12 +1173,16 @@ impl<'a> Crew<'a> {
                 }
                 return Ok(Step::Continue);
             }
+            // Another lane finished this chunk first. Not a failure, and not
+            // ours to hand back: the copy that won it has it.
+            Err(Error::Cancelled) if self.cancel.check().is_ok() => {
+                return Ok(Step::Continue);
+            }
             Err(e) if e.is_retryable() => {
                 // A path that died mid-transfer should cost this chunk, not the
                 // download: hand it back for a healthier lane.
                 self.selector.failed(lane);
-                self.chunks_seen.released(index);
-                self.regions.give_back(index);
+                give_back();
                 if self.selector.all_parked() {
                     return Err(e);
                 }
@@ -1046,12 +1192,17 @@ impl<'a> Crew<'a> {
                 // The origin misbehaved, which every lane would hit
                 // identically. Not the lane's fault, so do not park it.
                 self.selector.released(lane);
-                self.chunks_seen.released(index);
-                self.regions.give_back(index);
+                give_back();
                 return Err(e);
             }
         };
 
+        // Claimed before the bytes are counted, so two copies finishing
+        // together cannot both be written and leave the transfer reporting
+        // more bytes than the file holds.
+        if !self.endgame.won(index) {
+            return Ok(Step::Continue);
+        }
         self.transferred.fetch_add(range.len(), Ordering::Relaxed);
         if tx.send((index, body)).await.is_err() {
             return Ok(Step::Stop);
@@ -1077,7 +1228,7 @@ async fn fetch_chunk(
     let mut stream = source.open(Fetch::validated(range, validator)).await?;
     let mut buffer = Vec::with_capacity(range.len() as usize);
 
-    while let Some(chunk) = stream.next().await {
+    loop {
         // Checked as the body arrives, not only between chunks. Waiting for a
         // chunk to finish means a pause keeps pulling on every lane at once,
         // and on a borrowed mobile connection that is somebody's money being
@@ -1085,6 +1236,15 @@ async fn fetch_chunk(
         // and refetched later: nothing is journalled until it is whole, so
         // abandoning one costs bytes and never correctness.
         cancel.check()?;
+
+        // On a clock as well as on arrival. Checking only when bytes land ties
+        // how fast a chunk can be called off to how fast it is going, so the
+        // slowest lane, which is the one most likely to be paused or overtaken,
+        // is also the one that takes longest to notice.
+        let Ok(next) = tokio::time::timeout(CANCEL_POLL, stream.next()).await else {
+            continue;
+        };
+        let Some(chunk) = next else { break };
 
         let chunk = chunk?;
         if buffer.len() as u64 + chunk.len() as u64 > range.len() {
@@ -1155,6 +1315,90 @@ mod tests {
             ramp.consider(Some(rate), &sockets, ceiling);
         }
         sockets.want.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_much_faster_lane_takes_over_the_chunk_holding_up_the_finish() {
+        // The tail this exists for: everything is handed out, one slow lane is
+        // still mid-chunk, and the fast lane has nothing to do but wait.
+        let endgame = Endgame::default();
+        let slow = endgame.started(41, 0, 400e3);
+        assert!(!slow.is_cancelled());
+
+        let (chunk, fast) = endgame.join(1, 15e6).expect("the fast lane should join the race");
+        assert_eq!(chunk, 41);
+
+        assert!(endgame.won(41), "the first copy to finish keeps it");
+        assert!(slow.is_cancelled(), "the slower copy was left running");
+        assert!(fast.is_cancelled());
+    }
+
+    #[test]
+    fn a_lane_no_faster_than_the_one_already_on_it_does_not_duplicate() {
+        // Two copies over the same kind of link is bandwidth spent for a
+        // coin toss, and on a phone it is spent out of somebody's data plan.
+        let endgame = Endgame::default();
+        endgame.started(7, 0, 10e6);
+        assert!(endgame.join(1, 11e6).is_none());
+        assert!(endgame.join(1, 20e6).is_some(), "a genuinely faster lane should join");
+    }
+
+    #[test]
+    fn a_chunk_is_never_fetched_more_than_twice() {
+        let endgame = Endgame::default();
+        endgame.started(7, 0, 400e3);
+        assert!(endgame.join(1, 15e6).is_some());
+        assert!(endgame.join(2, 30e6).is_none(), "a third copy of one chunk");
+    }
+
+    #[test]
+    fn a_lane_does_not_race_itself() {
+        // One lane's connections all go idle together at the end; without
+        // this, they would all pile onto the same chunk.
+        let endgame = Endgame::default();
+        endgame.started(7, 0, 400e3);
+        assert!(endgame.join(0, 400e3).is_none());
+    }
+
+    #[test]
+    fn exactly_one_copy_is_ever_written() {
+        // Two copies finishing together must not both be counted, or the
+        // transfer reports more bytes downloaded than the file contains.
+        let endgame = Endgame::default();
+        endgame.started(7, 0, 400e3);
+        endgame.join(1, 15e6).expect("joined");
+        assert!(endgame.won(7));
+        assert!(!endgame.won(7), "the second copy was counted too");
+    }
+
+    #[test]
+    fn nobody_joins_a_race_that_is_already_decided() {
+        let endgame = Endgame::default();
+        endgame.started(7, 0, 400e3);
+        assert!(endgame.won(7));
+        assert!(endgame.join(1, 15e6).is_none());
+    }
+
+    #[test]
+    fn a_chunk_is_forgotten_once_every_copy_has_finished_with_it() {
+        // The map is every chunk in flight, so a leak here is a leak per
+        // chunk for the length of the transfer.
+        let endgame = Endgame::default();
+        endgame.started(7, 0, 400e3);
+        endgame.join(1, 15e6).expect("joined");
+        endgame.finished(7, 1);
+        assert_eq!(endgame.racing.lock().unwrap().len(), 1, "the owner is still on it");
+        endgame.finished(7, 0);
+        assert!(endgame.racing.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_chunk_nobody_is_racing_is_simply_won() {
+        // The ordinary case: one copy, no contest, and the same code path.
+        let endgame = Endgame::default();
+        let stop = endgame.started(3, 0, 1e6);
+        assert!(endgame.won(3));
+        assert!(stop.is_cancelled(), "winning should call off any copy that appears later");
     }
 
     #[test]

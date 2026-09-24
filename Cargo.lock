@@ -1577,6 +1577,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dl-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "dl-core",
+ "dl-net",
+ "dl-testkit",
+ "futures-util",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dl-cli"
 version = "0.1.0"
 dependencies = [

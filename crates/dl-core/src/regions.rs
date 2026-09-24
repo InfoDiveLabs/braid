@@ -61,11 +61,20 @@ struct Inner {
     /// run, because it no longer belongs to anyone's stretch of the file and
     /// burying it inside one would leave it until that lane got there.
     orphans: Vec<u64>,
+    /// What each lane was last measured at, so a run of one chunk goes to
+    /// whichever lane would finish it sooner.
+    rates: BTreeMap<usize, f64>,
 }
 
 impl Inner {
     /// Find a run for a lane that has none.
-    fn acquire(&mut self) -> Option<Span> {
+    ///
+    /// `rate` is what the asking lane is currently managing, and only matters
+    /// for a run of a single chunk: that cannot be halved, so taking it means
+    /// taking it away, and handing the file's last chunk from a gigabit card
+    /// to a phone is how a download that was seconds from finishing spends ten
+    /// more on four megabytes.
+    fn acquire(&mut self, lane: usize, rate: f64) -> Option<Span> {
         self.free.retain(|span| !span.is_empty());
         // The longest, and the earliest of those: ties are broken towards the
         // front of the file so lanes are handed their runs in order and the
@@ -79,13 +88,24 @@ impl Inner {
         // Nothing spare, so take the back half of whoever has the most left.
         // The front half stays with its owner, which is the part it is already
         // walking towards.
-        let victim = *self.claims.iter().max_by_key(|(_, span)| span.len())?.0;
+        let victim = self
+            .claims
+            .iter()
+            .filter(|(owner, _)| **owner != lane)
+            .max_by_key(|(owner, span)| (span.len(), std::cmp::Reverse(**owner)))
+            .map(|(owner, _)| *owner)?;
+        let held = self.rates.get(&victim).copied().unwrap_or(0.0);
         let span = self.claims.get_mut(&victim)?;
-        if span.len() < 2 {
-            // One chunk cannot be halved, and taking it outright would race
-            // the lane that is about to fetch it.
+        if span.is_empty() {
             return None;
         }
+        if span.len() == 1 && rate <= held {
+            // Nothing to gain: the lane that has it will not be slower at it.
+            return None;
+        }
+        // Halving a run of one leaves the owner with nothing and hands the
+        // chunk over whole, which is exactly what is wanted when the asking
+        // lane is the faster of the two.
         let middle = span.start + span.len() / 2;
         let back = Span { start: middle, end: span.end };
         span.end = middle;
@@ -126,10 +146,15 @@ impl Regions {
         Self { inner: Mutex::new(Inner { pending, free, ..Default::default() }) }
     }
 
-    /// The next chunk for this lane, or `None` when there is nothing left that
-    /// it can take without racing another lane for it.
-    pub fn take(&self, lane: usize) -> Option<u64> {
+    /// The next chunk for this lane, or `None` when there is nothing left
+    /// worth handing it.
+    ///
+    /// `rate` is the lane's current throughput in bytes per second, or zero if
+    /// it has not been measured. It decides only who gets a run that is down
+    /// to its last chunk.
+    pub fn take(&self, lane: usize, rate: f64) -> Option<u64> {
         let mut inner = self.inner.lock().unwrap();
+        inner.rates.insert(lane, rate);
         // Before anything else: a chunk somebody handed back is work that is
         // already overdue.
         if let Some(chunk) = inner.orphans.pop() {
@@ -144,7 +169,7 @@ impl Regions {
             return inner.pending.get(at).copied();
         }
 
-        let span = inner.acquire()?;
+        let span = inner.acquire(lane, rate)?;
         let at = span.start;
         inner.claims.insert(lane, Span { start: at + 1, end: span.end });
         inner.pending.get(at).copied()
@@ -191,7 +216,7 @@ mod tests {
     fn drain(r: &Regions, lane: usize, limit: usize) -> Vec<u64> {
         let mut taken = Vec::new();
         while taken.len() < limit {
-            match r.take(lane) {
+            match r.take(lane, 0.0) {
                 Some(chunk) => taken.push(chunk),
                 None => break,
             }
@@ -211,8 +236,8 @@ mod tests {
         // The point of the exercise: not four clients picking at the same
         // pile, but each one walking its own part.
         let r = regions(8, 2);
-        assert_eq!(r.take(0), Some(0));
-        assert_eq!(r.take(1), Some(4), "the second lane started inside the first's run");
+        assert_eq!(r.take(0, 0.0), Some(0));
+        assert_eq!(r.take(1, 0.0), Some(4), "the second lane started inside the first's run");
 
         let first = drain(&r, 0, 3);
         let second = drain(&r, 1, 3);
@@ -228,7 +253,7 @@ mod tests {
         let r = regions(16, 1);
         assert_eq!(drain(&r, 0, 4), vec![0, 1, 2, 3]);
 
-        let joined = r.take(1).expect("the new lane gets work");
+        let joined = r.take(1, 0.0).expect("the new lane gets work");
         assert!(joined >= 8, "the new lane started at {joined}, inside work already under way");
         assert!(joined < 16);
     }
@@ -240,10 +265,10 @@ mod tests {
         // and the slow one is left with what it can manage.
         let r = regions(64, 2);
         // Both start; lane 1 then does nothing at all.
-        let mut fast = vec![r.take(0).unwrap()];
-        let slow_start = r.take(1).unwrap();
+        let mut fast = vec![r.take(0, 0.0).unwrap()];
+        let slow_start = r.take(1, 0.0).unwrap();
 
-        while let Some(chunk) = r.take(0) {
+        while let Some(chunk) = r.take(0, 0.0) {
             fast.push(chunk);
         }
         assert!(fast.len() > 50, "the idle lane kept {} chunks", 64 - fast.len());
@@ -258,7 +283,7 @@ mod tests {
         for round in 0..60 {
             for lane in 0..4 {
                 if round % (lane + 1) == 0
-                    && let Some(chunk) = r.take(lane)
+                    && let Some(chunk) = r.take(lane, 0.0)
                 {
                     seen.push(chunk);
                 }
@@ -277,17 +302,17 @@ mod tests {
         // It is already overdue: burying it in some lane's run would leave it
         // until that lane walked to it, which may be the end of the file.
         let r = regions(32, 2);
-        let first = r.take(0).unwrap();
+        let first = r.take(0, 0.0).unwrap();
         r.give_back(first);
-        assert_eq!(r.take(1), Some(first), "the returned chunk was not picked up");
+        assert_eq!(r.take(1, 0.0), Some(first), "the returned chunk was not picked up");
     }
 
     #[test]
     fn a_retired_lanes_stretch_goes_back_on_the_pile() {
         // An interface that drops must not take a quarter of the file with it.
         let r = regions(16, 2);
-        r.take(0);
-        r.take(1);
+        r.take(0, 0.0);
+        r.take(1, 0.0);
         let left = r.remaining();
         r.retire(1);
         assert_eq!(r.remaining(), left, "retiring lost work");
@@ -307,18 +332,42 @@ mod tests {
     }
 
     #[test]
-    fn a_single_chunk_is_not_split_out_from_under_the_lane_fetching_it() {
-        // Halving a run of one would hand the same chunk to two lanes.
-        let r = regions(2, 2);
-        assert_eq!(r.take(0), Some(0));
-        assert_eq!(r.take(1), Some(1));
-        assert_eq!(r.take(2), None);
+    fn a_run_of_one_goes_to_whichever_lane_would_finish_it_sooner() {
+        // The last chunk of a file sitting on a phone while a gigabit card
+        // waits for it is ten seconds of a download that was already over.
+        let r = regions(4, 2);
+        assert_eq!(r.take(0, 400e3), Some(0), "the slow lane takes the front run");
+        assert_eq!(r.take(1, 400e3), Some(2));
+        // Lane 0 has chunk 1 left and is slow; lane 1 finishes and comes back
+        // for it at fifteen megabytes a second.
+        assert_eq!(r.take(1, 15e6), Some(3));
+        assert_eq!(r.take(1, 15e6), Some(1), "the faster lane should have taken it over");
+    }
+
+    #[test]
+    fn a_slower_lane_does_not_take_work_away_from_a_faster_one() {
+        // The same move in reverse is the bug, not the fix: handing the last
+        // chunk to the phone is what we were trying to stop.
+        let r = regions(4, 2);
+        assert_eq!(r.take(0, 15e6), Some(0));
+        assert_eq!(r.take(1, 400e3), Some(2));
+        assert_eq!(r.take(1, 400e3), Some(3));
+        assert_eq!(r.take(1, 400e3), None, "the slow lane took the fast lane's last chunk");
+        assert_eq!(r.take(0, 15e6), Some(1));
+    }
+
+    #[test]
+    fn a_lane_never_takes_a_run_from_itself() {
+        let r = regions(4, 1);
+        assert_eq!(r.take(0, 1e6), Some(0));
+        assert_eq!(drain(&r, 0, 8), vec![1, 2, 3]);
+        assert_eq!(r.take(0, 1e6), None);
     }
 
     #[test]
     fn an_empty_file_hands_out_nothing() {
         let r = Regions::new(Vec::new(), 4);
         assert!(r.is_empty());
-        assert_eq!(r.take(0), None);
+        assert_eq!(r.take(0, 0.0), None);
     }
 }
