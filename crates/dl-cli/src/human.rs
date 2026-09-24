@@ -6,18 +6,28 @@ use dl_core::schedule::{Schedule, TimeWindow};
 use dl_core::{Progress, SourceInfo};
 use std::time::Duration;
 
-/// `512K`, `16M`, `2G`, or a plain byte count.
+/// `512K`, `16M`, `2G`, `512KiB`, or a plain byte count.
+///
+/// A bare `K`/`M`/`G`/`T` is decimal, to agree with what [`bytes`] prints. The
+/// `i` forms are accepted and are binary, because someone who writes `KiB`
+/// means 1024 and would be surprised by anything else.
 pub fn parse_size(input: &str) -> Result<u64> {
     let s = input.trim();
     if s.is_empty() {
         bail!("empty size");
     }
-    let (digits, multiplier) = match s.chars().last().unwrap().to_ascii_uppercase() {
-        'K' => (&s[..s.len() - 1], 1u64 << 10),
-        'M' => (&s[..s.len() - 1], 1u64 << 20),
-        'G' => (&s[..s.len() - 1], 1u64 << 30),
-        'T' => (&s[..s.len() - 1], 1u64 << 40),
-        _ => (s, 1),
+    let upper = s.to_ascii_uppercase();
+    let body = upper.strip_suffix('B').unwrap_or(&upper);
+    let (body, base) = match body.strip_suffix('I') {
+        Some(rest) => (rest, 1024u64),
+        None => (body, 1000u64),
+    };
+    let (digits, multiplier) = match body.chars().last() {
+        Some('K') => (&body[..body.len() - 1], base),
+        Some('M') => (&body[..body.len() - 1], base.pow(2)),
+        Some('G') => (&body[..body.len() - 1], base.pow(3)),
+        Some('T') => (&body[..body.len() - 1], base.pow(4)),
+        _ => (body, 1),
     };
     let value: u64 =
         digits.trim().parse().with_context(|| format!("{input:?} is not a byte size"))?;
@@ -54,15 +64,13 @@ pub fn parse_digest(input: &str) -> Result<Digest> {
 }
 
 pub fn bytes(n: u64) -> String {
-    // Binary units with the labels that actually match them. Dividing by 1024
-    // and calling the result MB is the usual convention and still a lie: it
-    // reads seven percent low against the figure a download page quotes, and
-    // it disagreed with the phone companion, which counts the same transfer.
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    // Decimal units, matching the GUI. See `dl_gui::bridge::format_bytes`:
+    // the two must agree, because the same transfer is reported by both.
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = n as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
         unit += 1;
     }
     if unit == 0 { format!("{n} B") } else { format!("{value:.1} {}", UNITS[unit]) }
@@ -166,10 +174,14 @@ mod tests {
     #[test]
     fn size_suffixes() {
         assert_eq!(parse_size("1024").unwrap(), 1024);
-        assert_eq!(parse_size("1K").unwrap(), 1024);
-        assert_eq!(parse_size("16M").unwrap(), 16 << 20);
-        assert_eq!(parse_size("2G").unwrap(), 2 << 30);
-        assert_eq!(parse_size("1g").unwrap(), 1 << 30);
+        assert_eq!(parse_size("1K").unwrap(), 1_000);
+        assert_eq!(parse_size("16M").unwrap(), 16_000_000);
+        assert_eq!(parse_size("2G").unwrap(), 2_000_000_000);
+        assert_eq!(parse_size("1g").unwrap(), 1_000_000_000);
+        assert_eq!(parse_size("5MB").unwrap(), 5_000_000);
+        // Anyone who writes the binary suffix means the binary number.
+        assert_eq!(parse_size("1KiB").unwrap(), 1024);
+        assert_eq!(parse_size("2Mi").unwrap(), 2 << 20);
         assert!(parse_size("").is_err());
         assert!(parse_size("banana").is_err());
     }
@@ -195,10 +207,10 @@ mod tests {
     #[test]
     fn byte_formatting() {
         assert_eq!(bytes(0), "0 B");
-        assert_eq!(bytes(1023), "1023 B");
-        assert_eq!(bytes(1024), "1.0 KiB");
-        assert_eq!(bytes(1536), "1.5 KiB");
-        assert_eq!(bytes(1 << 30), "1.0 GiB");
+        assert_eq!(bytes(999), "999 B");
+        assert_eq!(bytes(1_000), "1.0 KB");
+        assert_eq!(bytes(1_500), "1.5 KB");
+        assert_eq!(bytes(1_000_000_000), "1.0 GB");
     }
 
     #[test]
@@ -265,7 +277,7 @@ mod window_tests {
     #[test]
     fn windows_accept_a_rate_as_well_as_off() {
         let schedule = parse_windows(&["09:00-17:00=500K".to_string()], None).unwrap().unwrap();
-        assert_eq!(schedule.limit_at(LocalTime::new(Weekday::Monday, 10, 0)), Some(500 * 1024));
+        assert_eq!(schedule.limit_at(LocalTime::new(Weekday::Monday, 10, 0)), Some(500_000));
         assert_eq!(schedule.limit_at(LocalTime::new(Weekday::Monday, 20, 0)), None);
     }
 

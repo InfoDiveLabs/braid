@@ -266,20 +266,20 @@ impl DnsMode {
 /// the chunk to the file and the connection count.
 pub fn chunk_size_from_index(index: i32) -> Option<u64> {
     match index {
-        1 => Some(1 << 20),
-        2 => Some(4 << 20),
-        3 => Some(16 << 20),
-        4 => Some(64 << 20),
+        1 => Some(1_000_000),
+        2 => Some(4_000_000),
+        3 => Some(16_000_000),
+        4 => Some(64_000_000),
         _ => None,
     }
 }
 
 pub fn chunk_size_index(size: Option<u64>) -> i32 {
     match size {
-        Some(s) if s == 1 << 20 => 1,
-        Some(s) if s == 4 << 20 => 2,
-        Some(s) if s == 16 << 20 => 3,
-        Some(s) if s == 64 << 20 => 4,
+        Some(1_000_000) => 1,
+        Some(4_000_000) => 2,
+        Some(16_000_000) => 3,
+        Some(64_000_000) => 4,
         _ => 0,
     }
 }
@@ -765,10 +765,15 @@ pub fn parse_rate(text: &str) -> Option<u64> {
         return None;
     }
     let unit = text[digits.len()..].trim();
+    // Decimal for the plain suffixes, binary only where the `i` says so. The
+    // field renders back through `format_rate`, so the two have to agree.
     let scale = match unit {
-        "" | "m" | "mb" | "mib" => 1u64 << 20,
-        "k" | "kb" | "kib" => 1 << 10,
-        "g" | "gb" | "gib" => 1 << 30,
+        "" | "m" | "mb" => 1_000_000u64,
+        "k" | "kb" => 1_000,
+        "g" | "gb" => 1_000_000_000,
+        "mib" => 1 << 20,
+        "kib" => 1 << 10,
+        "gib" => 1 << 30,
         "b" => 1,
         _ => return None,
     };
@@ -777,15 +782,14 @@ pub fn parse_rate(text: &str) -> Option<u64> {
 
 /// Render a rate back into the field it came from.
 pub fn format_rate(bytes_per_sec: u64) -> String {
-    // Binary units with the labels that actually match them. Dividing by 1024
-    // and calling the result MB is the usual convention and still a lie: it
-    // reads seven percent low against the figure a download page quotes, and
-    // it disagreed with the phone companion, which counts the same transfer.
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    // Decimal, matching `dl_gui::bridge::format_bytes` and `parse_rate`. A
+    // limit typed as "20" has to read back as "20 MB/s" or the field rewrites
+    // what the user entered every time the page is opened.
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes_per_sec as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
         unit += 1;
     }
     if (value - value.round()).abs() < 0.05 {
@@ -892,10 +896,12 @@ mod tests {
 
     #[test]
     fn a_bare_number_is_read_as_megabytes() {
-        assert_eq!(parse_rate("20"), Some(20 << 20));
-        assert_eq!(parse_rate("20 MB/s"), Some(20 << 20));
-        assert_eq!(parse_rate("500 KB/s"), Some(500 << 10));
-        assert_eq!(parse_rate("1.5 GB"), Some(1610612736));
+        assert_eq!(parse_rate("20"), Some(20_000_000));
+        assert_eq!(parse_rate("20 MB/s"), Some(20_000_000));
+        assert_eq!(parse_rate("500 KB/s"), Some(500_000));
+        assert_eq!(parse_rate("1.5 GB"), Some(1_500_000_000));
+        // The binary spelling still means the binary number.
+        assert_eq!(parse_rate("1 MiB/s"), Some(1 << 20));
     }
 
     #[test]
@@ -913,12 +919,12 @@ mod tests {
     fn rates_round_trip_through_the_field() {
         // Both spellings, because the field shows the "/s" form and parses
         // back whatever the user leaves in it.
-        for rate in [1 << 10, 20 << 20, 1536 << 10] {
+        for rate in [1_000, 20_000_000, 1_500_000] {
             for text in [format_rate(rate), format_rate_per_sec(rate)] {
                 assert_eq!(parse_rate(&text), Some(rate), "{text} did not round-trip");
             }
         }
-        assert_eq!(format_rate_per_sec(20 << 20), "20 MiB/s");
+        assert_eq!(format_rate_per_sec(20_000_000), "20 MB/s");
     }
 
     #[test]
@@ -1009,7 +1015,7 @@ mod tests {
         original.interfaces = vec!["en0".into(), "en1".into()];
         original.interface_limits.insert("en1".into(), 5 << 20);
         original.retries = 9;
-        original.chunk_size = Some(16 << 20);
+        original.chunk_size = Some(16_000_000);
         original.add_default_window();
 
         let mut restored = settings();
@@ -1023,7 +1029,7 @@ mod tests {
         assert_eq!(restored.interfaces, original.interfaces);
         assert_eq!(restored.interface_limit("en1"), Some(5 << 20));
         assert_eq!(restored.retries, 9);
-        assert_eq!(restored.chunk_size, Some(16 << 20));
+        assert_eq!(restored.chunk_size, Some(16_000_000));
         assert_eq!(restored.schedule_cells, original.schedule_cells);
     }
 
