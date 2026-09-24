@@ -19,6 +19,16 @@ impl HeadlessApp {
         Self::build_target(release, Some(example), example)
     }
 
+    /// Build the application itself, not a fixture.
+    ///
+    /// The screenshot fixture wires only what it needs, so a control that the
+    /// real binary connects and the fixture does not looks dead when driven
+    /// there. Anything whose wiring is the thing under test has to be checked
+    /// against this.
+    pub fn build_app(release: bool) -> Result<std::path::PathBuf> {
+        Self::build_target(release, None, "braid")
+    }
+
     fn build_target(
         release: bool,
         example: Option<&str>,

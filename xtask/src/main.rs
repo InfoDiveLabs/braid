@@ -62,6 +62,16 @@ enum Command {
         #[arg(long, default_value = "dist")]
         out: std::path::PathBuf,
     },
+    /// Drive the real application to its pairing code and capture it.
+    ///
+    /// Separate from `screenshots`, which drives a fixture: this is the only
+    /// way to see a control the fixture does not wire.
+    PairCode {
+        #[arg(long, default_value = "artifacts/screens")]
+        out: std::path::PathBuf,
+        #[arg(long, default_value_t = 8733)]
+        port: u16,
+    },
     /// Check the Windows installer definition without building the app.
     ///
     /// Minutes rather than the twenty a release build costs, because WiX does
@@ -85,10 +95,50 @@ fn main() -> Result<()> {
             bundle::run(out.as_deref(), release, features.as_deref()).map(|_| ())
         }
         Command::Package { out } => package::run(&out),
+        Command::PairCode { out, port } => pair_code(&out, port),
         Command::InstallerCheck => package::installer_check(),
         Command::Size => size::run(),
         Command::VerifyRelease => size::verify_release_is_clean(),
     }
+}
+
+/// Open the phone sheet in the real application and show a pairing code.
+///
+/// Every step is asserted, not just captured: a screenshot of a sheet that
+/// never opened looks much like one that did, and the code itself is the part
+/// nobody can check by reading the source.
+fn pair_code(out: &std::path::Path, port: u16) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    let binary = app::HeadlessApp::build_app(false)?;
+    let app = app::HeadlessApp::launch_with_args(&binary, port, &[])?;
+    let mcp = &app.mcp;
+    let window = mcp.first_window()?;
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let root = mcp.root_element(&window)?;
+    let Some((_, add_phone)) = mcp.find_by_label(&root, |l| l == "Add phone")? else {
+        anyhow::bail!("the sidebar has no Add phone row");
+    };
+    mcp.click(&add_phone)?;
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    let sheet = mcp.root_element(&window)?;
+    let Some((_, show)) = mcp.find_by_label(&sheet, |l| l == "Show code")? else {
+        anyhow::bail!("the phone sheet has no Show code control");
+    };
+    mcp.click(&show)?;
+    // Opening a port, drawing the code and handing it to the renderer.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let shown = mcp.root_element(&window)?;
+    anyhow::ensure!(
+        mcp.find_by_label(&shown, |l| l.starts_with("Open Braid on your phone"))?.is_some(),
+        "the code was never shown: the sheet has no instructions on it"
+    );
+
+    mcp.screenshot(&window, &out.join("pair-code.png"))?;
+    println!("captured pair-code.png");
+    Ok(())
 }
 
 /// Drive the real UI headlessly and assert it responds.
