@@ -50,6 +50,21 @@ impl LaneSet for SingleLane<'_> {
     }
 }
 
+/// How often a lane's rate is recalculated while a chunk is in flight.
+///
+/// Short enough that the sidebar reads as live and the assignment reacts to a
+/// path that just degraded; long enough that a fast lane is not sampling on
+/// every read.
+const SAMPLE_WINDOW: Duration = Duration::from_millis(250);
+
+/// Fold a rate observation into a lane's smoothed estimate.
+fn fold(entry: &mut LaneState, sample: f64) {
+    entry.throughput = Some(match entry.throughput {
+        Some(previous) => previous * (1.0 - EWMA_ALPHA) + sample * EWMA_ALPHA,
+        None => sample,
+    });
+}
+
 #[derive(Clone, Debug, Default)]
 struct LaneState {
     /// Smoothed throughput in bytes per second. `None` until first measured.
@@ -58,6 +73,13 @@ struct LaneState {
     cap: Option<f64>,
     inflight: u32,
     bytes: u64,
+    /// Bytes seen since the last rate sample, and when that sample was taken.
+    ///
+    /// Without these a lane's rate was only recalculated when a chunk
+    /// finished, so a slow path reported a figure minutes old and the
+    /// assignment kept weighting it on what it used to be worth.
+    live_bytes: u64,
+    live_at: Option<Instant>,
     chunks: u64,
     consecutive_failures: u32,
     parked: bool,
@@ -214,15 +236,39 @@ impl LaneSelector {
         entry.bytes += bytes;
         entry.chunks += 1;
         entry.consecutive_failures = 0;
+        entry.live_bytes = 0;
+        entry.live_at = None;
 
         let secs = elapsed.as_secs_f64();
         if secs > 0.0 {
-            let sample = bytes as f64 / secs;
-            entry.throughput = Some(match entry.throughput {
-                Some(previous) => previous * (1.0 - EWMA_ALPHA) + sample * EWMA_ALPHA,
-                None => sample,
-            });
+            fold(entry, bytes as f64 / secs);
         }
+    }
+
+    /// Bytes have arrived on a lane, mid-chunk.
+    ///
+    /// Called as the body streams rather than when it ends, which is what
+    /// makes a rate current. The window keeps the cost to one sample every
+    /// [`SAMPLE_WINDOW`] however small the reads are, and the same figure
+    /// feeds the assignment, so work moves off a path that has just slowed
+    /// down instead of after its chunk eventually lands.
+    pub fn progressed(&self, lane: usize, bytes: u64) {
+        let mut state = self.state.lock().unwrap();
+        let Some(entry) = state.get_mut(lane) else { return };
+        entry.live_bytes += bytes;
+
+        let started = *entry.live_at.get_or_insert_with(Instant::now);
+        let elapsed = started.elapsed();
+        if elapsed < SAMPLE_WINDOW {
+            return;
+        }
+
+        let secs = elapsed.as_secs_f64();
+        if secs > 0.0 {
+            fold(entry, entry.live_bytes as f64 / secs);
+        }
+        entry.live_bytes = 0;
+        entry.live_at = Some(Instant::now());
     }
 
     /// Release a lane after a failure that was not the lane's fault.

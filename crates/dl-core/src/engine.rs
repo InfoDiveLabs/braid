@@ -248,6 +248,19 @@ impl Record {
         self.smooth_at(progress, Instant::now())
     }
 
+    /// Fold a report in, never letting the byte count go backwards.
+    ///
+    /// A run counts bytes as they are fetched, while a retry restarts from
+    /// what the journal has. Anything fetched but not yet journalled when a
+    /// lane failed is therefore counted once and then not counted, and the
+    /// figure steps back. The bytes on disk never decrease, so neither should
+    /// the number describing them: a progress bar that retreats reads as
+    /// corruption, which is the one thing this project must never look like.
+    fn advance(&mut self, mut progress: Progress) -> Progress {
+        progress.downloaded = progress.downloaded.max(self.progress.downloaded);
+        self.smooth(progress)
+    }
+
     /// The same, with the clock supplied.
     ///
     /// Separated so the span can be exercised exactly. Sleeping for it instead
@@ -857,7 +870,7 @@ impl Engine {
         let on_progress = Box::new(move |progress: Progress| {
             let mut records = engine.inner.records.lock().unwrap();
             if let Some(record) = records.get_mut(&id) {
-                record.progress = record.smooth(progress);
+                record.progress = record.advance(progress);
                 let http: u64 = records
                     .values()
                     .filter(|r| r.torrent.is_none() && r.state == State::Running)
@@ -935,7 +948,7 @@ impl Engine {
         let on_progress = Box::new(move |report: TorrentProgress| {
             let mut records = engine.inner.records.lock().unwrap();
             let Some(record) = records.get_mut(&id) else { return };
-            record.progress = record.smooth(report.progress);
+            record.progress = record.advance(report.progress);
             let rate = record.progress.smoothed_bytes_per_sec;
             // A torrent has no lanes of ours: librqbit owns its sockets: but
             // the sidebar meters, the throughput graph and the combined total
@@ -1499,6 +1512,25 @@ mod tests {
         assert_eq!(written[0].state, State::Paused);
         assert_eq!((written[0].downloaded, written[0].total), (7, Some(9)));
         assert_eq!(written[0].name.as_deref(), Some("a.iso"));
+    }
+
+    #[tokio::test]
+    async fn progress_never_steps_backwards() {
+        // A retry restarts from the journal, so bytes fetched but not yet
+        // journalled are counted and then uncounted. The file on disk never
+        // shrinks, and a bar that retreats reads as corruption.
+        let mut record = blank_record();
+        record.progress = Progress { downloaded: 5_000_000, ..Default::default() };
+        let after = record.advance(Progress { downloaded: 4_000_000, ..Default::default() });
+        assert_eq!(after.downloaded, 5_000_000);
+    }
+
+    #[tokio::test]
+    async fn progress_still_moves_forward() {
+        let mut record = blank_record();
+        record.progress = Progress { downloaded: 5_000_000, ..Default::default() };
+        let after = record.advance(Progress { downloaded: 6_000_000, ..Default::default() });
+        assert_eq!(after.downloaded, 6_000_000);
     }
 
     struct NoFactory;

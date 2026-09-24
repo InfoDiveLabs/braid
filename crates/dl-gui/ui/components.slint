@@ -192,8 +192,6 @@ export component ProgressBar inherits Rectangle {
     /// Inspector opens, and that is where the split belongs.
     in property <bool> inverted;
 
-    property <bool> live: root.state == "running" && !root.inverted;
-
     height: 4px;
     border-radius: 2px;
     // Well clear of every surface behind it: when the track matched its
@@ -201,30 +199,25 @@ export component ProgressBar inherits Rectangle {
     background: root.inverted ? #00000038 : Theme.track;
     clip: true;
 
-    // A finished transfer is a single fact. Breaking it into interfaces would
-    // be a muted rainbow that reads as a fault.
-    if !root.live: Rectangle {
+    // One colour, whatever is carrying it.
+    //
+    // This used to be split into a band per interface. At four pixels tall the
+    // breakdown was never readable, and the bands moved as the shares shifted,
+    // so a bar whose length only ever grows appeared to jitter back and forth.
+    // The per-lane split belongs in the sidebar and the Inspector, where there
+    // is room to read it.
+    Rectangle {
         x: 0;
         y: 0;
         width: root.width * root.progress;
         height: root.height;
         background: root.inverted ? Theme.on-accent
             : root.state == "seeding" || root.state == "done" ? Theme.upload
-            : root.state == "error" ? Theme.danger : Theme.text-faint;
+            : root.state == "error" ? Theme.danger
+            : root.state == "running" ? Theme.accent : Theme.text-faint;
+        // An ease, not a spring: progress is a measurement, and overshoot
+        // would briefly display more of it than exists.
         animate width { duration: 260ms; easing: ease-out; }
-    }
-
-    if root.live: Rectangle {
-        for seg in root.segments: Rectangle {
-            x: root.width * root.progress * seg.start;
-            y: 0;
-            width: root.width * root.progress * seg.span;
-            height: root.height;
-            background: Theme.interface-colors[Math.mod(seg.color-index, 5)];
-            // An ease, not a spring: progress is a measurement, and overshoot
-            // would briefly display more of it than exists.
-            animate width, x { duration: 260ms; easing: ease-out; }
-        }
     }
 }
 

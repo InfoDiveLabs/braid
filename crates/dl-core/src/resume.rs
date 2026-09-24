@@ -518,8 +518,6 @@ async fn fetch_all(
         let cancel = options.cancel.clone();
         worker_futures.push(async move {
             loop {
-                // Checked between chunks, so a pause never interrupts a chunk
-                // part-way and leaves it unjournalled.
                 cancel.check()?;
 
                 let Some(index) = queue.lock().await.pop() else {
@@ -537,64 +535,70 @@ async fn fetch_all(
                 };
 
                 let began = Instant::now();
-                let body =
-                    match fetch_chunk(lanes.source(lane), range, validator.clone(), &budgets[lane])
-                        .await
-                    {
-                        Ok(body) => {
-                            selector.completed(lane, range.len(), began.elapsed());
-                            body
-                        }
-                        // The origin asking us to slow down is not a failing
-                        // path. Moving the chunk to another interface and
-                        // trying again at once is what turns one rate limit
-                        // into a rate limit on every interface we own.
-                        Err(Error::RateLimited { status, retry_after }) => {
-                            let wait = backoff_for(retry_after, attempts_for(index, &backoffs));
-                            tracing::info!(
-                                status,
-                                chunk = index,
-                                wait_ms = wait.as_millis() as u64,
-                                stated = retry_after.is_some(),
-                                "rate limited; backing off"
-                            );
-                            selector.park_for(lane, wait);
-                            chunks_seen.released(index);
-                            queue.lock().await.push(index);
-                            note_attempt(index, &backoffs);
+                let body = match fetch_chunk(
+                    lanes.source(lane),
+                    range,
+                    validator.clone(),
+                    &budgets[lane],
+                    &cancel,
+                    &|bytes| selector.progressed(lane, bytes),
+                )
+                .await
+                {
+                    Ok(body) => {
+                        selector.completed(lane, range.len(), began.elapsed());
+                        body
+                    }
+                    // The origin asking us to slow down is not a failing
+                    // path. Moving the chunk to another interface and
+                    // trying again at once is what turns one rate limit
+                    // into a rate limit on every interface we own.
+                    Err(Error::RateLimited { status, retry_after }) => {
+                        let wait = backoff_for(retry_after, attempts_for(index, &backoffs));
+                        tracing::info!(
+                            status,
+                            chunk = index,
+                            wait_ms = wait.as_millis() as u64,
+                            stated = retry_after.is_some(),
+                            "rate limited; backing off"
+                        );
+                        selector.park_for(lane, wait);
+                        chunks_seen.released(index);
+                        queue.lock().await.push(index);
+                        note_attempt(index, &backoffs);
 
-                            if selector.all_parked_permanently() {
-                                return Err(Error::RateLimited { status, retry_after });
-                            }
-                            // Sleep only if there is nowhere else to go; with a
-                            // free lane the work continues there while this one
-                            // waits out its period.
-                            if let Some(pause) = selector.time_until_unpark()
-                                && selector.all_parked()
-                            {
-                                tokio::time::sleep(pause.min(MAX_BACKOFF)).await;
-                            }
+                        if selector.all_parked_permanently() {
+                            return Err(Error::RateLimited { status, retry_after });
+                        }
+                        // Sleep only if there is nowhere else to go; with a
+                        // free lane the work continues there while this one
+                        // waits out its period.
+                        if let Some(pause) = selector.time_until_unpark()
+                            && selector.all_parked()
+                        {
+                            tokio::time::sleep(pause.min(MAX_BACKOFF)).await;
+                        }
+                        continue;
+                    }
+                    Err(e) if e.is_retryable() => {
+                        // A path that died mid-transfer should cost this chunk,
+                        // not the download: requeue it for a healthier lane.
+                        selector.failed(lane);
+                        chunks_seen.released(index);
+                        if !selector.all_parked() {
+                            queue.lock().await.push(index);
                             continue;
                         }
-                        Err(e) if e.is_retryable() => {
-                            // A path that died mid-transfer should cost this chunk,
-                            // not the download: requeue it for a healthier lane.
-                            selector.failed(lane);
-                            chunks_seen.released(index);
-                            if !selector.all_parked() {
-                                queue.lock().await.push(index);
-                                continue;
-                            }
-                            return Err(e);
-                        }
-                        Err(e) => {
-                            // The origin misbehaved, which every lane would hit
-                            // identically. Not the lane's fault, so do not park it.
-                            selector.released(lane);
-                            chunks_seen.released(index);
-                            return Err(e);
-                        }
-                    };
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        // The origin misbehaved, which every lane would hit
+                        // identically. Not the lane's fault, so do not park it.
+                        selector.released(lane);
+                        chunks_seen.released(index);
+                        return Err(e);
+                    }
+                };
                 transferred.fetch_add(range.len(), Ordering::Relaxed);
 
                 if tx.send((index, body)).await.is_err() {
@@ -659,11 +663,21 @@ async fn fetch_chunk(
     range: crate::model::ByteRange,
     validator: Option<String>,
     budget: &BudgetChain,
+    cancel: &Cancel,
+    on_bytes: &(dyn Fn(u64) + Send + Sync),
 ) -> Result<bytes::Bytes> {
     let mut stream = source.open(Fetch::validated(range, validator)).await?;
     let mut buffer = Vec::with_capacity(range.len() as usize);
 
     while let Some(chunk) = stream.next().await {
+        // Checked as the body arrives, not only between chunks. Waiting for a
+        // chunk to finish means a pause keeps pulling on every lane at once,
+        // and on a borrowed mobile connection that is somebody's money being
+        // spent after they asked it to stop. The partial chunk is discarded
+        // and refetched later: nothing is journalled until it is whole, so
+        // abandoning one costs bytes and never correctness.
+        cancel.check()?;
+
         let chunk = chunk?;
         if buffer.len() as u64 + chunk.len() as u64 > range.len() {
             return Err(Error::OverlongBody { expected: range.len() });
@@ -678,6 +692,10 @@ async fn fetch_chunk(
         }
 
         buffer.extend_from_slice(&chunk);
+        // Reported as they land rather than when the chunk ends, so a lane's
+        // rate is current and the assignment can move work off a path that
+        // has slowed while it is still slow.
+        on_bytes(chunk.len() as u64);
     }
 
     // Checked before the write so a short chunk is never journalled.

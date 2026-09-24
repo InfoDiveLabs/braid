@@ -10,6 +10,7 @@ use dl_core::{ResumeOptions, download_resumable};
 use dl_net::{HttpConfig, HttpSource};
 use dl_testkit::{Origin, Scenario, fixtures, scenario::SEED};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use std::time::Instant;
 
 async fn fixture(size: u64) -> (Origin, tempfile::TempDir, std::path::PathBuf, HttpSource) {
@@ -168,4 +169,59 @@ async fn raising_the_limit_mid_download_takes_effect() {
         started.elapsed()
     );
     assert_eq!(blake3::hash(&std::fs::read(&dest).unwrap()), fixtures::digest(SEED, size));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pausing_stops_the_bytes_rather_than_finishing_the_chunk() {
+    // A pause has to stop traffic now, not when the chunks in flight happen
+    // to end. On a borrowed mobile connection the difference is somebody's
+    // money being spent after they asked it to stop.
+    let size = 8 << 20;
+    let (_origin, _dir, dest, source) = fixture_slow(size, 256 << 10).await;
+
+    let cancel = dl_core::cancel::Cancel::new();
+    let stopper = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            cancel.cancel();
+        })
+    };
+
+    let started = Instant::now();
+    let outcome = download_resumable(
+        &source,
+        &dest,
+        ResumeOptions {
+            connections: 4,
+            // Large enough that finishing the chunks in flight would take far
+            // longer than stopping does.
+            chunk_size: Some(2 << 20),
+            cancel: cancel.clone(),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    stopper.await.unwrap();
+
+    assert!(outcome.is_err(), "a cancelled transfer must not report success");
+    assert!(
+        started.elapsed() < StdDuration::from_secs(4),
+        "pausing waited for the chunks in flight: took {:?}",
+        started.elapsed()
+    );
+}
+
+/// An origin that drips, so a chunk is still arriving when the pause lands.
+async fn fixture_slow(
+    size: u64,
+    rate: u64,
+) -> (Origin, tempfile::TempDir, std::path::PathBuf, HttpSource) {
+    let origin = Origin::spawn(Scenario::SlowStream { size, bytes_per_sec: rate }).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("paused.bin");
+    let source =
+        HttpSource::with_config(&HttpConfig::default(), origin.url("payload.bin")).unwrap();
+    (origin, dir, dest, source)
 }

@@ -73,11 +73,15 @@ fn paths_for(
         }
     }
 
-    if paths.is_empty() {
-        // Named after the interface the OS will actually pick. An invented
-        // "default route" row would take the credit for every byte while the
-        // card doing the work showed nothing.
-        paths.push(Path::Default(default_lane.to_string()));
+    // This computer's own connection, always, unless interfaces were chosen
+    // explicitly above.
+    //
+    // Only adding it when nothing else existed meant that pairing a phone
+    // silently stopped using the machine's own network: every byte went
+    // through the phone while the Wi-Fi it was sitting on showed zero. A
+    // borrowed path is meant to be an addition, never a replacement.
+    if interfaces.is_empty() {
+        paths.insert(0, Path::Default(default_lane.to_string()));
     }
     paths
 }
@@ -227,16 +231,30 @@ fn lane_names(paired: &[relays::Paired]) -> Vec<bridge::InterfaceInfo> {
 
 /// Keep that list current.
 ///
-/// Polled rather than driven by an event, because the three things that change
-/// it arrive by three different routes: a NIC appearing is an OS notification,
-/// a pairing is a click in this process, and a phone switching a lane off is a
-/// network reply. A five second poll of a handful of strings is cheaper than
-/// three subscriptions that each have to be right.
+/// Polled rather than driven by an event, because the things that change it
+/// arrive by different routes: a NIC appearing is an OS notification, a
+/// pairing is a click in this process, and a phone switching a network on is
+/// something only the phone knows.
+///
+/// That last one is why this asks the phones as well as the system. A person
+/// who turns mobile sharing on from their phone should see it appear here
+/// without touching anything, and should not have to agree with themselves
+/// twice.
 fn watch_lanes(lanes: bridge::LaneNames, runtime: &tokio::runtime::Handle) {
     runtime.spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut asked = tokio::time::Instant::now();
         loop {
             ticker.tick().await;
+
+            // The phones are asked less often than the system is. Each is a
+            // request to a device on battery, and a network being switched on
+            // is not something anyone expects to appear instantly.
+            if asked.elapsed() >= std::time::Duration::from_secs(15) {
+                follow_phones().await;
+                asked = tokio::time::Instant::now();
+            }
+
             let fresh = lane_names(&relays::load());
             let changed = lanes.read().map(|current| *current != fresh).unwrap_or(false);
             if changed && let Ok(mut current) = lanes.write() {
@@ -245,6 +263,46 @@ fn watch_lanes(lanes: bridge::LaneNames, runtime: &tokio::runtime::Handle) {
             }
         }
     });
+}
+
+/// Bring each paired phone's lane list up to date with what it now offers.
+///
+/// The phone is the authority. Whatever it lists is used, minus any lane that
+/// is the route this computer already has, which would add a name and no
+/// bandwidth.
+async fn follow_phones() {
+    let mut paired = relays::load();
+    if paired.is_empty() {
+        return;
+    }
+    let ours =
+        dl_net::control::host_egress(settings::EGRESS_SERVICE, settings::EGRESS_SERVICE_V6).await;
+
+    let mut changed = false;
+    for entry in &mut paired {
+        let Some(key) = entry.relay.key.clone() else { continue };
+        // A phone that cannot be reached keeps whatever it last offered, so a
+        // pocket or a lock screen does not empty the sidebar.
+        let Ok(status) = dl_net::control::status(&entry.relay.address, Some(&key)).await else {
+            continue;
+        };
+        let duplicates = dl_net::control::duplicates_of(&status, &ours);
+        let offered: Vec<String> = status
+            .lanes
+            .iter()
+            .filter(|lane| !duplicates.iter().any(|d| d.id == lane.id))
+            .map(|lane| lane.id.clone())
+            .collect();
+
+        if entry.enabled != offered {
+            tracing::info!(phone = %entry.relay.name, ?offered, "what the phone offers changed");
+            entry.enabled = offered;
+            changed = true;
+        }
+    }
+    if changed {
+        relays::save(&paired);
+    }
 }
 
 /// One phone as the scan found it.
@@ -744,41 +802,6 @@ fn wire_phones(ui: &MainWindow, runtime: tokio::runtime::Handle) {
             paired.retain(|p| p.relay.address != address);
             relays::save(&paired);
             ui.set_relays(std::rc::Rc::new(slint::VecModel::from(rows_for_paired(&paired))).into());
-        }
-    });
-
-    ui.on_set_phone_lane({
-        let weak = ui.as_weak();
-        move |index, lane, on| {
-            let Some(ui) = weak.upgrade() else { return };
-            let Some(row) = ui.get_relays().row_data(index as usize) else { return };
-            let address = row.address.to_string();
-            let lane = lane.to_string();
-
-            let mut paired = relays::load();
-            if let Some(entry) = paired.iter_mut().find(|p| p.relay.address == address) {
-                entry.enabled.retain(|id| *id != lane);
-                if on {
-                    entry.enabled.push(lane.clone());
-                }
-            }
-            relays::save(&paired);
-
-            // Reflect it at once rather than waiting for a rescan: a toggle
-            // that does not move has been pressed twice by everyone.
-            let mut row = row;
-            let lanes: Vec<RelayLaneRow> = row
-                .lanes
-                .iter()
-                .map(|mut l| {
-                    if l.id == lane.as_str() {
-                        l.on = on;
-                    }
-                    l
-                })
-                .collect();
-            row.lanes = std::rc::Rc::new(slint::VecModel::from(lanes)).into();
-            ui.get_relays().set_row_data(index as usize, row);
         }
     });
 }
@@ -1836,6 +1859,26 @@ mod factory_tests {
     use dl_net::path::Path;
 
     #[test]
+    fn a_phone_adds_to_this_computer_rather_than_replacing_it() {
+        // Pairing a phone used to switch the machine's own connection off:
+        // the only paths became the phone's, and the Wi-Fi it was sitting on
+        // sat at zero while every byte took a detour.
+        let paths = paths_for(&[], &[phone(Some("k"), &["cell"])], "en0");
+        assert_eq!(paths.len(), 2, "the local path was dropped: {paths:?}");
+        assert!(matches!(&paths[0], Path::Default(name) if name == "en0"));
+        assert!(matches!(&paths[1], Path::Relay { network, .. } if network == "cell"));
+    }
+
+    #[test]
+    fn choosing_interfaces_still_means_only_those() {
+        // The other direction. Someone who picked their interfaces did so on
+        // purpose, and the default route is not one of them.
+        let paths = paths_for(&["en0".into()], &[phone(Some("k"), &["cell"])], "en1");
+        assert_eq!(paths.len(), 2);
+        assert!(!paths.iter().any(|p| matches!(p, Path::Default(_))));
+    }
+
+    #[test]
     fn a_pairing_code_is_drawn_at_a_size_a_camera_can_read() {
         // A real URI, of the length one actually reaches: an IPv6 host
         // percent-encodes to something long, and the token is 64 characters.
@@ -1934,6 +1977,8 @@ mod factory_tests {
         let mut spare = phone(Some("k2"), &["cell"]);
         spare.relay.name = "Spare".into();
         let paths = paths_for(&[], &[phone(Some("k"), &["cell"]), spare], "en0");
-        assert_eq!(paths.len(), 2);
+        // Two phones plus this computer's own connection.
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths.iter().filter(|p| matches!(p, Path::Relay { .. })).count(), 2);
     }
 }

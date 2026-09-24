@@ -497,7 +497,6 @@ component PhoneSheet inherits Rectangle {
     callback scan();
     callback pair(int);
     callback forget(int);
-    callback set-lane(int, string, bool);
     callback add-by-address(string);
     callback cancel();
     in-out property <string> manual-address;
@@ -620,13 +619,18 @@ component PhoneSheet inherits Rectangle {
                         }
                     }
                     Rectangle { }
+                    // No switch. The phone already decides which of its
+                    // networks it offers, and a second control here meant
+                    // agreeing with yourself twice: switch it on there, and
+                    // it appears here.
                     VerticalLayout {
                         alignment: center;
                         horizontal-stretch: 0;
-                        Toggle {
-                            on: lane.on;
-                            label: lane.label;
-                            changed(v) => { root.set-lane(relay-index, lane.id, v); }
+                        Text {
+                            text: lane.duplicate ? "Not used" : "In use";
+                            font-family: Theme.font;
+                            font-size: 11px;
+                            color: lane.duplicate ? Theme.text-faint : Theme.success;
                         }
                     }
                 }
@@ -1247,7 +1251,6 @@ export component MainWindow inherits Window {
     callback add-phone-by-address(string);
     callback pair-phone(int);
     callback forget-phone(int);
-    callback set-phone-lane(int, string, bool);
     /// The transfer awaiting a remove confirmation, or -1.
     in-out property <int> removing-id: -1;
     in property <string> removing-name;
@@ -1864,7 +1867,6 @@ export component MainWindow inherits Window {
         add-by-address(a) => { root.add-phone-by-address(a); }
         pair(i) => { root.pair-phone(i); }
         forget(i) => { root.forget-phone(i); }
-        set-lane(i, lane, on) => { root.set-phone-lane(i, lane, on); }
         cancel => { root.phones-open = false; }
     }
 
