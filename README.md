@@ -131,14 +131,14 @@ a dead link produce exactly one refresh.
 The phone forwards; the desktop downloads. The phone never stores, verifies or resumes
 anything, so every hard problem stays where it is already solved.
 
-**Braid for Android 0.1.0** is a signed APK from
+**Braid for Android 0.1.1** is a signed APK from
 [InfoDiveLabs/braid-android](https://github.com/InfoDiveLabs/braid-android).
 One build for every architecture, since it carries no native code.
 
 | | |
 |---|---|
 | Requires | Android 8.0 or newer |
-| Download | `braid-android-0.1.0.apk`, 511 KiB, with `SHA256SUMS` |
+| Download | `braid-android-0.1.1.apk`, 511 KiB, with `SHA256SUMS` |
 | Signing key | `04:C0:0D:53:6A:D1:DB:AD:25:90:C8:43:3C:41:6B:EA:6A:66:4C:9E:2B:4C:B6:E5:49:C2:4F:80:B5:08:77:E2` |
 
 That repository is **private** for now, so the link works only for InfoDive Labs
