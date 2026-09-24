@@ -258,6 +258,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_phone_that_stops_recognising_us_costs_its_lane_and_not_the_file() {
+        // Someone presses Forget on their phone mid-download. That lane starts
+        // answering 407, and the transfer has to continue on the paths that
+        // still work. Asserted at the classification because that is what the
+        // chunk loop branches on: a retryable error requeues the chunk onto
+        // another lane and fails this one towards being parked, while the
+        // other arm ends the whole download.
+        let refused = dl_core::error::Error::Http { status: 407 };
+        assert!(refused.is_retryable(), "a proxy refusal must not fail the transfer");
+
+        // The same for the status a phone sends when a lane it was offering
+        // has gone away, which is the case its own UI produces when a network
+        // is switched off.
+        let gone = dl_core::error::Error::Http { status: 503 };
+        assert!(gone.is_retryable(), "a lane going away must not fail the transfer");
+    }
+
+    #[tokio::test]
     async fn a_tunnel_without_a_key_is_challenged() {
         // The control case. Without it the assertion above could pass because
         // the relay never checks, which is exactly the gap it is testing for.

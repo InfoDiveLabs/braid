@@ -116,7 +116,14 @@ impl Error {
             // already on disk passed its own hash, so a retry costs nothing
             // but the pieces in flight.
             Self::Torrent(_) => true,
-            Self::Http { status } => matches!(status, 408 | 429 | 500..=599),
+            // 407 is the proxy refusing, not the origin. It belongs with the
+            // rest only because of what "retryable" means here: the chunk is
+            // requeued onto a different lane and this one accumulates a
+            // failure until it is parked. Without it, a relay that stops
+            // recognising us mid-transfer, because someone pressed Forget on
+            // their phone, fails the whole download instead of costing it one
+            // path. The other lanes are unaffected and can finish the file.
+            Self::Http { status } => matches!(status, 407 | 408 | 429 | 500..=599),
             Self::RateLimited { .. } => true,
             Self::OverlongBody { .. }
             | Self::ResourceChanged { .. }
@@ -158,6 +165,9 @@ mod tests {
         assert!(Error::Transport("reset".into()).is_retryable());
         assert!(Error::ShortBody { expected: 10, received: 4 }.is_retryable());
         assert!(Error::Http { status: 503 }.is_retryable());
+        // A phone that stopped recognising us costs its own lane, never the
+        // file: the chunk moves to another path and that lane is parked.
+        assert!(Error::Http { status: 407 }.is_retryable());
         assert!(Error::Http { status: 429 }.is_retryable());
 
         // A 404 will still be a 404, and cancellation is a decision, not a fault.
