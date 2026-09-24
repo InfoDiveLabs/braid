@@ -8,6 +8,7 @@ pub mod control;
 pub mod http;
 pub mod iface;
 pub mod multi;
+pub mod path;
 pub mod refreshing;
 pub mod relay;
 
@@ -18,4 +19,4 @@ pub use multi::{Binding, InterfaceLanes};
 pub use refreshing::{
     HttpFetcher, LaneSpec, RefresherFor, RefreshingLanes, ReqwestJson, lane_specs,
 };
-pub use relay::{Relay, RelayLanes};
+pub use relay::Relay;

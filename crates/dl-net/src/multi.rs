@@ -48,6 +48,11 @@ impl InterfaceLane {
     pub fn label(&self) -> String {
         format!("{} ({})", self.interface.name, self.binding.as_str())
     }
+
+    /// Hand the source over, for a caller assembling its own lane list.
+    pub fn into_source(self) -> HttpSource {
+        self.source
+    }
 }
 
 /// A set of interface-bound lanes, all fetching the same URL.
@@ -115,6 +120,11 @@ impl InterfaceLanes {
 
     pub fn lanes(&self) -> &[InterfaceLane] {
         &self.lanes
+    }
+
+    /// Take the lanes, for the same reason as [`InterfaceLane::into_source`].
+    pub fn into_lanes(self) -> Vec<InterfaceLane> {
+        self.lanes
     }
 
     /// Whether every lane is genuinely pinned to its own interface.

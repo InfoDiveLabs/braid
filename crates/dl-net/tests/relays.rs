@@ -7,7 +7,9 @@
 
 use dl_core::lane::LaneSet;
 use dl_core::{ResumeOptions, download_over_lanes};
-use dl_net::{HttpConfig, Relay, RelayLanes};
+use dl_net::iface::FakeInterfaces;
+use dl_net::path::{Path, PathLanes};
+use dl_net::{HttpConfig, Relay};
 use dl_testkit::{Origin, Scenario, fixtures};
 use std::time::Duration;
 
@@ -22,13 +24,19 @@ async fn relays(count: usize) -> Vec<dl_testkit::Relay> {
     out
 }
 
-fn lanes(running: &[dl_testkit::Relay], url: &str) -> RelayLanes {
-    let configured: Vec<Relay> = running
+fn lanes(running: &[dl_testkit::Relay], url: &str) -> PathLanes {
+    // One lane per phone, each unpaired: these stand-ins ask for no key, and
+    // whether a key is demanded is tested separately in `path.rs`.
+    let paths: Vec<Path> = running
         .iter()
         .enumerate()
-        .map(|(i, relay)| Relay::new(format!("phone{i}"), relay.url()))
+        .map(|(i, relay)| Path::Relay {
+            relay: Relay::new(format!("phone{i}"), relay.url(), None),
+            network: "cell".into(),
+        })
         .collect();
-    RelayLanes::new(&configured, url, &HttpConfig::default()).expect("lanes build")
+    PathLanes::build(&paths, url, &HttpConfig::default(), &FakeInterfaces(Vec::new()))
+        .expect("lanes build")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -91,8 +99,17 @@ async fn a_relay_that_goes_away_costs_its_chunks_and_not_the_transfer() {
     // Answers a couple of requests and then stops, mid-transfer.
     let flaky = dl_testkit::Relay::spawn_with_limit(Some(2)).await.unwrap();
 
-    let configured = [Relay::new("healthy", healthy.url()), Relay::new("flaky", flaky.url())];
-    let set = RelayLanes::new(&configured, &origin.url("f.bin"), &HttpConfig::default()).unwrap();
+    let paths = [
+        Path::Relay { relay: Relay::new("healthy", healthy.url(), None), network: "cell".into() },
+        Path::Relay { relay: Relay::new("flaky", flaky.url(), None), network: "cell".into() },
+    ];
+    let set = PathLanes::build(
+        &paths,
+        &origin.url("f.bin"),
+        &HttpConfig::default(),
+        &FakeInterfaces(Vec::new()),
+    )
+    .unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("survivor.bin");
@@ -116,8 +133,20 @@ async fn every_relay_being_unreachable_fails_rather_than_hanging() {
     // Nothing on the other end of any of them: better a clear error than a
     // transfer that sits at zero for ever.
     let origin = Origin::spawn(Scenario::Ok200 { size: 1 << 20 }).await.unwrap();
-    let configured = [Relay::new("gone", "127.0.0.1:9"), Relay::new("also gone", "127.0.0.1:10")];
-    let set = RelayLanes::new(&configured, &origin.url("f.bin"), &HttpConfig::default()).unwrap();
+    let paths = [
+        Path::Relay { relay: Relay::new("gone", "127.0.0.1:9", None), network: "cell".into() },
+        Path::Relay {
+            relay: Relay::new("also gone", "127.0.0.1:10", None),
+            network: "cell".into(),
+        },
+    ];
+    let set = PathLanes::build(
+        &paths,
+        &origin.url("f.bin"),
+        &HttpConfig::default(),
+        &FakeInterfaces(Vec::new()),
+    )
+    .unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("never.bin");
@@ -160,7 +189,11 @@ async fn a_relay_lane_reports_itself_by_name() {
     let origin = Origin::spawn(Scenario::Ok200 { size }).await.unwrap();
     let running = relays(2).await;
     let set = lanes(&running, &origin.url("f.bin"));
-    assert_eq!(set.label(0), "phone0");
+    // The device and which of its networks this is. A phone can offer several,
+    // and two lanes labelled only "phone0" would be indistinguishable in the
+    // sidebar, which is where a person decides whether a lane is worth having.
+    assert_eq!(set.label(0), "phone0 (cell)");
+    assert_eq!(set.label(1), "phone1 (cell)");
 
     let dir = tempfile::tempdir().unwrap();
     let outcome = download_over_lanes(
@@ -172,7 +205,8 @@ async fn a_relay_lane_reports_itself_by_name() {
     .await
     .unwrap();
 
-    // The sidebar meters and the graph bands are keyed on these.
+    // The sidebar meters and the graph bands are keyed on these, and they have
+    // to survive the whole transfer, not just lane construction.
     let names: Vec<&str> = outcome.lanes.iter().map(|l| l.label.as_str()).collect();
-    assert!(names.contains(&"phone0") && names.contains(&"phone1"), "{names:?}");
+    assert!(names.contains(&"phone0 (cell)") && names.contains(&"phone1 (cell)"), "{names:?}");
 }

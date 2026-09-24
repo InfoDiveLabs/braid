@@ -17,71 +17,54 @@
 //! privileges.
 //!
 //! What a relay shares with an interface is everything that matters to the
-//! engine: it is a [`ByteSource`], it has its own public address so per-source
+//! engine: it is a byte source, it has its own public address so per-source
 //! signed URLs resolve per lane, and it can go away mid-transfer: a phone
 //! loses signal, sleeps, or throttles itself when hot: which the lane selector
 //! already handles by parking it and moving the work.
+//!
+//! The lanes themselves live in [`crate::path`], because an engine weighing
+//! one lane against another has no reason to care which of them is a card and
+//! which is a phone.
 
-use crate::http::{HttpConfig, HttpSource, ProxyMode};
-use dl_core::error::{Error, Result};
-use dl_core::lane::LaneSet;
-use dl_core::source::ByteSource;
-
-/// One relay, as the user configured it.
+/// One relay, as the desktop knows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Relay {
     /// What to call it in the sidebar. The phone's name, usually.
     pub name: String,
-    /// Where it listens, as `host:port` or a full proxy URL.
+    /// Where it listens, as `host:port`.
     pub address: String,
+    /// What pairing handed back. Absent for a relay that has been seen but not
+    /// authorised, which may be asked who it is and nothing else.
+    pub key: Option<String>,
 }
 
 impl Relay {
-    pub fn new(name: impl Into<String>, address: impl Into<String>) -> Self {
-        Self { name: name.into(), address: address.into() }
+    pub fn new(name: impl Into<String>, address: impl Into<String>, key: Option<String>) -> Self {
+        Self { name: name.into(), address: address.into(), key }
     }
-}
 
-/// A [`LaneSet`] where every lane goes through a different relay.
-pub struct RelayLanes {
-    sources: Vec<HttpSource>,
-    labels: Vec<String>,
-}
-
-impl RelayLanes {
-    /// Build one lane per relay, all fetching the same URL.
+    /// As a proxy URL, with the key as credentials.
     ///
-    /// The relays are not contacted here: an unreachable one becomes a lane
-    /// that fails its probe, which the selector parks. Checking them up front
-    /// would mean a phone that woke a second late cost the whole transfer a
-    /// path it could have used.
-    pub fn new(relays: &[Relay], url: &str, config: &HttpConfig) -> Result<Self> {
-        if relays.is_empty() {
-            return Err(Error::Transport("no relays configured".into()));
+    /// Credentials in the URL is how `ProxyMode::Manual` already carries them,
+    /// so nothing in the HTTP layer needs to learn that relays exist.
+    ///
+    /// The username is the network the phone should use. It has to travel on
+    /// every request, and proxy credentials are the one field that already
+    /// does, so this avoids inventing a header the phone would have to be
+    /// taught separately.
+    /// An address may arrive either way: typed by a person as `host:port`, or
+    /// handed over by discovery as a full URL. Prepending a scheme
+    /// unconditionally produces `http://http://host`, which fails as a DNS
+    /// lookup of the word "http" and is a confusing way to learn this.
+    pub fn proxy_url(&self, network: &str) -> String {
+        let (scheme, host) = match self.address.split_once("://") {
+            Some((scheme, rest)) => (scheme, rest),
+            None => ("http", self.address.as_str()),
+        };
+        match &self.key {
+            Some(key) => format!("{scheme}://{network}:{key}@{host}"),
+            None => format!("{scheme}://{host}"),
         }
-        let mut sources = Vec::with_capacity(relays.len());
-        let mut labels = Vec::with_capacity(relays.len());
-        for relay in relays {
-            let config =
-                HttpConfig { proxy: ProxyMode::Manual(relay.address.clone()), ..config.clone() };
-            sources.push(HttpSource::with_config(&config, url)?);
-            labels.push(relay.name.clone());
-        }
-        Ok(Self { sources, labels })
-    }
-}
-
-impl LaneSet for RelayLanes {
-    fn len(&self) -> usize {
-        self.sources.len()
-    }
-
-    fn source(&self, lane: usize) -> &dyn ByteSource {
-        &self.sources[lane]
-    }
-
-    fn label(&self, lane: usize) -> &str {
-        &self.labels[lane]
     }
 }
 
@@ -90,28 +73,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_lane_per_relay_keeps_their_names() {
-        let relays = [Relay::new("Pixel", "127.0.0.1:1"), Relay::new("Spare", "127.0.0.1:2")];
-        let lanes = RelayLanes::new(&relays, "http://example.test/x", &HttpConfig::default())
-            .expect("lanes build without contacting anything");
-        assert_eq!(lanes.len(), 2);
-        assert_eq!(lanes.label(0), "Pixel");
-        assert_eq!(lanes.label(1), "Spare");
+    fn a_paired_relay_carries_its_key_as_credentials() {
+        let relay = Relay::new("Pixel", "10.0.0.5:8710", Some("secret".into()));
+        assert_eq!(relay.proxy_url("cell"), "http://cell:secret@10.0.0.5:8710");
     }
 
     #[test]
-    fn no_relays_is_an_error_rather_than_an_empty_lane_set() {
-        // An empty `LaneSet` would read as "nothing to do" and finish a
-        // transfer that never started.
-        assert!(RelayLanes::new(&[], "http://example.test/x", &HttpConfig::default()).is_err());
+    fn an_unpaired_relay_offers_no_credentials() {
+        // It will earn a 407, which is the correct outcome: the alternative is
+        // inventing a key and being refused anyway, more confusingly.
+        let relay = Relay::new("Pixel", "10.0.0.5:8710", None);
+        assert_eq!(relay.proxy_url("cell"), "http://10.0.0.5:8710");
     }
 
     #[test]
-    fn a_relay_that_is_down_still_produces_its_lane() {
-        // Built, not probed: a phone that woke a second late should not cost
-        // the transfer a path it could have used. The selector parks lanes
-        // that fail their probe.
-        let relays = [Relay::new("Asleep", "127.0.0.1:9")];
-        assert!(RelayLanes::new(&relays, "http://example.test/x", &HttpConfig::default()).is_ok());
+    fn an_address_that_already_has_a_scheme_does_not_get_another() {
+        // Discovery hands over a full URL, a person types `host:port`, and
+        // both have to work.
+        let relay = Relay::new("Pixel", "http://10.0.0.5:8710", Some("secret".into()));
+        assert_eq!(relay.proxy_url("cell"), "http://cell:secret@10.0.0.5:8710");
+
+        let bare = Relay::new("Pixel", "10.0.0.5:8710", Some("secret".into()));
+        assert_eq!(bare.proxy_url("cell"), relay.proxy_url("cell"));
+    }
+
+    #[test]
+    fn the_network_travels_in_the_username() {
+        // Two lanes on one phone differ only here, so it is the field that
+        // decides which radio serves the request.
+        let relay = Relay::new("Pixel", "10.0.0.5:8710", Some("k".into()));
+        assert_ne!(relay.proxy_url("cell"), relay.proxy_url("wifi"));
     }
 }
