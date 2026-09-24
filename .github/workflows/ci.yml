@@ -1,9 +1,21 @@
 name: CI
 
+# A commit that only changes prose or pictures cannot break a build, and
+# running twelve jobs across three operating systems to prove that is an hour
+# of runner time for nothing. GitHub skips the workflow only when *every*
+# changed file matches, so a commit touching both a document and the code
+# still runs in full.
 on:
   push:
     branches: [main]
+    paths-ignore: &prose
+      - "**.md"
+      - "assets/**"
+      - "LICENSE"
+      - "AUTHORS"
+      - ".gitignore"
   pull_request:
+    paths-ignore: *prose
 
 env:
   CARGO_TERM_COLOR: always
