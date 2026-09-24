@@ -299,6 +299,21 @@ async fn follow_phones() {
         dl_net::control::host_egress(settings::EGRESS_SERVICE, settings::EGRESS_SERVICE_V6).await;
 
     let mut changed = false;
+    let mut lost = Vec::new();
+    for (index, entry) in paired.iter().enumerate() {
+        let Some(key) = entry.relay.key.clone() else { continue };
+        if dl_net::control::status(&entry.relay.address, Some(&key)).await.is_err() {
+            lost.push(index);
+        }
+    }
+    // Looked for before anything is concluded from the silence: a phone that
+    // has merely changed address is not a phone that has gone away, and the
+    // whole point of remembering it is that nobody should have to pair it
+    // again for that.
+    if relocate(&mut paired, &lost).await {
+        changed = true;
+    }
+
     for entry in &mut paired {
         let Some(key) = entry.relay.key.clone() else { continue };
         // A phone that cannot be reached keeps whatever it last offered, so a
@@ -381,14 +396,7 @@ fn to_rows(found: Vec<Found>) -> Vec<RelayRow> {
 /// Both end at `/braid/hello`, which is what separates a companion from a
 /// router that happened to accept a connection.
 async fn scan_for_relays() -> Vec<Found> {
-    let mut found = dl_net::discovery::browse(std::time::Duration::from_secs(3)).await;
-    let tethered = dl_net::discovery::tether_candidates(&dl_net::SystemInterfaces);
-    for candidate in dl_net::discovery::confirm(&tethered).await {
-        if !found.iter().any(|c| c.hello.device_id == candidate.hello.device_id) {
-            found.push(candidate);
-        }
-    }
-
+    let found = discover(std::time::Duration::from_secs(3)).await;
     let paired = relays::load();
     let ours =
         dl_net::control::host_egress(settings::EGRESS_SERVICE, settings::EGRESS_SERVICE_V6).await;
@@ -413,6 +421,80 @@ async fn scan_for_relays() -> Vec<Found> {
         });
     }
     rows
+}
+
+/// Every companion that answers right now, wherever it is.
+///
+/// mDNS first, then the gateway of every link that might be a tethered phone.
+/// Both end at `/braid/hello`, which is what separates a companion from a
+/// router that happened to accept a connection.
+async fn discover(timeout: std::time::Duration) -> Vec<dl_net::discovery::Candidate> {
+    let mut found = dl_net::discovery::browse(timeout).await;
+    let tethered = dl_net::discovery::tether_candidates(&dl_net::SystemInterfaces);
+    for candidate in dl_net::discovery::confirm(&tethered).await {
+        if !found.iter().any(|c| c.hello.device_id == candidate.hello.device_id) {
+            found.push(candidate);
+        }
+    }
+    found
+}
+
+/// Point paired phones back at wherever they are now.
+///
+/// Addresses are leases, not names. Either end rejoining its Wi-Fi is enough
+/// to change one, and the stored address then points at nothing or, worse, at
+/// whatever took the lease next. Pairing is a thing someone did once by
+/// picking their phone up, and it should survive a router handing out
+/// different numbers: so a phone that stops answering is looked for by device
+/// id, which is what it is, rather than by address, which is where it was.
+///
+/// Returns true if anything moved.
+async fn relocate(paired: &mut [relays::Paired], unreachable: &[usize]) -> bool {
+    if unreachable.is_empty() {
+        return false;
+    }
+    let found = discover(std::time::Duration::from_secs(3)).await;
+    let addresses: Vec<(String, String)> =
+        found.into_iter().map(|c| (c.hello.device_id, c.address)).collect();
+    relocated(paired, unreachable, &addresses)
+}
+
+/// Move the named entries to wherever discovery says they are, if anywhere.
+///
+/// Separated from the search so the matching rule can be exercised without a
+/// network: which phone is which is the part worth being sure about.
+fn relocated(
+    paired: &mut [relays::Paired],
+    unreachable: &[usize],
+    found: &[(String, String)],
+) -> bool {
+    let mut moved = false;
+    for index in unreachable {
+        let Some(entry) = paired.get_mut(*index) else { continue };
+        // The device id is the identity. Matching on the name instead would
+        // follow somebody else's phone home when two people call theirs the
+        // same thing, which on a shared network is not a rare accident; and
+        // an entry with no id at all matches nothing rather than the first
+        // phone that answers.
+        if entry.device_id.is_empty() {
+            continue;
+        }
+        let Some((_, address)) = found.iter().find(|(id, _)| *id == entry.device_id) else {
+            continue;
+        };
+        if *address == entry.relay.address {
+            continue;
+        }
+        tracing::info!(
+            phone = %entry.relay.name,
+            was = %entry.relay.address,
+            now = %address,
+            "a paired phone moved"
+        );
+        entry.relay.address = address.clone();
+        moved = true;
+    }
+    moved
 }
 
 /// One paired phone, with whatever it says it is offering.
@@ -1877,6 +1959,73 @@ fn main() -> Result<()> {
 mod factory_tests {
     use super::*;
     use dl_net::path::Path;
+
+    fn remembered(device_id: &str, address: &str) -> relays::Paired {
+        relays::Paired {
+            relay: dl_net::Relay::new("Pixel 7 Pro", address, Some("key".into())),
+            device_id: device_id.to_string(),
+            enabled: vec!["cell".into()],
+        }
+    }
+
+    #[test]
+    fn a_phone_that_got_a_new_address_is_followed_rather_than_forgotten() {
+        // Either end rejoining its Wi-Fi changes the lease. Pairing is
+        // something someone did once by picking their phone up, and it has to
+        // survive the router handing out different numbers.
+        let mut paired = vec![remembered("abc123", "192.168.1.42:8710")];
+        let found = vec![("abc123".to_string(), "192.168.1.77:8710".to_string())];
+        assert!(relocated(&mut paired, &[0], &found));
+        assert_eq!(paired[0].relay.address, "192.168.1.77:8710");
+        assert_eq!(paired[0].relay.key.as_deref(), Some("key"), "the pairing was thrown away");
+        assert_eq!(paired[0].enabled, vec!["cell".to_string()]);
+    }
+
+    #[test]
+    fn a_phone_is_matched_on_what_it_is_and_not_what_it_is_called() {
+        // Two people on one network both calling their phone by the model
+        // name is not a rare accident, and following the wrong one would send
+        // somebody else's data plan our traffic.
+        let mut paired = vec![remembered("abc123", "192.168.1.42:8710")];
+        let stranger = vec![("zzz999".to_string(), "192.168.1.90:8710".to_string())];
+        assert!(!relocated(&mut paired, &[0], &stranger));
+        assert_eq!(paired[0].relay.address, "192.168.1.42:8710");
+    }
+
+    #[test]
+    fn a_phone_with_no_recorded_identity_is_left_where_it_was() {
+        // An address typed in by hand whose hello never answered. There is
+        // nothing to match on, and matching on nothing would adopt the first
+        // phone that replied.
+        let mut paired = vec![remembered("", "192.168.1.42:8710")];
+        let found = vec![(String::new(), "10.0.0.5:8710".to_string())];
+        assert!(!relocated(&mut paired, &[0], &found));
+        assert_eq!(paired[0].relay.address, "192.168.1.42:8710");
+    }
+
+    #[test]
+    fn a_phone_that_has_not_moved_is_not_rewritten() {
+        // Saving on every sweep would rewrite the file every fifteen seconds
+        // for a phone that is simply asleep.
+        let mut paired = vec![remembered("abc123", "192.168.1.42:8710")];
+        let found = vec![("abc123".to_string(), "192.168.1.42:8710".to_string())];
+        assert!(!relocated(&mut paired, &[0], &found));
+    }
+
+    #[test]
+    fn only_the_phones_that_stopped_answering_are_moved() {
+        let mut paired = vec![
+            remembered("abc123", "192.168.1.42:8710"),
+            remembered("def456", "192.168.1.43:8710"),
+        ];
+        let found = vec![
+            ("abc123".to_string(), "10.0.0.1:8710".to_string()),
+            ("def456".to_string(), "10.0.0.2:8710".to_string()),
+        ];
+        assert!(relocated(&mut paired, &[1], &found));
+        assert_eq!(paired[0].relay.address, "192.168.1.42:8710", "a reachable phone was moved");
+        assert_eq!(paired[1].relay.address, "10.0.0.2:8710");
+    }
 
     #[test]
     fn a_phone_adds_to_this_computer_rather_than_replacing_it() {
