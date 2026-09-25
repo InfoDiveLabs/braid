@@ -18,11 +18,20 @@ dl-torrent.workspace = true
 
 anyhow.workspace = true
 axum.workspace = true
+# For `/api/v1/events`: a `Stream` of server-sent events, ticked by
+# `tokio::time::interval`. Both are already in the tree at these versions
+# through axum and dl-core's own `resume` module; declaring them directly
+# rather than reaching through those crates' internals is what keeps this
+# from breaking the moment either stops using them the same way.
+futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+tokio-stream = "0.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+http-body-util = "0.1"
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
