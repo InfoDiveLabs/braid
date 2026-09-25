@@ -18,5 +18,5 @@
 
 #![allow(dead_code)]
 
-mod app;
+pub(crate) mod app;
 mod state;

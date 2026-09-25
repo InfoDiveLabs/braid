@@ -244,6 +244,11 @@ async fn main() -> Result<()> {
     let app = axum::Router::new()
         .route("/health", get(health))
         .merge(auth::routes())
+        // The compatible surface sits outside the middleware on purpose. Its
+        // own login cannot be behind a session check, and the rest of it
+        // answers 403 from inside the handler because that is the code
+        // qBittorrent returns and the code its clients are written to expect.
+        .merge(qbit::app::routes())
         .merge(guarded)
         .with_state(state)
         .layer(axum::Extension(Arc::clone(&sessions)))
