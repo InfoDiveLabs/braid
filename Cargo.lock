@@ -1684,6 +1684,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dl-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "dl-core",
+ "dl-net",
+ "dl-torrent",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dl-testkit"
 version = "0.1.0"
 dependencies = [
