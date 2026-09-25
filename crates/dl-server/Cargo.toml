@@ -18,7 +18,13 @@ dl-torrent.workspace = true
 
 anyhow.workspace = true
 argon2.workspace = true
-axum.workspace = true
+# `multipart` on top of axum's defaults: Prowlarr uploads a `.torrent` file
+# directly when a tracker needs a cookie it will not hand to a URL, so
+# `torrents/add` has to read `multipart/form-data` as well as a form-encoded
+# body. `multer`, the crate this pulls in, is already how axum itself would
+# have parsed one; asking for the feature does not add a dependency axum was
+# not already one flag away from.
+axum = { workspace = true, features = ["multipart"] }
 # For `/api/v1/events`: a `Stream` of server-sent events, ticked by
 # `tokio::time::interval`. Both are already in the tree at these versions
 # through axum and dl-core's own `resume` module; declaring them directly
@@ -27,12 +33,22 @@ axum.workspace = true
 futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
+# `torrents/add` cannot know whether it is reading a form body or a multipart
+# one until it looks at the request, so it cannot use axum's own `Form`
+# extractor, which commits to one up front. This is the exact crate that
+# extractor uses internally for the form case; declaring it directly costs
+# nothing already absent from the tree.
+serde_urlencoded = "0.7"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
 tokio-stream = "0.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Only for a fake `TorrentBackend` the qBittorrent-compatible torrent tests
+# drive: dl-core's own trait is written against this macro, so a test double
+# for it needs the same one.
+async-trait = "0.1"
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

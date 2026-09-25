@@ -511,6 +511,29 @@ impl Engine {
         records.get(&id)?.chunks.as_ref().map(|c| c.report())
     }
 
+    /// Where one transfer writes its bytes, or `None` if there is no such
+    /// transfer.
+    ///
+    /// Nothing before this needed a destination back out of the engine: a
+    /// caller supplied it once, to [`Self::add`], and never had to ask again.
+    /// The qBittorrent-compatible API breaks that, because `save_path` and
+    /// `content_path` are fields somebody else's client polls for by hash.
+    pub fn destination(&self, id: DownloadId) -> Option<PathBuf> {
+        let records = self.inner.records.lock().unwrap();
+        records.get(&id).map(|r| r.spec.destination.clone())
+    }
+
+    /// The labels attached to one transfer, or empty if there are none.
+    ///
+    /// [`Self::set_labels`] is write-only by design: nothing that wrote a
+    /// category needed to read it back, because the record it was attached to
+    /// carried it forward on its own. Listing transfers by category, the way
+    /// the compatible API's clients do, needs the other direction as well.
+    pub fn labels(&self, id: DownloadId) -> BTreeMap<String, String> {
+        let records = self.inner.records.lock().unwrap();
+        records.get(&id).map(|r| r.labels.clone()).unwrap_or_default()
+    }
+
     pub fn budget(&self) -> &Arc<Budget> {
         &self.inner.budget
     }
@@ -1538,6 +1561,40 @@ mod tests {
         let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
         engine.set_labels(DownloadId(9999), BTreeMap::from([("a".to_string(), "b".to_string())]));
         assert!(engine.specs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_label_written_can_be_read_back_by_id() {
+        // `set_labels` predates this and is write-only: a category survives a
+        // restart through `specs()`, which has no id to match one against.
+        // Reading one transfer's labels back by id is what the compatible
+        // API's listing needs in order to show the category it was given.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let id = engine.add(DownloadSpec::new("http://x/a.iso", "/tmp/a.iso"));
+        engine.set_labels(id, BTreeMap::from([("category".to_string(), "tv-sonarr".to_string())]));
+        assert_eq!(engine.labels(id).get("category").map(String::as_str), Some("tv-sonarr"));
+    }
+
+    #[test]
+    fn labels_for_an_unknown_transfer_are_empty_rather_than_a_panic() {
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        assert!(engine.labels(DownloadId(9999)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transfers_destination_can_be_read_back_by_id() {
+        // `save_path` and `content_path` in the compatible API are answers to
+        // a question nothing before it ever needed to ask: where a transfer,
+        // already running, is writing its bytes.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let id = engine.add(DownloadSpec::new("http://x/a.iso", "/tmp/somewhere/a.iso"));
+        assert_eq!(engine.destination(id), Some(PathBuf::from("/tmp/somewhere/a.iso")));
+    }
+
+    #[test]
+    fn the_destination_of_an_unknown_transfer_is_none() {
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        assert_eq!(engine.destination(DownloadId(9999)), None);
     }
 
     #[tokio::test]
