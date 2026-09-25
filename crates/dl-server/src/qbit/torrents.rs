@@ -20,7 +20,7 @@ use dl_core::engine::{DownloadId, DownloadSnapshot, DownloadSpec, Engine};
 use dl_core::torrent::TorrentStatus;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,6 +38,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v2/torrents/categories", get(list_categories))
         .route("/api/v2/torrents/createCategory", post(create_category))
         .route("/api/v2/torrents/removeCategories", post(remove_categories))
+        .route("/api/v2/torrents/tags", get(list_tags))
+        .route("/api/v2/torrents/createTags", post(create_tags))
+        .route("/api/v2/torrents/deleteTags", post(delete_tags))
+        .route("/api/v2/torrents/addTags", post(add_tags))
+        .route("/api/v2/torrents/removeTags", post(remove_tags))
         .route("/api/v2/torrents/setShareLimits", post(set_share_limits))
         .route("/api/v2/torrents/topPriority", post(top_priority))
         .route("/api/v2/sync/maindata", get(sync_maindata))
@@ -199,7 +204,18 @@ fn torrent_entry_json(
         "state": qbit_state(snapshot),
         "category": labels.get("category").cloned().unwrap_or_default(),
         "tags": labels.get("tags").cloned().unwrap_or_default(),
-        "save_path": destination.display().to_string(),
+        // The directory the category points at, not the folder this torrent
+        // writes into. A client reads `save_path` to learn where downloads in
+        // general land and `content_path` to find this one, and collapsing the
+        // two is exactly what made Sonarr refuse to import: if the content is
+        // reported as being at the base directory, nothing distinguishes it
+        // from everything else in there.
+        "save_path": labels
+            .get("save_path")
+            .cloned()
+            .unwrap_or_else(|| {
+                destination.parent().unwrap_or(destination).display().to_string()
+            }),
         "content_path": content_path(destination, torrent).display().to_string(),
         "added_on": added_on,
         "completion_on": completion_on,
@@ -219,6 +235,9 @@ fn torrent_entry_json(
 #[derive(Deserialize, Default)]
 struct InfoQuery {
     category: Option<String>,
+    /// A single tag to filter by, which is how qBittorrent spells it: one
+    /// tag, not a list, because a client asks for the one it is looking after.
+    tag: Option<String>,
     hashes: Option<String>,
 }
 
@@ -245,6 +264,12 @@ async fn list_torrents(
                 if current != category {
                     return None;
                 }
+            }
+            if let Some(wanted) = &query.tag
+                && !parse_tag_list(labels.get("tags").map(String::as_str).unwrap_or(""))
+                    .contains(wanted)
+            {
+                return None;
             }
             let destination = state.engine.destination(snapshot.id).unwrap_or_default();
             Some(torrent_entry_json(&state.engine, &snapshot, &hash, &labels, &destination))
@@ -368,6 +393,142 @@ struct CreateCategoryForm {
     save_path: String,
 }
 
+/// Tags, which are a flat list rather than a map.
+///
+/// Stored in the same one-line-per-entry shape as the categories beside them,
+/// with nothing after the separator: a tag carries no save path, only a name.
+/// It would be neater as a plain list and it is not worth a second file format
+/// in a directory people read by hand.
+fn tags_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("tags.conf")
+}
+
+fn load_tags(config_dir: &Path) -> BTreeSet<String> {
+    let Ok(text) = std::fs::read_to_string(tags_path(config_dir)) else {
+        return BTreeSet::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.split('=').next().unwrap_or(line).trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn save_tags(config_dir: &Path, tags: &BTreeSet<String>) {
+    let mut out = String::from("# Braid tags. Written by the app.\n");
+    for tag in tags {
+        out.push_str(tag);
+        out.push_str(" =\n");
+    }
+    let _ = std::fs::create_dir_all(config_dir);
+    let _ = std::fs::write(tags_path(config_dir), out);
+}
+
+/// Read a `tags=a,b,c` field, which is how every one of these endpoints takes
+/// them, into the set the rest of this module works in.
+fn parse_tag_list(raw: &str) -> BTreeSet<String> {
+    raw.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect()
+}
+
+/// The tags on one transfer, from the single comma separated label they live
+/// in. Stored that way rather than as a label each because `torrents/info`
+/// reports them as one string and the engine's label map is not the place to
+/// invent a schema.
+fn tags_of(engine: &Engine, id: DownloadId) -> BTreeSet<String> {
+    parse_tag_list(engine.labels(id).get("tags").map(String::as_str).unwrap_or(""))
+}
+
+fn write_tags(engine: &Engine, id: DownloadId, tags: &BTreeSet<String>) {
+    let mut labels = engine.labels(id);
+    if tags.is_empty() {
+        labels.remove("tags");
+    } else {
+        labels.insert("tags".to_string(), tags.iter().cloned().collect::<Vec<_>>().join(","));
+    }
+    engine.set_labels(id, labels);
+}
+
+/// Every tag this server knows: the ones created explicitly, and the ones that
+/// only ever arrived on a torrent.
+///
+/// Both, because a client that tagged something at `add` time never called
+/// `createTags`, and a tag that exists on a download but not in this list
+/// would be one the user can see and cannot filter by.
+async fn list_tags(State(state): State<AppState>) -> Json<Vec<String>> {
+    let mut tags = load_tags(&state.config.config_dir);
+    for snapshot in state.engine.snapshot() {
+        tags.extend(tags_of(&state.engine, snapshot.id));
+    }
+    Json(tags.into_iter().collect())
+}
+
+#[derive(Deserialize)]
+struct TagsForm {
+    tags: String,
+}
+
+async fn create_tags(State(state): State<AppState>, Form(form): Form<TagsForm>) -> StatusCode {
+    let mut tags = load_tags(&state.config.config_dir);
+    tags.extend(parse_tag_list(&form.tags));
+    save_tags(&state.config.config_dir, &tags);
+    StatusCode::OK
+}
+
+/// Delete tags, and take them off everything carrying them.
+///
+/// Leaving them on the transfers would mean a tag that is gone from the list
+/// and still shown on a row, which is the sort of inconsistency that has a
+/// client asking to filter by something this server has just said does not
+/// exist.
+async fn delete_tags(State(state): State<AppState>, Form(form): Form<TagsForm>) -> StatusCode {
+    let going = parse_tag_list(&form.tags);
+    let mut tags = load_tags(&state.config.config_dir);
+    tags.retain(|tag| !going.contains(tag));
+    save_tags(&state.config.config_dir, &tags);
+
+    for snapshot in state.engine.snapshot() {
+        let current = tags_of(&state.engine, snapshot.id);
+        if current.iter().any(|tag| going.contains(tag)) {
+            let kept: BTreeSet<String> =
+                current.into_iter().filter(|tag| !going.contains(tag)).collect();
+            write_tags(&state.engine, snapshot.id, &kept);
+        }
+    }
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct TagEditForm {
+    hashes: String,
+    tags: String,
+}
+
+async fn add_tags(State(state): State<AppState>, Form(form): Form<TagEditForm>) -> StatusCode {
+    let adding = parse_tag_list(&form.tags);
+    for id in resolve_ids(&state.engine, &form.hashes) {
+        let mut current = tags_of(&state.engine, id);
+        current.extend(adding.iter().cloned());
+        write_tags(&state.engine, id, &current);
+    }
+    // Recorded as well as applied, so a tag that only ever arrived this way
+    // still shows up in `tags` for a client that wants to filter by it.
+    let mut known = load_tags(&state.config.config_dir);
+    known.extend(adding);
+    save_tags(&state.config.config_dir, &known);
+    StatusCode::OK
+}
+
+async fn remove_tags(State(state): State<AppState>, Form(form): Form<TagEditForm>) -> StatusCode {
+    let going = parse_tag_list(&form.tags);
+    for id in resolve_ids(&state.engine, &form.hashes) {
+        let kept: BTreeSet<String> =
+            tags_of(&state.engine, id).into_iter().filter(|tag| !going.contains(tag)).collect();
+        write_tags(&state.engine, id, &kept);
+    }
+    StatusCode::OK
+}
+
 async fn create_category(
     State(state): State<AppState>,
     Form(form): Form<CreateCategoryForm>,
@@ -448,7 +609,12 @@ fn resolve_path(download_dir: &Path, raw: &str) -> PathBuf {
 /// directory, which is not writable, and every torrent either of them adds
 /// failed with a permission error the first time this was tried against a
 /// real client instead of a guess at what one would send.
-fn destination_for(state: &AppState, savepath: Option<&str>, category: Option<&str>) -> PathBuf {
+/// Where a category, or an explicit save path, says a download belongs.
+///
+/// This is the directory qBittorrent calls `save_path`, shared by every
+/// torrent under that category. It is not where the files themselves land:
+/// see `destination_for`.
+fn save_path_for(state: &AppState, savepath: Option<&str>, category: Option<&str>) -> PathBuf {
     if let Some(raw) = savepath.filter(|s| !s.is_empty()) {
         return resolve_path(&state.config.download_dir, raw);
     }
@@ -464,9 +630,72 @@ fn destination_for(state: &AppState, savepath: Option<&str>, category: Option<&s
     state.config.download_dir.clone()
 }
 
-fn label_new_torrent(state: &AppState, id: DownloadId, form: &AddForm) {
+/// Where this particular torrent's files are written: a folder of its own,
+/// inside the save path.
+///
+/// A torrent that carries no top level folder of its own writes its files
+/// straight into whatever directory it is given. Two such torrents in one
+/// category then share a directory, and nothing says which files belong to
+/// which download. Sonarr refuses to import that, and it is right to: it
+/// cannot tell either. It reports "Path matches client base download
+/// directory" and the download sits finished and unusable for ever.
+///
+/// So every torrent gets its own folder. qBittorrent offers this as a content
+/// layout setting and we simply always do it, because the alternative needs
+/// the file list to decide, and a magnet does not have one until the swarm
+/// answers, which is long after the destination has to be fixed.
+fn destination_for(
+    state: &AppState,
+    savepath: Option<&str>,
+    category: Option<&str>,
+    url: &str,
+) -> PathBuf {
+    save_path_for(state, savepath, category).join(folder_name_for(url))
+}
+
+/// A directory name for one torrent, from whatever the source will tell us.
+///
+/// The magnet's display name if it has one, its info hash if it does not, and
+/// the file's own stem for an uploaded `.torrent`. Something is always
+/// available, and a folder named after a hash is ugly rather than wrong.
+///
+/// Sanitised, and not as a formality: the display name arrives inside a URI
+/// that anybody can write, so `dn=../../etc` would otherwise place a download
+/// outside the directory it was meant to land in.
+fn folder_name_for(url: &str) -> String {
+    let raw = dl_core::torrent::magnet_display_name(url)
+        .or_else(|| dl_core::torrent::info_hash_of(url))
+        .or_else(|| Path::new(url).file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    sanitise_folder(&raw)
+}
+
+/// Reduce a name to something safe to append to a path.
+///
+/// Separators and parent references are removed rather than escaped, because
+/// there is no version of either that belongs in a single directory name.
+fn sanitise_folder(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '-',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() { "torrent".to_string() } else { trimmed.chars().take(120).collect() }
+}
+
+fn label_new_torrent(state: &AppState, id: DownloadId, form: &AddForm, save_path: &Path) {
     let mut labels = BTreeMap::new();
     labels.insert("added_on".to_string(), now_unix().to_string());
+    // Kept because the engine only knows the folder this torrent writes into,
+    // and qBittorrent's `save_path` is the directory above it, shared with
+    // every other torrent in the same category. Deriving it from the parent
+    // would be right until somebody sets a category whose path happens to
+    // nest, so it is recorded rather than inferred.
+    labels.insert("save_path".to_string(), save_path.display().to_string());
     if let Some(category) = form.category.as_deref().filter(|c| !c.is_empty()) {
         labels.insert("category".to_string(), category.to_string());
     }
@@ -485,9 +714,11 @@ fn label_new_torrent(state: &AppState, id: DownloadId, form: &AddForm) {
 }
 
 fn add_one(state: &AppState, url: String, form: &AddForm) {
-    let destination = destination_for(state, form.savepath.as_deref(), form.category.as_deref());
+    let save_path = save_path_for(state, form.savepath.as_deref(), form.category.as_deref());
+    let destination =
+        destination_for(state, form.savepath.as_deref(), form.category.as_deref(), &url);
     let id = state.engine.add(DownloadSpec::new(url, destination));
-    label_new_torrent(state, id, form);
+    label_new_torrent(state, id, form, &save_path);
 }
 
 fn add_urls_from(state: &AppState, urls: &str, form: &AddForm) -> usize {
@@ -1323,6 +1554,80 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tags_are_created_listed_added_removed_and_deleted() {
+        // Sonarr and Radarr both let somebody tag what they send to a client,
+        // and a tag configured there means these endpoints get called. Without
+        // them the client gets a 404 for something it has every reason to
+        // expect, having been told this server is qBittorrent.
+        let hash = hash_n(20);
+        let app = TestApp::with_default_backend();
+        let router = app.router();
+        app.add_magnet_and_wait(&hash).await;
+
+        post_form(&router, "/api/v2/torrents/createTags", &[("tags", "tv,archive")]).await;
+        let listed: Vec<String> =
+            serde_json::from_value(json_body(get(&router, "/api/v2/torrents/tags").await).await)
+                .unwrap();
+        assert!(listed.contains(&"tv".to_string()) && listed.contains(&"archive".to_string()));
+
+        post_form(&router, "/api/v2/torrents/addTags", &[("hashes", &hash), ("tags", "tv")]).await;
+        let list = list_json(&router, "").await;
+        assert_eq!(list[0]["tags"], "tv");
+
+        let tagged = list_json(&router, "?tag=tv").await;
+        assert_eq!(tagged.len(), 1, "filtering by tag should find it");
+        assert!(list_json(&router, "?tag=nothing").await.is_empty());
+
+        post_form(&router, "/api/v2/torrents/removeTags", &[("hashes", &hash), ("tags", "tv")])
+            .await;
+        assert_eq!(list_json(&router, "").await[0]["tags"], "");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_tag_takes_it_off_everything_carrying_it() {
+        // A tag gone from the list and still shown on a row has a client
+        // asking to filter by something this server has just said is not there.
+        let hash = hash_n(21);
+        let app = TestApp::with_default_backend();
+        let router = app.router();
+        app.add_magnet_and_wait(&hash).await;
+
+        post_form(&router, "/api/v2/torrents/addTags", &[("hashes", &hash), ("tags", "gone,kept")])
+            .await;
+        post_form(&router, "/api/v2/torrents/deleteTags", &[("tags", "gone")]).await;
+
+        assert_eq!(list_json(&router, "").await[0]["tags"], "kept");
+        let listed: Vec<String> =
+            serde_json::from_value(json_body(get(&router, "/api/v2/torrents/tags").await).await)
+                .unwrap();
+        assert!(!listed.contains(&"gone".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_tag_that_only_ever_arrived_on_a_torrent_is_still_listed() {
+        // A client that tagged at add time never called createTags. Leaving
+        // that tag out of the list would show it on a row and refuse to filter
+        // by it.
+        let hash = hash_n(22);
+        let app = TestApp::with_default_backend();
+        let router = app.router();
+        let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Show");
+        post_form(&router, "/api/v2/torrents/add", &[("urls", &magnet), ("tags", "from-add")])
+            .await;
+        for _ in 0..200 {
+            if find_by_hash(&app.state.engine, &hash).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let listed: Vec<String> =
+            serde_json::from_value(json_body(get(&router, "/api/v2/torrents/tags").await).await)
+                .unwrap();
+        assert!(listed.contains(&"from-add".to_string()));
     }
 
     #[tokio::test]

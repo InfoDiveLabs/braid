@@ -427,10 +427,10 @@ async fn torrents_info_while_downloading() {
     let session = app.login().await;
     app.create_tv_sonarr_category(&session).await;
     let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Big+Buck+Bunny");
-    let id = app
-        .state
-        .engine
-        .add(DownloadSpec::new(magnet, app.state.config.download_dir.join("tv-sonarr")));
+    let id = app.state.engine.add(DownloadSpec::new(
+        magnet,
+        app.state.config.download_dir.join("tv-sonarr/Big Buck Bunny"),
+    ));
     // `engine.add` alone is not the same request Sonarr sent: the real
     // `torrents/add` handler is what attaches a category label, and that
     // label, not the destination passed here, is what `torrents/info`
@@ -438,7 +438,10 @@ async fn torrents_info_while_downloading() {
     // about the listing rather than about `add` itself.
     app.state.engine.set_labels(
         id,
-        std::collections::BTreeMap::from([("category".to_string(), "tv-sonarr".to_string())]),
+        std::collections::BTreeMap::from([
+            ("category".to_string(), "tv-sonarr".to_string()),
+            ("save_path".to_string(), "/downloads/tv-sonarr".to_string()),
+        ]),
     );
     for _ in 0..200 {
         if app.state.engine.snapshot().iter().any(|s| s.torrent.is_some()) {
@@ -468,8 +471,12 @@ async fn torrents_info_while_downloading() {
     for field in ["hash", "name", "size", "category", "state", "num_seeds", "num_leechs"] {
         assert_eq!(entry[field], recorded[field], "field {field} diverged from the recording");
     }
+    // These two differing is the fix. While they were identical Sonarr saw a
+    // finished download whose content was reported as sitting at the category
+    // directory itself, and refused to import it, which is what the recording
+    // beside this test caught.
     assert_eq!(entry["save_path"], "/downloads/tv-sonarr");
-    assert_eq!(entry["content_path"], "/downloads/tv-sonarr");
+    assert_eq!(entry["content_path"], "/downloads/tv-sonarr/Big Buck Bunny");
 }
 
 /// Unlike the in-progress fixture, every field here except `added_on` and
@@ -495,10 +502,10 @@ async fn torrents_info_after_completion() {
     let session = app.login().await;
     app.create_tv_sonarr_category(&session).await;
     let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Big+Buck+Bunny");
-    let id = app
-        .state
-        .engine
-        .add(DownloadSpec::new(magnet, app.state.config.download_dir.join("tv-sonarr")));
+    let id = app.state.engine.add(DownloadSpec::new(
+        magnet,
+        app.state.config.download_dir.join("tv-sonarr/Big Buck Bunny"),
+    ));
     // `engine.add` alone is not the same request Sonarr sent: the real
     // `torrents/add` handler is what attaches a category label, and that
     // label, not the destination passed here, is what `torrents/info`
@@ -506,7 +513,10 @@ async fn torrents_info_after_completion() {
     // about the listing rather than about `add` itself.
     app.state.engine.set_labels(
         id,
-        std::collections::BTreeMap::from([("category".to_string(), "tv-sonarr".to_string())]),
+        std::collections::BTreeMap::from([
+            ("category".to_string(), "tv-sonarr".to_string()),
+            ("save_path".to_string(), "/downloads/tv-sonarr".to_string()),
+        ]),
     );
     for _ in 0..200 {
         if app.state.engine.snapshot().iter().any(|s| s.state == State::Seeding) {

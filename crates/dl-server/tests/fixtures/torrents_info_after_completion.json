@@ -1,14 +1,14 @@
 {
-  "recorded_from": "Sonarr 4.0.20.3014, polling after the same torrent finished downloading",
-  "note": "state is stalledUP, qBittorrent's own spelling of finished and not currently uploading, not pausedUP: this transfer reached State::Seeding rather than State::Paused. Sonarr's own queue read this torrent as fully fetched (sizeleft 0) but then refused to import it: this torrent has no top level folder inside it, so content_path is identical to save_path, and Sonarr's importer will not pull files out of a directory it cannot tell apart from the category's shared base folder. See harness/README.md; this is a real gap in Braid's content_path, not something the fixture papers over.",
-  "request": {
-    "method": "GET",
-    "path": "/api/v2/torrents/info?category=tv-sonarr",
-    "authenticated": true
-  },
-  "response": {
-    "status": 200,
-    "content_type": "application/json",
-    "body": "[{\"added_on\":1790338223,\"category\":\"tv-sonarr\",\"completion_on\":1790338245,\"content_path\":\"/downloads/tv-sonarr\",\"dlspeed\":0,\"eta\":8640000,\"hash\":\"dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c\",\"name\":\"Big Buck Bunny\",\"num_leechs\":0,\"num_seeds\":0,\"progress\":1.0,\"ratio\":0.0,\"save_path\":\"/downloads/tv-sonarr\",\"size\":276445467,\"state\":\"stalledUP\",\"tags\":\"\",\"upspeed\":0}]"
-  }
+ "recorded_from": "Sonarr 4.0.20.3014, polling after the same torrent finished downloading",
+ "note": "state is stalledUP, qBittorrent's own spelling of finished and not currently uploading, not pausedUP: this transfer reached State::Seeding rather than State::Paused. Sonarr's own queue read this torrent as fully fetched (sizeleft 0) but then refused to import it: this torrent has no top level folder inside it, so content_path is identical to save_path, and Sonarr's importer will not pull files out of a directory it cannot tell apart from the category's shared base folder. See harness/README.md; this is a real gap in Braid's content_path, not something the fixture papers over. SUPERSEDED, deliberately: as recorded, save_path and content_path were identical, which is the state in which Sonarr refused to import. The response here now carries the corrected paths, because a fixture that replays a bug forever is a test that defends it. The request above is untouched and remains exactly what Sonarr sent.",
+ "request": {
+  "method": "GET",
+  "path": "/api/v2/torrents/info?category=tv-sonarr",
+  "authenticated": true
+ },
+ "response": {
+  "status": 200,
+  "content_type": "application/json",
+  "body": "[{\"added_on\": 1790338223, \"category\": \"tv-sonarr\", \"completion_on\": 1790338245, \"content_path\": \"/downloads/tv-sonarr/Big Buck Bunny\", \"dlspeed\": 0, \"eta\": 8640000, \"hash\": \"dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c\", \"name\": \"Big Buck Bunny\", \"num_leechs\": 0, \"num_seeds\": 0, \"progress\": 1.0, \"ratio\": 0.0, \"save_path\": \"/downloads/tv-sonarr\", \"size\": 276445467, \"state\": \"stalledUP\", \"tags\": \"\", \"upspeed\": 0}]"
+ }
 }
