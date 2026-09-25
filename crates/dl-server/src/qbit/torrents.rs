@@ -44,7 +44,12 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v2/torrents/addTags", post(add_tags))
         .route("/api/v2/torrents/removeTags", post(remove_tags))
         .route("/api/v2/torrents/setShareLimits", post(set_share_limits))
-        .route("/api/v2/torrents/topPriority", post(top_priority))
+        // Real qBittorrent's endpoint is `topPrio`, not `topPriority`: this
+        // used to be named for what it does rather than for what a client
+        // actually asks for, and a real Sonarr calling it 404'd every single
+        // time as a result. See `harness/README.md`.
+        .route("/api/v2/torrents/topPrio", post(top_priority))
+        .route("/api/v2/torrents/setForceStart", post(set_force_start))
         .route("/api/v2/sync/maindata", get(sync_maindata))
 }
 
@@ -294,7 +299,16 @@ async fn torrent_properties(
     let Some(snapshot) = find_by_hash(&state.engine, &query.hash) else { return not_found() };
     let labels = state.engine.labels(snapshot.id);
     let destination = state.engine.destination(snapshot.id).unwrap_or_default();
-    let torrent = snapshot.torrent.as_ref().expect("find_by_hash only matches a torrent");
+    // `find_by_hash` matches on `torrent_hash`, which (see its own doc
+    // comment) reads a magnet's own hash out of the URL the instant it is
+    // added, before the backend has joined a swarm and produced a
+    // `TorrentStatus` at all. A hash matching here is therefore not a
+    // promise that `snapshot.torrent` is populated yet: this used to
+    // `.expect()` that and crashed the whole process the first time Sonarr
+    // called `torrents/properties` on a torrent that fast, which real
+    // traffic does. Every field below reads the same "not reported yet
+    // means zero" convention `torrent_entry_json` already uses.
+    let torrent = snapshot.torrent.as_ref();
     let complete =
         snapshot.progress.total.is_some_and(|total| snapshot.progress.downloaded >= total);
     let (added_on, completion_on) = timestamps(&state.engine, snapshot.id, &labels, complete);
@@ -304,10 +318,10 @@ async fn torrent_properties(
         "total_size": snapshot.progress.total.unwrap_or(0),
         "addition_date": added_on,
         "completion_date": completion_on,
-        "up_total": torrent.uploaded,
-        "upload_speed": torrent.upload_bytes_per_sec,
+        "up_total": torrent.map(|t| t.uploaded).unwrap_or(0),
+        "upload_speed": torrent.map(|t| t.upload_bytes_per_sec).unwrap_or(0),
         "dl_speed": snapshot.progress.bytes_per_sec,
-        "nb_connections": torrent.peers,
+        "nb_connections": torrent.map(|t| t.peers).unwrap_or(0),
         // Neither is tracked: see the comment on `num_seeds` in
         // `torrent_entry_json` for why, and `comment` because librqbit's
         // metadata handling does not surface one at all.
@@ -319,9 +333,15 @@ async fn torrent_properties(
 
 async fn torrent_files(State(state): State<AppState>, Query(query): Query<HashQuery>) -> Response {
     let Some(snapshot) = find_by_hash(&state.engine, &query.hash) else { return not_found() };
-    let torrent = snapshot.torrent.as_ref().expect("find_by_hash only matches a torrent");
-    let files: Vec<Value> = torrent
-        .files
+    // See the comment in `torrent_properties`: a matched hash does not mean
+    // the backend has reported a `TorrentStatus` yet, so there may be no
+    // file list at all. An empty list is the honest answer for "not known
+    // yet", the same way `torrent_entry_json` treats an absent torrent.
+    let files: Vec<Value> = snapshot
+        .torrent
+        .as_ref()
+        .map(|t| t.files.as_slice())
+        .unwrap_or(&[])
         .iter()
         .map(|file| {
             json!({
@@ -714,6 +734,26 @@ fn label_new_torrent(state: &AppState, id: DownloadId, form: &AddForm, save_path
 }
 
 fn add_one(state: &AppState, url: String, form: &AddForm) {
+    // A magnet naming a hash Braid already has open is not a second
+    // download. librqbit's session is keyed by info hash, one session per
+    // hash, so a second `add` for a hash already running silently attaches
+    // to that existing session instead of starting a new one: `dl_torrent`
+    // reports it as already complete within a second, at whatever
+    // destination the *first* add used, while the destination this second
+    // call was just given is never written to at all. A caller that grabbed
+    // the same release into two categories (this happened for real: the
+    // same public-domain magnet grabbed once by Sonarr and once by Radarr in
+    // this project's harness) would see this handler answer "Ok." and
+    // `torrents/info` claim a finished download sitting at a path that has
+    // nothing in it. Real qBittorrent's own answer to re-adding a hash it
+    // already has is to leave the existing torrent alone rather than start
+    // a second one, so that is what this does too, before a destination for
+    // the new request is even computed.
+    if let Some(hash) = dl_core::torrent::info_hash_of(&url)
+        && find_by_hash(&state.engine, &hash).is_some()
+    {
+        return;
+    }
     let save_path = save_path_for(state, form.savepath.as_deref(), form.category.as_deref());
     let destination =
         destination_for(state, form.savepath.as_deref(), form.category.as_deref(), &url);
@@ -939,8 +979,44 @@ async fn set_share_limits(
 /// here for "top" to mean anything about. Refusing the request would make a
 /// client log an error for a button its own interface still offers; doing
 /// nothing and saying so here is the more honest of the two ways to fail.
+///
+/// This is not a hypothetical: a real Sonarr with its "Recent Priority" set
+/// to "First" calls this, as `torrents/topPrio`, immediately after every
+/// `torrents/add`. See `harness/README.md`.
 async fn top_priority(State(state): State<AppState>, Form(form): Form<HashesForm>) -> StatusCode {
     let _ = resolve_ids(&state.engine, &form.hashes);
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct ForceStartForm {
+    hashes: String,
+    value: String,
+}
+
+/// `torrents/setForceStart`. Also not hypothetical: a real Sonarr with its
+/// "Initial State" set to "Force Started" calls this immediately after every
+/// `torrents/add`, and got a 404 for it until now. See `harness/README.md`.
+///
+/// `value=true` is the half of "force start" this engine can genuinely do:
+/// [`Engine::resume`] starts a transfer regardless of its queue position,
+/// which is what asking a paused or queued torrent to be force-started
+/// means. `value=false` asks for the opposite, to go back to being subject
+/// to ordinary queueing, and there is nothing to revert it to: this engine
+/// has no per-torrent forced flag, only [`EngineConfig::max_concurrent`],
+/// so a torrent already running keeps running rather than being paused to
+/// simulate un-forcing it. Accepting and doing nothing for that half is the
+/// same honesty `top_priority` above already applies to a request this
+/// engine cannot act on in full.
+async fn set_force_start(
+    State(state): State<AppState>,
+    Form(form): Form<ForceStartForm>,
+) -> StatusCode {
+    if form.value == "true" {
+        for id in resolve_ids(&state.engine, &form.hashes) {
+            state.engine.resume(id);
+        }
+    }
     StatusCode::OK
 }
 
@@ -1434,6 +1510,33 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn properties_and_files_do_not_panic_before_the_torrent_is_known() {
+        // A magnet's hash is readable from the URL the instant it is added,
+        // before the backend has joined a swarm and produced a
+        // `TorrentStatus` at all: see `torrent_hash`. `find_by_hash` matching
+        // on that early hash used to be read, by both handlers below, as a
+        // promise that `snapshot.torrent` was already populated. It is not a
+        // promise: a real Sonarr calling `torrents/properties` in that
+        // window crashed the whole process. See `harness/README.md`.
+        let hash = hash_n(13);
+        let app = TestApp::with_backend(FakeTorrentBackend::new(None));
+        let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Big+Buck+Bunny");
+        app.state.engine.add(DownloadSpec::new(magnet, app.state.config.download_dir.clone()));
+        let router = app.router();
+
+        let props = get(&router, &format!("/api/v2/torrents/properties?hash={hash}")).await;
+        assert_eq!(props.status(), StatusCode::OK);
+        let props = json_body(props).await;
+        assert_eq!(props["nb_connections"], 0);
+        assert_eq!(props["up_total"], 0);
+        assert_eq!(props["upload_speed"], 0);
+
+        let files = get(&router, &format!("/api/v2/torrents/files?hash={hash}")).await;
+        assert_eq!(files.status(), StatusCode::OK);
+        assert!(json_body(files).await.as_array().unwrap().is_empty());
+    }
+
     // -- Task 10: driving -----------------------------------------------
 
     #[tokio::test]
@@ -1466,6 +1569,52 @@ mod tests {
         let list = list_json(&router, "").await;
         assert_eq!(list[0]["category"], "tv-sonarr");
         assert_eq!(list[0]["save_path"], "/downloads/tv");
+    }
+
+    #[tokio::test]
+    async fn re_adding_a_known_hash_under_a_different_category_does_not_create_a_second_torrent() {
+        // librqbit's session is one per info hash. A second `add` for a hash
+        // already open silently attaches to the existing session instead of
+        // starting a new one, and `dl_torrent` reports it complete within a
+        // second, at the *first* add's destination, while the destination
+        // this second call asked for is never written to at all. This
+        // happened for real in this project's harness: the same
+        // public-domain magnet grabbed once into Sonarr's category and once
+        // into Radarr's had the second category's `torrents/info` claim a
+        // finished download sitting at a path that had nothing in it. See
+        // `harness/README.md`.
+        let hash = hash_n(20);
+        let app = TestApp::with_default_backend();
+        let router = app.router();
+        let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Show");
+
+        post_form(&router, "/api/v2/torrents/add", &[("urls", &magnet), ("category", "tv-sonarr")])
+            .await;
+        for _ in 0..200 {
+            if find_by_hash(&app.state.engine, &hash).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(app.state.engine.snapshot().len(), 1);
+
+        post_form(
+            &router,
+            "/api/v2/torrents/add",
+            &[("urls", &magnet), ("category", "movies-radarr")],
+        )
+        .await;
+        // Nothing to poll for: a duplicate is either created immediately or
+        // never at all.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            app.state.engine.snapshot().len(),
+            1,
+            "adding a hash already open must not start a second, unreachable download"
+        );
+        let list = list_json(&router, "").await;
+        assert_eq!(list[0]["category"], "tv-sonarr", "the original add must be left alone");
     }
 
     #[tokio::test]
