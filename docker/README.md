@@ -47,6 +47,7 @@ default below.
 | `BRAID_DOWNLOAD_LIMIT` | unlimited | download rate cap, bytes per second |
 | `BRAID_UPLOAD_LIMIT` | unlimited | upload rate cap, bytes per second (torrents) |
 | `BRAID_AUTH_REQUIRED` | `true` | require login; leave this alone unless you know why you wouldn't |
+| `BRAID_INTERFACES` | unset | comma separated interface names to spread a download across, e.g. `eth0,wlan0`; unset lets the OS route |
 
 Plus the container-level variables the entrypoint reads before any of the
 above: `PUID`, `PGID`, and optionally `UMASK` (default `022`). `PUID` has no

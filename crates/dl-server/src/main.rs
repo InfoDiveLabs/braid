@@ -43,15 +43,36 @@ use std::sync::Arc;
 
 const DEFAULT_LOG: &str = "info";
 
-/// Builds the network paths for each download.
+/// The network paths every download on this server will use.
 ///
-/// Deliberately simpler than `dl-gui`'s equivalent: there is no settings
-/// window here to pin a transfer to one interface or to pair a phone, so
-/// every transfer gets the single path the OS would pick anyway. Interface
-/// selection can be added once there is an API request that carries the
-/// choice; inventing the plumbing before there is a caller for it would be
-/// guessing at a shape nobody has asked for yet.
+/// Mirrors `dl-gui`'s `paths_for`: naming interfaces replaces the OS's
+/// default route rather than adding to it, because somebody who listed their
+/// interfaces chose them on purpose and the default route is not one of
+/// them. The two must not disagree, so this is the same rule.
+///
+/// Aggregation is not the pitch for a server the way it is for a laptop
+/// tethering to a phone in a parking lot: it only pays when the local link
+/// is the bottleneck, and a well connected server usually is not. It still
+/// earns its keep on a home server running both Wi-Fi and Ethernet, and
+/// leaving it out entirely would mean the server build can never do what the
+/// desktop build does.
+///
+/// Phones are deliberately absent here. A relay lane needs the paired relay
+/// store, which lives in `dl-gui` and is bound to a desktop pairing flow
+/// with a QR code and a camera; how a screenless server pairs with a phone
+/// is its own design question, not answered by adding a field to this one.
+fn paths_for(interfaces: &[String], default_lane: &str) -> Vec<NetPath> {
+    if interfaces.is_empty() {
+        return vec![NetPath::Default(default_lane.to_string())];
+    }
+    interfaces.iter().map(|name| NetPath::Interface(name.clone())).collect()
+}
+
+/// Builds the network paths for each download.
 struct HeadlessFactory {
+    /// Interfaces named in config to spread transfers across. Empty leaves
+    /// routing to the OS, same as `dl-gui` with nothing selected.
+    interfaces: Vec<String>,
     /// What to call a transfer whose lane the OS chose rather than us. See
     /// `dl_core::EngineConfig::unattributed_lane` for why this is not the
     /// literal string "default".
@@ -60,7 +81,7 @@ struct HeadlessFactory {
 
 impl SourceFactory for HeadlessFactory {
     fn lanes_for(&self, spec: &DownloadSpec) -> dl_core::Result<Box<dyn LaneSet>> {
-        let paths = vec![NetPath::Default(self.default_lane.clone())];
+        let paths = paths_for(&self.interfaces, &self.default_lane);
         let lanes = PathLanes::build(&paths, &spec.url, &HttpConfig::default(), &SystemInterfaces)?;
         Ok(Box::new(lanes))
     }
@@ -166,7 +187,11 @@ async fn main() -> Result<()> {
         Some(rate) => Budget::with_rate(rate),
         None => Budget::unlimited(),
     };
-    let engine = Engine::new(Arc::new(HeadlessFactory { default_lane }), engine_config, budget);
+    let engine = Engine::new(
+        Arc::new(HeadlessFactory { interfaces: config.interfaces.clone(), default_lane }),
+        engine_config,
+        budget,
+    );
     if let Some(rate) = config.upload_limit {
         engine.upload_budget().set_rate(rate);
     }
@@ -229,4 +254,26 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dl_net::path::Path;
+
+    #[test]
+    fn naming_interfaces_produces_one_lane_each_and_no_default() {
+        // Somebody who listed their interfaces chose them on purpose, and the
+        // default route is not one of them. This is the same rule the desktop
+        // applies in `paths_for`, and the two must not disagree.
+        let paths = paths_for(&["en0".into(), "en5".into()], "en0");
+        assert_eq!(paths.len(), 2);
+        assert!(!paths.iter().any(|p| matches!(p, Path::Default(_))));
+    }
+
+    #[test]
+    fn naming_none_leaves_the_routing_to_the_operating_system() {
+        let paths = paths_for(&[], "en0");
+        assert!(matches!(paths.as_slice(), [Path::Default(name)] if name == "en0"));
+    }
 }

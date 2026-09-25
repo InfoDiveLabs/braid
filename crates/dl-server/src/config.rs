@@ -22,6 +22,7 @@ const FIELDS: &[&str] = &[
     "download_limit",
     "upload_limit",
     "auth_required",
+    "interfaces",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +36,10 @@ pub struct Config {
     pub download_limit: Option<u64>,
     pub upload_limit: Option<u64>,
     pub auth_required: bool,
+    /// Interfaces a download should be spread across, named exactly as the
+    /// OS names them. Empty means what it always has here: let the OS pick
+    /// the route. See `paths_for` in `main.rs` for what this becomes.
+    pub interfaces: Vec<String>,
 }
 
 impl Default for Config {
@@ -52,6 +57,10 @@ impl Default for Config {
             connections: 8,
             download_limit: None,
             upload_limit: None,
+            // Naming none is not an oversight to fix later: most servers sit
+            // on one well connected link where aggregation buys nothing, and
+            // the OS already picks the right route for that case.
+            interfaces: Vec::new(),
             // A server bound to a container's network namespace is reachable
             // from anything else in it, and from the host if the port is
             // published. Defaulting to open would mean the first honest
@@ -149,9 +158,20 @@ impl Config {
                 "false" => self.auth_required = false,
                 _ => {}
             },
+            "interfaces" => self.interfaces = parse_interfaces(value),
             _ => {}
         }
     }
+}
+
+/// Comma separated interface names, trimmed of surrounding whitespace so a
+/// compose file that wraps the line does not smuggle spaces into a name the
+/// OS will never match. An empty value clears the list rather than being
+/// rejected as unparsable: that is how a compose file says "let the OS
+/// route" without omitting the key, and it matches what an unset key already
+/// defaults to.
+fn parse_interfaces(value: &str) -> Vec<String> {
+    value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
 /// An empty value means unlimited; zero means the same thing, since a rate
