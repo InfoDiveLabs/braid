@@ -42,12 +42,19 @@ pub(super) fn routes() -> Router<AppState> {
 /// A plain function rather than a `Serialize` struct: half the fields are
 /// conditional on whether this is a torrent, and matching that here once is
 /// clearer than teaching `serde` a shape that changes underneath it.
-pub(super) fn transfer_json(snapshot: &DownloadSnapshot) -> Value {
+///
+/// `category` is not on `DownloadSnapshot` itself: it lives in the engine's
+/// label map (see `set_category`) and is looked up by the caller, which
+/// already has the engine in hand. Threading it in here rather than a second
+/// lookup inside this function keeps this a pure mapping, and lets every call
+/// site decide once whether the lookup is worth its cost.
+pub(super) fn transfer_json(snapshot: &DownloadSnapshot, category: Option<&str>) -> Value {
     json!({
         "id": snapshot.id.0,
         "filename": snapshot.filename,
         "host": snapshot.host,
         "state": snapshot.state.as_str(),
+        "category": category,
         "downloaded": snapshot.progress.downloaded,
         "total": snapshot.progress.total,
         // Expressed 0..100 rather than a bare fraction: a progress bar's
@@ -66,6 +73,15 @@ pub(super) fn transfer_json(snapshot: &DownloadSnapshot) -> Value {
         // has no swarm to look in".
         "torrent": snapshot.torrent.as_ref().map(torrent_json),
     })
+}
+
+/// The `category` label for one transfer, or `None` when it was never set.
+///
+/// A thin wrapper over `Engine::labels` so every call site spells the same
+/// lookup the same way, rather than each one reaching into the label map's
+/// `"category"` key by hand.
+fn category_for(engine: &dl_core::engine::Engine, id: DownloadId) -> Option<String> {
+    engine.labels(id).get("category").cloned()
 }
 
 fn lane_json(lane: &LaneReport) -> Value {
@@ -205,7 +221,10 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 async fn list_transfers(State(state): State<AppState>) -> Json<Value> {
     let snapshots = state.engine.snapshot();
     Json(json!({
-        "transfers": snapshots.iter().map(transfer_json).collect::<Vec<_>>(),
+        "transfers": snapshots
+            .iter()
+            .map(|s| transfer_json(s, category_for(&state.engine, s.id).as_deref()))
+            .collect::<Vec<_>>(),
         // The header reads this rather than summing the rows itself, so the
         // toolbar figure and the one this same call already computed from the
         // lane selectors can never drift apart.
@@ -217,7 +236,7 @@ async fn get_transfer(State(state): State<AppState>, Path(id): Path<u64>) -> Res
     let id = DownloadId(id);
     match state.engine.get(id) {
         Some(snapshot) => {
-            let mut body = transfer_json(&snapshot);
+            let mut body = transfer_json(&snapshot, category_for(&state.engine, id).as_deref());
             // Only the detail view pays for this, not the list or the event
             // stream: a digest is checked once per transfer, not ten times a
             // second, and `checksum_json` has to walk `error` to say whether
@@ -312,6 +331,14 @@ struct NewTransfer {
     /// A qBittorrent idea, kept out of `DownloadSpec` on purpose: see
     /// `set_category`.
     category: Option<String>,
+    /// Add the transfer already paused, for a caller that wants to queue up
+    /// several things before letting any of them touch the network. There is
+    /// no such notion in `DownloadSpec`; this is `Engine::add` immediately
+    /// followed by `Engine::pause`, done here rather than as two requests so
+    /// the pause can never be lost to a client that navigates away between
+    /// them.
+    #[serde(default)]
+    start_paused: bool,
 }
 
 async fn add_transfer(State(state): State<AppState>, Json(body): Json<NewTransfer>) -> Response {
@@ -353,12 +380,15 @@ async fn add_transfer(State(state): State<AppState>, Json(body): Json<NewTransfe
     spec.expect = expect;
 
     let id = state.engine.add(spec);
-    if let Some(category) = body.category {
-        set_category(&state.engine, id, category);
+    if let Some(category) = &body.category {
+        set_category(&state.engine, id, category.clone());
+    }
+    if body.start_paused {
+        state.engine.pause(id);
     }
 
     let snapshot = state.engine.get(id).expect("just added, cannot have vanished already");
-    (StatusCode::CREATED, Json(transfer_json(&snapshot))).into_response()
+    (StatusCode::CREATED, Json(transfer_json(&snapshot, body.category.as_deref()))).into_response()
 }
 
 /// Where an uploaded `.torrent` file's bytes land, so the backend has
@@ -438,8 +468,8 @@ async fn pause_transfer(State(state): State<AppState>, Path(id): Path<u64>) -> R
         return not_found();
     }
     state.engine.pause(id);
-    Json(transfer_json(&state.engine.get(id).expect("still here, we hold no lock across this")))
-        .into_response()
+    let snapshot = state.engine.get(id).expect("still here, we hold no lock across this");
+    Json(transfer_json(&snapshot, category_for(&state.engine, id).as_deref())).into_response()
 }
 
 async fn resume_transfer(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
@@ -448,8 +478,8 @@ async fn resume_transfer(State(state): State<AppState>, Path(id): Path<u64>) -> 
         return not_found();
     }
     state.engine.resume(id);
-    Json(transfer_json(&state.engine.get(id).expect("still here, we hold no lock across this")))
-        .into_response()
+    let snapshot = state.engine.get(id).expect("still here, we hold no lock across this");
+    Json(transfer_json(&snapshot, category_for(&state.engine, id).as_deref())).into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -692,7 +722,7 @@ mod tests {
         // Collapsing them here would make the web UI's estimate jump the way
         // the desktop's used to.
         let snapshot = snapshot_with(TransferState::Running, 500, Some(1000), 20_000_000);
-        let json = transfer_json(&snapshot);
+        let json = transfer_json(&snapshot, None);
         assert_eq!(json["state"], "running");
         assert_eq!(json["downloaded"], 500);
         assert_eq!(json["total"], 1000);
@@ -705,7 +735,7 @@ mod tests {
     async fn a_transfer_of_unknown_length_reports_null_rather_than_zero() {
         // A server that sent no Content-Length has not told us the file is
         // empty.
-        let json = transfer_json(&snapshot_with(TransferState::Running, 500, None, 0));
+        let json = transfer_json(&snapshot_with(TransferState::Running, 500, None, 0), None);
         assert!(json["total"].is_null());
         assert!(json["percent"].is_null());
     }
@@ -714,7 +744,7 @@ mod tests {
     async fn an_http_transfer_has_no_torrent_block_at_all() {
         // Reporting zero peers and zero uploaded for something that has
         // neither would have the UI draw a seeding row for a file download.
-        let json = transfer_json(&snapshot_with(TransferState::Running, 1, Some(2), 0));
+        let json = transfer_json(&snapshot_with(TransferState::Running, 1, Some(2), 0), None);
         assert!(json["torrent"].is_null());
     }
 
@@ -846,6 +876,53 @@ mod tests {
     async fn a_transfer_that_does_not_exist_is_a_404_not_an_empty_row() {
         let response = app().oneshot(get("/api/v1/transfers/999")).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_category_set_on_add_comes_back_on_every_read_path() {
+        // The category filter in the web UI reads this off the list endpoint,
+        // not just the detail one: a category invisible there could never be
+        // filtered on.
+        let state = test_state();
+        let router = routes().with_state(state.clone());
+        let added = router
+            .clone()
+            .oneshot(post(
+                "/api/v1/transfers",
+                json!({"url": "https://example.test/a.iso", "category": "movies"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(added).await["category"], "movies");
+
+        let listed = body_json(router.oneshot(get("/api/v1/transfers")).await.unwrap()).await;
+        assert_eq!(listed["transfers"][0]["category"], "movies");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_with_no_category_reports_it_as_null_not_an_empty_string() {
+        let router = routes().with_state(test_state());
+        let added = router
+            .oneshot(post("/api/v1/transfers", json!({"url": "https://example.test/a.iso"})))
+            .await
+            .unwrap();
+        assert!(body_json(added).await["category"].is_null());
+    }
+
+    #[tokio::test]
+    async fn start_paused_lands_the_transfer_in_paused_rather_than_queued() {
+        // Two requests (add, then pause) would leave a window where a second
+        // browser tab's own list briefly shows the transfer running; asking
+        // for both in the one request that creates it closes that window.
+        let router = routes().with_state(test_state());
+        let added = router
+            .oneshot(post(
+                "/api/v1/transfers",
+                json!({"url": "https://example.test/a.iso", "start_paused": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(added).await["state"], "paused");
     }
 
     #[tokio::test]
