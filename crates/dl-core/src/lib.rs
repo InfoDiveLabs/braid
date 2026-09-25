@@ -13,6 +13,7 @@ pub mod error;
 pub mod integrity;
 pub mod lane;
 pub mod model;
+pub mod persist;
 pub mod refresh;
 pub mod regions;
 pub mod resume;

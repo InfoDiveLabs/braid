@@ -20,7 +20,7 @@ use dl_core::engine::{DownloadSpec, Engine, SourceFactory};
 use dl_core::lane::LaneSet;
 use dl_gui::{
     InterfaceSetting, MainWindow, RelayLaneRow, RelayRow, SettingsWindow, Tray, bridge, platform,
-    relays, settings, transfers,
+    relays, settings,
 };
 use dl_net::iface::InterfaceProvider as _;
 use dl_net::{HttpConfig, HttpSource, SystemInterfaces};
@@ -1722,11 +1722,19 @@ fn main() -> Result<()> {
 
     // What the last run was doing. Before the window exists, so the first
     // frame already has the rows rather than growing them a tick later.
-    let restored = transfers::restore(&engine);
-    if restored > 0 {
-        tracing::info!(restored, "transfers carried over from the last run");
+    //
+    // Beside settings.conf, whose directory is the one place this app already
+    // agrees on: the engine takes it as a plain path and has no notion of
+    // where a front end keeps its configuration.
+    if let Some(dir) =
+        settings::Settings::path().and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+    {
+        let restored = dl_core::persist::restore(&engine, &dir);
+        if restored > 0 {
+            tracing::info!(restored, "transfers carried over from the last run");
+        }
+        dl_core::persist::spawn_autosave(engine.clone(), dir);
     }
-    transfers::spawn_autosave(engine.clone());
 
     let ui = MainWindow::new()?;
     // Follow the system appearance at launch. The property stays settable so

@@ -227,6 +227,9 @@ struct Record {
     display_name: Option<String>,
     /// Peers, upload and file list, for a torrent. Stays `None` for HTTP.
     torrent: Option<TorrentStatus>,
+    /// See `Restorable::labels`. Held here only so a transfer restored with
+    /// some keeps them for the next time it is written back out.
+    labels: BTreeMap<String, String>,
 }
 
 /// How long the rate average takes to follow a step change.
@@ -452,6 +455,12 @@ pub struct Restorable {
     pub downloaded: u64,
     pub total: Option<u64>,
     pub name: Option<String>,
+    /// Whatever a front end wants attached to a transfer that the engine has
+    /// no business interpreting: a category, a pair of timestamps, anything
+    /// else in that vein. Carried through unread, so a compatibility detail
+    /// like a qBittorrent category never becomes something this crate has an
+    /// opinion about.
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A set of downloads with a shared bandwidth budget and a concurrency limit.
@@ -554,6 +563,7 @@ impl Engine {
                     cancel: Cancel::new(),
                     display_name,
                     torrent: None,
+                    labels: BTreeMap::new(),
                 },
             );
         }
@@ -660,6 +670,7 @@ impl Engine {
                 downloaded: r.progress.downloaded,
                 total: r.progress.total,
                 name: r.display_name.clone(),
+                labels: r.labels.clone(),
             })
             .collect()
     }
@@ -671,7 +682,7 @@ impl Engine {
     /// itself because the app restarted would be the opposite of a pause, and
     /// a finished one must not be fetched again.
     pub fn restore(&self, entry: Restorable) -> DownloadId {
-        let Restorable { spec, state, downloaded, total, name } = entry;
+        let Restorable { spec, state, downloaded, total, name, labels } = entry;
         let id = DownloadId(self.inner.next_id.fetch_add(1, Ordering::SeqCst));
         // A finished transfer with no size would render as "0 of 0 bytes", so
         // the figures come back with it rather than being rediscovered.
@@ -695,6 +706,7 @@ impl Engine {
                     display_name: name,
                     error: None,
                     cancel: Cancel::new(),
+                    labels,
                 },
             );
         }
@@ -1300,6 +1312,7 @@ mod tests {
             display_name: None,
             error: None,
             cancel: Cancel::new(),
+            labels: BTreeMap::new(),
         }
     }
 
@@ -1476,6 +1489,7 @@ mod tests {
             downloaded: 1024,
             total: Some(4096),
             name: None,
+            labels: BTreeMap::new(),
         });
         let row = engine.get(id).expect("restored");
         assert_eq!(row.state, State::Paused);
@@ -1494,6 +1508,7 @@ mod tests {
             downloaded: 4096,
             total: None,
             name: None,
+            labels: BTreeMap::new(),
         });
         let row = engine.get(id).expect("restored");
         assert_eq!(row.progress.fraction(), Some(1.0));
@@ -1510,6 +1525,7 @@ mod tests {
             downloaded: 7,
             total: Some(9),
             name: Some("a.iso".into()),
+            labels: BTreeMap::new(),
         });
 
         let written = engine.specs();
