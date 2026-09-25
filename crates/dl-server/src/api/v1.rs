@@ -6,11 +6,14 @@
 //! `torrent_json` for why an HTTP transfer's `torrent` field is `null`
 //! rather than a block of zeroes.
 
+use crate::auth::{
+    Credentials, MIN_PASSWORD_LEN, PasswordChangeError, SESSION_COOKIE, Sessions, cookie_value,
+};
 use crate::state::AppState;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use dl_core::chunks::ChunkReport;
@@ -26,6 +29,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
@@ -35,6 +39,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/api/v1/transfers/{id}/pause", post(pause_transfer))
         .route("/api/v1/transfers/{id}/resume", post(resume_transfer))
         .route("/api/v1/settings", get(get_settings).post(update_settings))
+        .route("/api/v1/password", post(change_password))
 }
 
 /// One transfer, as the web UI reads it.
@@ -674,6 +679,59 @@ fn drop_zero_limits(limits: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
         .collect()
 }
 
+/// What the Settings page sends to change the password.
+#[derive(Deserialize)]
+struct PasswordChange {
+    current_password: String,
+    new_password: String,
+}
+
+/// `POST /api/v1/password`.
+///
+/// Reached only with a valid session already, courtesy of `auth::require_auth`
+/// sitting in front of every route in this module; the current password is
+/// still asked for here, on top of that, because a valid session is exactly
+/// what a shared machine's browser has left open for whoever walks up to it
+/// next. Asking again costs the legitimate caller one field.
+async fn change_password(
+    State(state): State<AppState>,
+    Extension(sessions): Extension<Arc<Sessions>>,
+    Extension(credentials): Extension<Arc<Credentials>>,
+    headers: HeaderMap,
+    Json(body): Json<PasswordChange>,
+) -> Response {
+    match credentials.change_password(
+        &state.config.config_dir,
+        &body.current_password,
+        &body.new_password,
+    ) {
+        Ok(()) => {
+            // The whole reason to change a password is a suspicion that a
+            // session is loose somewhere else, so every other session goes
+            // now. Not this one: logging someone out of the page they are
+            // standing on, as a reward for changing their password, is
+            // hostile rather than safe.
+            if let Some(id) = cookie_value(&headers, SESSION_COOKIE) {
+                sessions.revoke_all_except(id);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        // Deliberately no detail beyond the status: telling a caller the
+        // current password specifically was wrong is the same mistake as
+        // telling a login attempt which half it got wrong.
+        Err(PasswordChangeError::WrongCurrentPassword) => {
+            (StatusCode::FORBIDDEN, "wrong current password").into_response()
+        }
+        Err(PasswordChangeError::TooShort) => {
+            bad_request("new_password", format!("must be at least {MIN_PASSWORD_LEN} characters"))
+        }
+        Err(PasswordChangeError::Io(error)) => {
+            tracing::warn!(%error, "could not save the new password");
+            (StatusCode::INTERNAL_SERVER_ERROR, "could not save the new password").into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,5 +1353,139 @@ mod tests {
             .uri(uri)
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    /// Everything a password-change test needs: a config directory the change
+    /// can actually write into, a session already issued (standing in for the
+    /// one a browser would already be holding), and the real password
+    /// `Credentials::load_or_create` generated for it, the same way every
+    /// other test in this crate that needs to log in does.
+    struct PasswordFixture {
+        _dir: tempfile::TempDir,
+        router: axum::Router,
+        sessions: Arc<Sessions>,
+        credentials: Arc<Credentials>,
+        session: String,
+        password: String,
+    }
+
+    fn password_fixture() -> PasswordFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            crate::config::Config { config_dir: dir.path().to_path_buf(), ..Default::default() };
+        let state = AppState { engine: test_state().engine, config: Arc::new(config) };
+        let sessions = Arc::new(Sessions::default());
+        let (credentials, password) = Credentials::load_or_create(dir.path()).unwrap();
+        let password = password.expect("freshly created credentials hand back their password");
+        let credentials = Arc::new(credentials);
+        let session = sessions.issue();
+
+        let router = routes()
+            .with_state(state)
+            .layer(Extension(sessions.clone()))
+            .layer(Extension(credentials.clone()));
+
+        PasswordFixture { _dir: dir, router, sessions, credentials, session, password }
+    }
+
+    fn password_post(
+        session: &str,
+        current: &str,
+        new: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/password")
+            .header("content-type", "application/json")
+            .header("cookie", format!("SID={session}"))
+            .body(axum::body::Body::from(
+                json!({"current_password": current, "new_password": new}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_changed_password_works_and_the_old_one_stops_working() {
+        let fixture = password_fixture();
+        let new_password = "a-fresh-password-of-plenty-of-length";
+
+        let response = fixture
+            .router
+            .oneshot(password_post(&fixture.session, &fixture.password, new_password))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(fixture.credentials.verify("admin", new_password));
+        assert!(!fixture.credentials.verify("admin", &fixture.password));
+    }
+
+    #[tokio::test]
+    async fn the_current_password_is_required_even_with_a_valid_session() {
+        let fixture = password_fixture();
+
+        let response = fixture
+            .router
+            .oneshot(password_post(
+                &fixture.session,
+                "definitely the wrong password",
+                "a-fresh-enough-password",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // A valid session got the request past the middleware this endpoint
+        // will sit behind; it must not also get it past this check. Nothing
+        // should have moved: the old password still works, and the session
+        // that made the doomed attempt is exactly as valid as before it.
+        assert!(fixture.credentials.verify("admin", &fixture.password));
+        assert!(fixture.sessions.valid(&fixture.session));
+    }
+
+    #[tokio::test]
+    async fn a_short_new_password_is_refused_and_says_the_limit() {
+        let fixture = password_fixture();
+
+        let response = fixture
+            .router
+            .oneshot(password_post(&fixture.session, &fixture.password, "too-short"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_json(response).await;
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&MIN_PASSWORD_LEN.to_string()),
+            "the message should say the limit rather than just refuse: {message}"
+        );
+        assert!(
+            fixture.credentials.verify("admin", &fixture.password),
+            "nothing should have changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_keeps_this_session_and_ends_the_others() {
+        let fixture = password_fixture();
+        let other_session = fixture.sessions.issue();
+
+        let response = fixture
+            .router
+            .oneshot(password_post(
+                &fixture.session,
+                &fixture.password,
+                "a-fresh-password-of-plenty-of-length",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(
+            fixture.sessions.valid(&fixture.session),
+            "changing a password must not sign out the caller"
+        );
+        assert!(!fixture.sessions.valid(&other_session), "every other session must be ended");
     }
 }
