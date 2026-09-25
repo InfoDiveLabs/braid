@@ -297,3 +297,217 @@ add cycle, not repeat it indefinitely.
   UI (so far as this harness's use of each app's REST API can tell) surfaced
   a warning or a different behaviour tied to those two fields, in either the
   in-progress or the completed state.
+
+## Second run: does Sonarr actually import it now
+
+The content_path fix above (every torrent gets a folder of its own) shipped
+without ever being re-run against a real Sonarr. It has now been, end to end,
+with the same flat, no-top-level-folder torrent the first run used.
+
+**Sonarr does import it.** A magnet pushed the same way as before, grabbed
+for real through the registered client, downloaded to completion, and this
+time Sonarr's queue accepted `content_path` as distinct from `save_path` and
+moved on: no more "Path matches client base download directory". It reached a
+new, later failure instead: "Unable to parse file", because the file Sonarr
+found is really *Big Buck Bunny*, named exactly that, and nothing about that
+filename says `Pioneer.One.S01E03` to Sonarr's parser. That is a property of
+using a real, unrelated, permanently-seeded public torrent for actual bytes,
+the same limitation the first run's own README already named, not a Braid
+defect. Manually importing the same file (`POST /api/v3/command` with
+`ManualImport`, naming the series and episode explicitly, exactly the
+operation Sonarr's own "Manual Import" screen drives) succeeded outright: a
+real `downloadFolderImported` history event, and the file moved into
+`/downloads/tv/Pioneer One/Pioneer.One.S01E03.720p.WEB.x264-GROUP.mp4`. That
+is the proof this run set out to get: given a name Sonarr can actually match,
+the file Braid produced imports cleanly, and `content_path`/`save_path`
+are no longer the obstacle.
+
+Radarr got the same treatment with a title that genuinely matches its own
+metadata (*Big Buck Bunny* is a real, small, public-domain film with its own
+TMDB entry): Radarr's own `GET /api/v3/manualimport` found the file, read its
+size correctly, and matched it to the right movie by title and year on its
+own, with no help from a folder name. It stopped one step short of a full
+import in this session over "Unable to parse file" (a quality-parsing
+rejection) and a JSON schema quirk in Radarr 6.4.4's own `POST
+/api/v3/command` payload for `ManualImport` that this session did not resolve
+in time; that is a gap in this write-up, not a claim that Radarr's own
+automatic import was seen to work end to end the way Sonarr's manual import
+was. What is proven for Radarr is the same thing the file listing already
+showed: the file is real, complete, and at a path Radarr can read and
+correctly identify.
+
+### A harness bug that would have hidden all of this: three separate `/downloads`
+
+The compose file this session inherited mounted `./data/braid/downloads`,
+`./data/sonarr/downloads` and `./data/radarr/downloads` as `/downloads` in
+three different containers. Braid's API could report a torrent finished at
+`/downloads/tv-sonarr/Big Buck Bunny` all day and it would never matter,
+because Sonarr's own `/downloads` was a completely different directory on the
+host with nothing in it. This is exactly why the first run's "Path matches
+client base download directory" failure was the *only* failure it ever saw:
+that check is a pure string comparison inside Sonarr, done before it ever
+touches a filesystem, so it fired and stopped the story before the missing
+shared volume could matter. The moment that string check was fixed, this
+would have surfaced instead, as "no files found are eligible for import",
+and would have looked like a Braid bug. It is not one. Real
+qBittorrent-plus-Sonarr deployments always bind-mount one download directory
+into both containers at a matching path for exactly this reason. Fixed here:
+`harness/compose.yml` now mounts a single `./data/downloads` into `braid`,
+`sonarr` and `radarr` alike, and `record.sh up` creates that one directory
+instead of three.
+
+### A real crash: `torrents/properties` and `torrents/files` before a torrent's status is known
+
+`braid-server` panicked and exited mid-session, twice, the first time a real
+Sonarr called `torrents/properties` on a torrent it had only just added:
+
+```
+thread 'tokio-rt-worker' panicked at crates/dl-server/src/qbit/torrents.rs:297:45:
+find_by_hash only matches a torrent
+```
+
+`find_by_hash` matches on `torrent_hash`, which (by design, see its own doc
+comment) reads a magnet's hash straight out of the URL the instant it is
+added, before the backend has joined a swarm and produced a `TorrentStatus`
+at all. A hash matching there is not a promise that `snapshot.torrent` is
+populated, and both `torrent_properties` and `torrent_files` `.expect()`-ed
+that it was. A real client asking about a torrent it had just added, which is
+an entirely ordinary thing to do, crashed the whole process. Fixed in
+`crates/dl-server/src/qbit/torrents.rs`: both handlers now treat an absent
+`TorrentStatus` the same way `torrents/info` already does, as "not reported
+yet" rather than a contradiction. Regression coverage:
+`properties_and_files_do_not_panic_before_the_torrent_is_known` in
+`qbit/torrents.rs`, which reproduces the exact sequence (add a magnet, ask
+about it before the backend has replied) without needing a real crash to
+prove it stopped happening.
+
+### A second real bug, found by testing "more than one category at once": a duplicate info hash silently lies
+
+Pushing the same magnet into Sonarr's category and then into Radarr's
+category (the brief's own "more than one category at once" case) produced a
+`torrents/info` entry that claimed a finished download at
+`/downloads/movies-radarr/Big Buck Bunny`, a directory that had nothing in
+it. `dl_torrent`'s own log line gives it away:
+
+```
+INFO dl_torrent: download complete; seeding torrent=Some("Big Buck Bunny")
+```
+
+logged under one second after the add, with no "added torrent" or "Doing
+initial checksum validation" line in between. librqbit's session is one per
+info hash; a second `add` for a hash already open silently attaches to
+whatever session already holds it and reports it complete immediately, at
+the *first* add's destination, while the destination the second call was
+just given is never written to at all. Real qBittorrent's own answer to
+re-adding a hash it already has is to leave the existing torrent alone,
+not to fabricate a second, phantom one. Fixed in `add_one`
+(`crates/dl-server/src/qbit/torrents.rs`): a magnet naming a hash Braid
+already has open is now a no-op, checked before a destination for the new
+request is even computed. Regression coverage:
+`re_adding_a_known_hash_under_a_different_category_does_not_create_a_second_torrent`.
+
+### `torrents/topPrio`, not `torrents/topPriority`
+
+Braid's route was named `topPriority`. Real qBittorrent's endpoint, and what
+a real Sonarr with its "Recent Priority" set to "First" actually calls
+immediately after every `torrents/add`, is `topPrio`:
+
+```
+Warn HttpClient: HTTP Error - Res: HTTP/1.1 [POST] http://braid-proxy:8080/api/v2/torrents/topPrio: 404.NotFound
+Warn QBittorrent: Failed to set the torrent priority for DD8255ECDC7CA55FB0BBF81323D87062DB1F6D1C.
+```
+
+Sonarr logs a warning and moves on rather than failing the grab, which is
+exactly why this was easy to miss: nothing about the download itself looked
+wrong. Fixed by renaming the route. Fixture:
+`sonarr_sets_top_priority_after_adding_a_magnet.json`.
+
+### `torrents/setForceStart` was missing outright, and a real Sonarr calls it
+
+With "Initial State" set to "Force Started", Sonarr's own `AddFromMagnetLink`
+calls `torrents/setForceStart` right after every add, and got a 404 for an
+endpoint that did not exist:
+
+```
+Warn HttpClient: HTTP Error - Res: HTTP/1.1 [POST] http://braid-proxy:8080/api/v2/torrents/setForceStart: 404.NotFound
+Warn QBittorrent: Failed to set ForceStart for DD8255ECDC7CA55FB0BBF81323D87062DB1F6D1C.
+```
+
+This is one of the brief's own "strong candidates", now confirmed rather than
+guessed at. Implemented: `value=true` calls `Engine::resume`, which is a real
+action this engine can take (starting a torrent regardless of its queue
+position is what "force start" means for something paused or queued);
+`value=false` is accepted and left alone, the same honesty `topPrio` already
+applies to a request (returning a torrent to ordinary queueing) this engine
+has no per-torrent flag to represent. Fixtures:
+`sonarr_sets_force_start_after_adding_a_magnet.json` for the wire exchange,
+plus a direct unit test (`set_force_start_true_resumes_a_paused_torrent`)
+proving `value=true` actually resumes a paused transfer rather than only
+acknowledging the request.
+
+### Tags on the download client never reach Braid at all, and can silently stop every grab
+
+Configuring the Sonarr/Radarr *tags* field on the Braid download client
+(distinct from a torrent's own tags) without also tagging the series or
+movie made every single grab sit at `downloadClientUnavailable` forever:
+Sonarr never called `torrents/add` at all, because it does its own routing
+decision, client-side, before ever talking to the download client, and a
+download client with tags set is only used for items carrying a matching
+tag. Nothing about this reaches the wire, and no fixture models it, because
+there is nothing for Braid to answer: the request is never sent. Worth
+recording plainly because it looks, from the queue, exactly like a broken
+download client.
+
+### Seed ratio and seeding time limits still cannot be exercised, and now we know why
+
+Neither Sonarr 4.0.20's nor Radarr 6.4.4's own qBittorrent client schema
+(`GET /api/v3/downloadclient/schema`) has a ratio or seeding-time field
+anywhere in it: `recentTvPriority`/`olderTvPriority` (and their Radarr
+equivalents), `initialState`, `sequentialOrder`, `firstAndLast` and
+`contentLayout` are the whole list. `torrents/setShareLimits` was not called
+in this run either, and now there is a reason beyond "it did not come up":
+these versions have nothing in their own settings screen that would ever
+send it. This is not a gap in Braid to close.
+
+### What else was exercised, and stayed clean
+
+- **More than one category at once**: `tv-sonarr` and `movies-radarr` ran
+  side by side without cross-talk, once the duplicate-hash bug above (found
+  by exactly this test) was fixed.
+- **`app/webapiVersion`'s repeated polling**, **Basic auth being sent and
+  ignored**, and **recovery from a `403` after a restart**: all matched the
+  first run's findings again, unchanged.
+- **`torrents/setShareLimits`, `torrents/trackers`, `torrents/peers`,
+  `app/buildInfo`, and `transfer/setDownloadLimit` / `setUploadLimit` /
+  `downloadLimit` / `uploadLimit`**: named as candidates worth watching for.
+  None appeared anywhere in this session's recordings, across both apps,
+  registration, testing, polling, and multiple real grabs with tags,
+  priorities and force-start all configured. Not implemented, on the
+  brief's own terms: a real engine-backed implementation of an endpoint
+  nothing asked for is still speculation, just speculation with working
+  code behind it.
+
+### What this run did not settle
+
+- **Removing a completed download from the client after import**
+  (`removeCompletedDownloads`, on by default in both apps' schemas) was
+  configured, but not cleanly observed. Repeated test churn in this
+  session, pushing the same magnet under three different fake episode
+  numbers so each one would dodge Sonarr's own "already meets cutoff"
+  dedup, left three queue entries all pointing at the same info hash, and
+  Sonarr's own per-episode tracking visibly could not tell them apart. A
+  single clean push-download-manual-import cycle is needed to see this for
+  real; this run does not claim to have seen it either work or fail.
+- **Pausing and resuming from the app** was not exercised. Neither app's
+  REST queue API in these versions exposes a direct pause/resume action;
+  doing this for real means driving the web UI itself, which this session
+  did not attempt.
+- **Radarr's own automatic import completing end to end** was not seen.
+  Radarr's `GET /api/v3/manualimport` correctly found and identified the
+  file by title and year with no help from the folder name, which is
+  itself real evidence the underlying file placement is fine; the `POST
+  /api/v3/command` call to actually perform that import hit a JSON schema
+  quirk in Radarr 6.4.4's own API that this session did not resolve in
+  time. Sonarr's own equivalent command did work, end to end, and both
+  applications drive the same handlers in `qbit/torrents.rs`, so this is
+  recorded as unresolved rather than as evidence of anything wrong.
