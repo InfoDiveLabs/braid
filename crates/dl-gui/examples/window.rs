@@ -88,8 +88,8 @@ impl dl_core::torrent::TorrentBackend for FakeSwarm {
                         upload_bytes_per_sec: 12 << 20,
                         peers: 61,
                         files: files.clone(),
-                        peer_list: Vec::new(),
                         interface: Some("Ethernet".into()),
+                        ..Default::default()
                     },
                     name: Some("debian-12.5-DVD".into()),
                     seeding: false,

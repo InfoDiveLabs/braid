@@ -1022,11 +1022,8 @@ impl Engine {
             };
             record.torrent = Some(TorrentStatus {
                 uploaded: outcome.uploaded,
-                upload_bytes_per_sec: 0,
-                peers: 0,
                 files: outcome.files,
-                peer_list: Vec::new(),
-                interface: None,
+                ..Default::default()
             });
         }
         Ok(())
