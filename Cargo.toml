@@ -21,6 +21,14 @@ dl-testkit = { path = "crates/dl-testkit" }
 dl-torrent = { path = "crates/dl-torrent" }
 
 anyhow = "1"
+# The one dependency this task adds. Storing a password directly, even hashed
+# with something fast like SHA-256, is what turns a single leaked config
+# directory into every instance owned at once: fast hashes are precisely what
+# GPUs are good at brute-forcing. Argon2id is the RFC 9106 recommendation for
+# this exact job, memory-hard so the same attack costs orders of magnitude
+# more, and this crate is the RustCrypto reference implementation rather than
+# a wrapper this project would otherwise have to trust blindly.
+argon2 = "0.6"
 # Pulled up from dl-testkit's own Cargo.toml, where it was pinned on its own.
 # dl-server needs the same version to mount its health check, and a second
 # independent pin is how two crates end up on two different axum minor

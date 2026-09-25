@@ -17,6 +17,7 @@ dl-net.workspace = true
 dl-torrent.workspace = true
 
 anyhow.workspace = true
+argon2.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
