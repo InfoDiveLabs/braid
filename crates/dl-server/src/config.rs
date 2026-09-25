@@ -3,6 +3,8 @@
 //! at once, because a container that refuses to start without a file that
 //! nobody wrote is a container nobody can start.
 
+use dl_core::store::Durability;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Every field name this format understands, doubling as the file's key and,
@@ -22,6 +24,8 @@ const FIELDS: &[&str] = &[
     "download_limit",
     "upload_limit",
     "auth_required",
+    "interface_limits",
+    "durability",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +39,12 @@ pub struct Config {
     pub download_limit: Option<u64>,
     pub upload_limit: Option<u64>,
     pub auth_required: bool,
+    /// Ceilings for individual interfaces, by device name. Mirrors
+    /// `dl_core::EngineConfig::interface_limits` exactly: this is where that
+    /// value lives between restarts, since `EngineConfig` itself is rebuilt
+    /// fresh every start rather than read off disk directly.
+    pub interface_limits: BTreeMap<String, u64>,
+    pub durability: Durability,
 }
 
 impl Default for Config {
@@ -58,6 +68,8 @@ impl Default for Config {
             // `docker run -p` exposes an unauthenticated file store to
             // whatever else is on that network.
             auth_required: true,
+            interface_limits: BTreeMap::new(),
+            durability: Durability::default(),
         }
     }
 }
@@ -149,9 +161,69 @@ impl Config {
                 "false" => self.auth_required = false,
                 _ => {}
             },
+            "interface_limits" => self.interface_limits = parse_interface_limits(value),
+            "durability" => {
+                if let Some(d) = Durability::parse(value) {
+                    self.durability = d;
+                }
+            }
             _ => {}
         }
     }
+
+    /// Rewrite `server.conf` in `dir` with the settings held here.
+    ///
+    /// A full rewrite rather than a patch: the settings screen is the only
+    /// writer this file ever has once a server is running, so there is no
+    /// hand-written comment or forgotten field to merge back in. Written to a
+    /// temporary name and renamed into place so a crash mid-write leaves the
+    /// previous, still-valid file rather than a half-written one the next
+    /// start would silently fall back to defaults from.
+    pub fn write(&self, dir: &Path) -> std::io::Result<()> {
+        let limits: Vec<String> =
+            self.interface_limits.iter().map(|(name, rate)| format!("{name}:{rate}")).collect();
+        let text = format!(
+            "web_port = {}\n\
+             download_dir = {}\n\
+             config_dir = {}\n\
+             torrent_port = {}\n\
+             max_concurrent = {}\n\
+             connections = {}\n\
+             download_limit = {}\n\
+             upload_limit = {}\n\
+             auth_required = {}\n\
+             interface_limits = {}\n\
+             durability = {}\n",
+            self.web_port,
+            self.download_dir.display(),
+            self.config_dir.display(),
+            self.torrent_port,
+            self.max_concurrent,
+            self.connections,
+            self.download_limit.map(|v| v.to_string()).unwrap_or_default(),
+            self.upload_limit.map(|v| v.to_string()).unwrap_or_default(),
+            self.auth_required,
+            limits.join(","),
+            self.durability.as_str(),
+        );
+        let temp = dir.join("server.conf.tmp");
+        std::fs::write(&temp, text)?;
+        std::fs::rename(&temp, dir.join("server.conf"))
+    }
+}
+
+/// `"en0:5000000,en1:0"`, comma separated `name:bytes-per-second` pairs. A
+/// rate of zero is dropped rather than kept as an explicit zero-rate entry:
+/// see `parse_limit` just below for why zero and absent mean the same thing.
+fn parse_interface_limits(value: &str) -> BTreeMap<String, u64> {
+    value
+        .split(',')
+        .filter_map(|pair| {
+            let (name, rate) = pair.split_once(':')?;
+            let rate: u64 = rate.trim().parse().ok()?;
+            (rate != 0).then(|| (name.trim().to_string(), rate))
+        })
+        .collect()
 }
 
 /// An empty value means unlimited; zero means the same thing, since a rate
@@ -207,5 +279,53 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = Config::read(dir.path(), |k| (k == "BRAID_WEB_PORT").then(|| "banana".into()));
         assert_eq!(c.web_port, 8080);
+    }
+
+    #[test]
+    fn a_settings_change_survives_being_written_and_read_back() {
+        // The settings screen writes through `write` and the next start reads
+        // through `read`; if those two disagree about the format a restart
+        // silently reverts whatever was just changed.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config { durability: Durability::Safe, ..Default::default() };
+        config.interface_limits.insert("en0".into(), 5_000_000);
+        config.interface_limits.insert("en1".into(), 1_000_000);
+        config.download_dir = dir.path().join("downloads");
+        config.connections = 12;
+        config.write(dir.path()).unwrap();
+
+        let back = Config::read(dir.path(), |_| None);
+        assert_eq!(back.durability, Durability::Safe);
+        assert_eq!(back.interface_limits.get("en0"), Some(&5_000_000));
+        assert_eq!(back.interface_limits.get("en1"), Some(&1_000_000));
+        assert_eq!(back.download_dir, dir.path().join("downloads"));
+        assert_eq!(back.connections, 12);
+    }
+
+    #[test]
+    fn an_interface_limit_of_zero_is_the_same_as_no_limit_at_all() {
+        // Matches `parse_limit`'s own rule for the global limit: a rate of
+        // zero is not a rate anyone means to set, it is "take the checkbox
+        // off", and keeping a zero entry around would have every reader of
+        // `interface_limits` re-learn that a zero here means unlimited.
+        assert_eq!(
+            parse_interface_limits("en0:0,en1:5000"),
+            BTreeMap::from([("en1".into(), 5000)])
+        );
+    }
+
+    #[test]
+    fn garbage_in_one_interface_limit_does_not_take_the_rest_down_with_it() {
+        assert_eq!(
+            parse_interface_limits("en0:5000,not-a-pair,en1:oops,en2:9000"),
+            BTreeMap::from([("en0".into(), 5000), ("en2".into(), 9000)])
+        );
+    }
+
+    #[test]
+    fn an_unknown_durability_in_the_file_keeps_the_default_rather_than_refusing_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("server.conf"), "durability = overclocked\n").unwrap();
+        assert_eq!(Config::read(dir.path(), |_| None).durability, Durability::default());
     }
 }

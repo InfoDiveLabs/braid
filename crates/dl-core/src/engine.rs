@@ -511,6 +511,17 @@ impl Engine {
         records.get(&id)?.chunks.as_ref().map(|c| c.report())
     }
 
+    /// The digest a transfer was asked to verify against, if any.
+    ///
+    /// Read off the spec rather than carried on the snapshot: only a caller
+    /// showing one transfer's detail wants this, and putting it on every row
+    /// of a list rebuilt ten times a second would cost every other reader a
+    /// clone of a digest nobody asked for.
+    pub fn expect(&self, id: DownloadId) -> Option<crate::integrity::Digest> {
+        let records = self.inner.records.lock().unwrap();
+        records.get(&id)?.spec.expect.clone()
+    }
+
     pub fn budget(&self) -> &Arc<Budget> {
         &self.inner.budget
     }
@@ -1528,6 +1539,29 @@ mod tests {
         let saved = engine.specs();
         let entry = saved.first().expect("the transfer should be in what gets written out");
         assert_eq!(entry.labels.get("category").map(String::as_str), Some("tv-sonarr"));
+    }
+
+    #[tokio::test]
+    async fn the_expected_digest_comes_back_for_a_transfer_that_asked_for_one() {
+        // A server's detail panel wants to say what a download was asked to
+        // verify against, and the spec is the only place that survives to ask.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let digest =
+            crate::integrity::Digest::parse(crate::integrity::Algorithm::Sha256, &"a".repeat(64))
+                .unwrap();
+        let mut spec = DownloadSpec::new("http://x/a.iso", "/tmp/a.iso");
+        spec.expect = Some(digest.clone());
+        let id = engine.add(spec);
+
+        // `Digest` carries no `Debug`, so this is `assert!` on `==` rather
+        // than `assert_eq!`.
+        assert!(engine.expect(id) == Some(digest));
+    }
+
+    #[test]
+    fn a_transfer_with_no_expected_digest_reports_none_not_a_panic() {
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        assert!(engine.expect(DownloadId(9999)).is_none());
     }
 
     #[tokio::test]
