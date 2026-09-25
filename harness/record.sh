@@ -56,9 +56,11 @@ api_key_from() {
 }
 
 cmd_up() {
-    mkdir -p data/braid/config data/braid/downloads
-    mkdir -p data/sonarr/config data/sonarr/downloads
-    mkdir -p data/radarr/config data/radarr/downloads
+    mkdir -p data/braid/config data/sonarr/config data/radarr/config
+    # One shared downloads directory, bind-mounted into all three containers
+    # at the same path: see the comment on braid's volumes in compose.yml for
+    # why a directory per container defeats the harness's whole purpose.
+    mkdir -p data/downloads
     mkdir -p recordings
 
     echo "building and starting the stack..."

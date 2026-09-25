@@ -1,0 +1,15 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, immediately after torrents/add, with its own Recent Priority setting configured to First",
+  "note": "Recorded as a 404: Braid's route was named topPriority, not topPrio, which is what real qBittorrent calls this endpoint and what Sonarr actually asked for. Sonarr's own AddFromMagnetLink logged 'Failed to set the torrent priority' and continued anyway, so this did not fail the grab, but it never worked either. The response here is the corrected one, now that the route is named topPrio; the request is exactly what was recorded.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v2/torrents/topPrio",
+    "content_type": "application/x-www-form-urlencoded",
+    "body": "hashes=dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c",
+    "authenticated": true
+  },
+  "response": {
+    "status": 200,
+    "body": ""
+  }
+}

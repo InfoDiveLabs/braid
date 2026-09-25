@@ -479,6 +479,87 @@ async fn torrents_info_while_downloading() {
     assert_eq!(entry["content_path"], "/downloads/tv-sonarr/Big Buck Bunny");
 }
 
+/// `torrents/topPrio`, recorded as a 404 the first time this harness ran a
+/// real Sonarr with its own Recent Priority set to First: the route was
+/// misnamed `topPriority`, which nothing on the wire ever asks for. See
+/// `harness/README.md`.
+#[tokio::test]
+async fn sonarr_sets_top_priority_after_adding_a_magnet() {
+    let fixture = fixture!("sonarr_sets_top_priority_after_adding_a_magnet");
+    let app = TestApp::no_torrents();
+    let session = app.login().await;
+
+    let response = send(&app.router(), &fixture.request, Some(&session)).await;
+
+    assert_eq!(response.status().as_u16(), fixture.response.status);
+    assert_eq!(body_text(response).await, fixture.response.body.unwrap_or_default());
+}
+
+/// `torrents/setForceStart`, recorded as a 404 the first time this harness
+/// ran a real Sonarr with its own Initial State set to Force Started: the
+/// endpoint did not exist at all. See `harness/README.md`.
+#[tokio::test]
+async fn sonarr_sets_force_start_after_adding_a_magnet() {
+    let fixture = fixture!("sonarr_sets_force_start_after_adding_a_magnet");
+    let app = TestApp::no_torrents();
+    let session = app.login().await;
+
+    let response = send(&app.router(), &fixture.request, Some(&session)).await;
+
+    assert_eq!(response.status().as_u16(), fixture.response.status);
+    assert_eq!(body_text(response).await, fixture.response.body.unwrap_or_default());
+}
+
+/// `setForceStart`'s `value=true` half is not just an acknowledgement: it
+/// genuinely resumes a paused torrent, the same real action the engine
+/// already exposes for `torrents/resume`. This is the behaviour the fixture
+/// test above cannot see, because a fresh magnet in that test is never
+/// paused to begin with.
+#[tokio::test]
+async fn set_force_start_true_resumes_a_paused_torrent() {
+    let hash = "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c";
+    let app = TestApp::with_backend(FakeTorrentBackend::new(TorrentProgress {
+        progress: Progress { downloaded: 0, total: Some(1000), ..Default::default() },
+        status: TorrentStatus { info_hash: Some(hash.to_string()), ..Default::default() },
+        name: Some("Big Buck Bunny".to_string()),
+        seeding: false,
+        phase: None,
+    }));
+    let session = app.login().await;
+    let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Big+Buck+Bunny");
+    let id = app.state.engine.add(DownloadSpec::new(magnet, app.state.config.download_dir.clone()));
+    app.state.engine.pause(id);
+    for _ in 0..200 {
+        if app.state.engine.get(id).is_some_and(|s| s.state == State::Paused) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(app.state.engine.get(id).unwrap().state, State::Paused);
+
+    let request = FixtureRequest {
+        method: "POST".into(),
+        path: "/api/v2/torrents/setForceStart".into(),
+        content_type: Some("application/x-www-form-urlencoded".into()),
+        body: Some(format!("hashes={hash}&value=true")),
+        authenticated: true,
+    };
+    let response = send(&app.router(), &request, Some(&session)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for _ in 0..200 {
+        if app.state.engine.get(id).is_some_and(|s| s.state != State::Paused) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_ne!(
+        app.state.engine.get(id).unwrap().state,
+        State::Paused,
+        "value=true must resume a paused torrent, not just acknowledge the request"
+    );
+}
+
 /// Unlike the in-progress fixture, every field here except `added_on` and
 /// `completion_on` is reproducible: a finished transfer's `eta` and
 /// `dlspeed` settle to fixed values rather than a live measurement, so this

@@ -29,7 +29,21 @@ services:
       - HOME=/config
     volumes:
       - ./data/braid/config:/config
-      - ./data/braid/downloads:/downloads
+      # Shared with sonarr and radarr below, at the same in-container path in
+      # all three. This is not a convenience: Sonarr's importer does not take
+      # qBittorrent's word for a finished download, it opens the file at the
+      # path torrents/info reported and reads it, on its own filesystem. Three
+      # separate host directories each mounted as /downloads (what this
+      # harness shipped with originally) means Braid writes real bytes that
+      # neither *arr application's container can ever see, and "no files
+      # found are eligible for import" is what that looks like once the
+      # content_path fix (see harness/README.md) gets Sonarr past its earlier,
+      # purely string-level "path matches base directory" refusal. A real
+      # qBittorrent-plus-Sonarr deployment always bind-mounts one shared
+      # downloads directory into both containers at a matching path for
+      # exactly this reason, and this harness has to do the same to be
+      # evidence of anything.
+      - ./data/downloads:/downloads
     networks:
       - harness
     # Published so record.sh and a human on the host can both reach the real
@@ -72,7 +86,7 @@ services:
       - TZ=Etc/UTC
     volumes:
       - ./data/sonarr/config:/config
-      - ./data/sonarr/downloads:/downloads
+      - ./data/downloads:/downloads
     ports:
       - "8989:8989"
     networks:
@@ -87,7 +101,7 @@ services:
       - TZ=Etc/UTC
     volumes:
       - ./data/radarr/config:/config
-      - ./data/radarr/downloads:/downloads
+      - ./data/downloads:/downloads
     ports:
       - "7878:7878"
     networks:
