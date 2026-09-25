@@ -6,6 +6,5 @@ pub mod openurl;
 pub mod platform;
 pub mod relays;
 pub mod settings;
-pub mod transfers;
 
 slint::include_modules!();

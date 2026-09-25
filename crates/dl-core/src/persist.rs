@@ -8,12 +8,18 @@
 //! Stored as flat `key = value` records separated by blank lines, the same
 //! shape and for the same reasons as `settings.conf` next to it.
 
-use dl_core::engine::{DownloadSpec, Engine, Restorable, State};
-use std::path::PathBuf;
+use crate::engine::{DownloadSpec, Engine, Restorable, State};
+use crate::integrity::{Algorithm, Digest};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-/// Where the list lives, beside the settings.
-fn path() -> Option<PathBuf> {
-    crate::settings::Settings::path().map(|p| p.with_file_name("transfers.conf"))
+/// Where the list lives, beside whatever else a front end keeps in `dir`.
+///
+/// The front end owns the notion of where its configuration lives (a
+/// platform data directory, a server's working directory, whatever it is);
+/// the engine only knows the name of its own file within it.
+fn path(dir: &Path) -> PathBuf {
+    dir.join("transfers.conf")
 }
 
 /// The state a restored transfer comes back in.
@@ -79,6 +85,12 @@ fn encode(entries: &[Restorable]) -> String {
                 expect.to_hex()
             ));
         }
+        // A `BTreeMap` rather than the insertion order a front end used,
+        // so the file a person opens by hand is stable across a save that
+        // touched none of the labels.
+        for (key, value) in &entry.labels {
+            out.push_str(&format!("label.{key} = {value}\n"));
+        }
     }
     out
 }
@@ -115,9 +127,17 @@ fn decode(text: &str) -> Vec<Restorable> {
                     .collect();
             }
             "expect" => {
-                record.expect = value.split_once(':').and_then(|(algorithm, hex)| {
-                    dl_core::Digest::parse(dl_core::Algorithm::parse(algorithm)?, hex)
-                });
+                record.expect = value
+                    .split_once(':')
+                    .and_then(|(algorithm, hex)| Digest::parse(Algorithm::parse(algorithm)?, hex));
+            }
+            // Kept for any key under `label.`, known to this build or not.
+            // A label is a front end's own compatibility detail, not a
+            // vocabulary this crate agrees to: a server upgraded to keep a
+            // new one and then downgraded must not have this file quietly
+            // erase it the next time an older build rewrites the file.
+            _ if key.starts_with("label.") => {
+                record.labels.insert(key["label.".len()..].to_string(), value.to_string());
             }
             _ => {}
         }
@@ -138,7 +158,8 @@ struct Record {
     total: Option<u64>,
     name: Option<String>,
     interfaces: Vec<String>,
-    expect: Option<dl_core::Digest>,
+    expect: Option<Digest>,
+    labels: BTreeMap<String, String>,
 }
 
 impl Default for Record {
@@ -153,6 +174,7 @@ impl Default for Record {
             name: None,
             interfaces: Vec::new(),
             expect: None,
+            labels: BTreeMap::new(),
         }
     }
 }
@@ -177,6 +199,7 @@ impl Record {
             downloaded: self.downloaded,
             total: self.total,
             name: self.name,
+            labels: self.labels,
         });
     }
 }
@@ -190,11 +213,9 @@ fn current(engine: &Engine) -> String {
 
 /// Write the list, through a temporary file so an interrupted save leaves the
 /// previous one rather than half of this one.
-fn write(text: &str) {
-    let Some(path) = path() else { return };
-    if let Some(parent) = path.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
+fn write(dir: &Path, text: &str) {
+    let path = path(dir);
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let temp = path.with_extension("conf.tmp");
@@ -209,15 +230,15 @@ fn write(text: &str) {
 /// half a dozen places (the add sheet, the tray, a magnet from the browser, the
 /// scheduler, a download simply finishing), and one of them would eventually be
 /// missed. Comparing the encoded text means an idle app writes nothing.
-pub fn spawn_autosave(engine: Engine) {
+pub fn spawn_autosave(engine: Engine, dir: PathBuf) {
     std::thread::spawn(move || {
         let mut written = current(&engine);
-        write(&written);
+        write(&dir, &written);
         loop {
             std::thread::sleep(std::time::Duration::from_secs(2));
             let now = current(&engine);
             if now != written {
-                write(&now);
+                write(&dir, &now);
                 written = now;
             }
         }
@@ -225,9 +246,8 @@ pub fn spawn_autosave(engine: Engine) {
 }
 
 /// Put back what the last run was doing. Returns how many rows came back.
-pub fn restore(engine: &Engine) -> usize {
-    let Some(path) = path() else { return 0 };
-    let Ok(text) = std::fs::read_to_string(&path) else { return 0 };
+pub fn restore(engine: &Engine, dir: &Path) -> usize {
+    let Ok(text) = std::fs::read_to_string(path(dir)) else { return 0 };
 
     let mut restored = 0;
     for mut entry in decode(&text) {
@@ -250,7 +270,13 @@ mod tests {
             downloaded: 0,
             total: None,
             name: None,
+            labels: BTreeMap::new(),
         }
+    }
+
+    /// A record for tests that do not care about its state.
+    fn record_for(url: &str) -> Restorable {
+        entry(url, State::Queued)
     }
 
     #[test]
@@ -312,17 +338,38 @@ mod tests {
     #[test]
     fn a_digest_survives_the_file() {
         let mut one = entry("https://example.test/a.iso", State::Queued);
-        one.spec.expect = dl_core::Digest::parse(dl_core::Algorithm::Sha256, &"ab".repeat(32));
+        one.spec.expect = Digest::parse(Algorithm::Sha256, &"ab".repeat(32));
         let back = decode(&encode(&[one]));
-        assert_eq!(
-            back[0].spec.expect.as_ref().map(|d| d.algorithm()),
-            Some(dl_core::Algorithm::Sha256)
-        );
+        assert_eq!(back[0].spec.expect.as_ref().map(|d| d.algorithm()), Some(Algorithm::Sha256));
     }
 
     #[test]
     fn a_corrupt_file_costs_the_records_it_could_not_read_and_no_more() {
         let back = decode("garbage\n[transfer]\nurl = https://e.test/a\ndestination = /tmp/a\n");
         assert_eq!(back.len(), 1);
+    }
+
+    #[test]
+    fn labels_survive_a_restart_and_the_engine_never_reads_them() {
+        // The server keeps a category, a pair of timestamps and whatever else a
+        // front end needs here. The engine stores them and has no opinion: a
+        // category is a qBittorrent idea, not a download one, and teaching the
+        // engine about it would put a compatibility detail in the wrong crate.
+        let mut record = record_for("https://example.test/x.iso");
+        record.labels.insert("category".into(), "tv-sonarr".into());
+        record.labels.insert("added_on".into(), "1790000000".into());
+
+        let back = decode(&encode(&[record]));
+        assert_eq!(back[0].labels.get("category").map(String::as_str), Some("tv-sonarr"));
+        assert_eq!(back[0].labels.get("added_on").map(String::as_str), Some("1790000000"));
+    }
+
+    #[test]
+    fn a_label_with_an_equals_sign_in_it_round_trips() {
+        // The file is `key = value` lines, so a value containing the separator is
+        // the case that corrupts the record after it.
+        let mut record = record_for("https://example.test/x.iso");
+        record.labels.insert("note".into(), "a=b".into());
+        assert_eq!(decode(&encode(&[record]))[0].labels.get("note").unwrap(), "a=b");
     }
 }
