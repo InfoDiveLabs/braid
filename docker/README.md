@@ -144,7 +144,7 @@ UI instead.
 not implemented.** Generic qBittorrent clients and mobile apps expect these;
 the `*arr` apps do not use them.
 
-**Nothing here is code signed or audited.** This is a beta.
+**Nothing here is code signed or audited.**
 
 Each of these is tracked under
 [qBittorrent API compatibility](https://github.com/InfoDiveLabs/braid/issues/12).
