@@ -33,6 +33,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Only for a fake `TorrentBackend` the qBittorrent-compatible torrent tests
+# drive: dl-core's own trait is written against this macro, so a test double
+# for it needs the same one.
+async-trait = "0.1"
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
