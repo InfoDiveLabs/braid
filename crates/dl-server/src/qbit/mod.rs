@@ -18,4 +18,5 @@
 
 #![allow(dead_code)]
 
+mod app;
 mod state;

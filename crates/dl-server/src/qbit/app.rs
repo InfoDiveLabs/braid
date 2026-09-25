@@ -40,29 +40,17 @@ const QBITTORRENT_VERSION: &str = "v4.6.0";
 /// gate on the application version, some on this one.
 const WEBAPI_VERSION: &str = "2.9.2";
 
-/// The cookie name qBittorrent's own clients send, matching
-/// `auth::SESSION_COOKIE`. Not imported from there: that constant is private
-/// to a module that predates this one and has no other reason to expose it,
-/// and the name is part of the wire protocol these clients speak, not an
-/// implementation detail that module happens to own.
-const SESSION_COOKIE: &str = "SID";
-
-/// Pull the session id out of a raw `Cookie` header, the same way
-/// `auth::require_auth` does for the routes that sit behind it. Duplicated
-/// rather than shared because that function is private to `auth`, which owns
-/// nothing else these routes need: reaching into it for one line of parsing
-/// would trade a few lines here for a dependency on that module's internals.
-fn session_id(headers: &HeaderMap) -> Option<&str> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    raw.split(';').find_map(|pair| {
-        let (key, value) = pair.trim().split_once('=')?;
-        (key == SESSION_COOKIE).then_some(value)
-    })
-}
-
 /// Whether this request carries a session the shared store still recognises.
+///
+/// The cookie name and the parsing come from `auth` rather than being repeated
+/// here. Two copies would be two places to change, and this one is not an
+/// implementation detail either module owns: `SID` is the name qBittorrent's
+/// clients send, so a divergence between the routes they log in through and
+/// the routes they then call would lock them out with nothing in any log
+/// saying why.
 fn authenticated(headers: &HeaderMap, sessions: &Sessions) -> bool {
-    session_id(headers).is_some_and(|id| sessions.valid(id))
+    crate::auth::cookie_value(headers, crate::auth::SESSION_COOKIE)
+        .is_some_and(|id| sessions.valid(id))
 }
 
 pub fn routes() -> Router<AppState> {
@@ -116,7 +104,7 @@ async fn login(
 /// expire, for the same reason `auth::logout` revokes rather than expires:
 /// somebody logging out means it now.
 async fn logout(Extension(sessions): Extension<Arc<Sessions>>, headers: HeaderMap) -> Response {
-    if let Some(id) = session_id(&headers) {
+    if let Some(id) = crate::auth::cookie_value(&headers, crate::auth::SESSION_COOKIE) {
         sessions.revoke(id);
     }
     (StatusCode::OK, "Ok.").into_response()

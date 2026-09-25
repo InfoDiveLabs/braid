@@ -43,7 +43,7 @@ const SESSION_ID_BYTES: usize = 32;
 /// The cookie name is not a style choice: the qBittorrent-compatible layer
 /// that will share this session store is written against exactly this name,
 /// because that is what real qBittorrent clients send.
-const SESSION_COOKIE: &str = "SID";
+pub(crate) const SESSION_COOKIE: &str = "SID";
 
 /// One line of OS randomness, base32-encoded.
 ///
@@ -312,7 +312,7 @@ fn header_str(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
 /// Pull one cookie's value out of a raw `Cookie` header. Written by hand
 /// rather than pulled in as a dependency for the one line of parsing it
 /// takes: a `key=value` pair separated by `; `.
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     let raw = header_str(headers, header::COOKIE)?;
     raw.split(';').find_map(|pair| {
         let (key, value) = pair.trim().split_once('=')?;
