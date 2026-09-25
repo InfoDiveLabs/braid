@@ -21,6 +21,16 @@ dl-testkit = { path = "crates/dl-testkit" }
 dl-torrent = { path = "crates/dl-torrent" }
 
 anyhow = "1"
+# Pulled up from dl-testkit's own Cargo.toml, where it was pinned on its own.
+# dl-server needs the same version to mount its health check, and a second
+# independent pin is how two crates end up on two different axum minor
+# versions with no one noticing until a trait bound stops matching.
+axum = "0.8"
+# Likewise pulled up from dl-net's own pin, for the same reason: dl-server's
+# health response is JSON and gains nothing from a second, possibly
+# diverging, version of serde living beside dl-net's.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 tokio = { version = "1.53", default-features = false }
 tracing = "0.1"
