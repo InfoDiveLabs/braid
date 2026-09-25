@@ -1,0 +1,14 @@
+{
+ "recorded_from": "Sonarr 4.0.20.3014, polling after the same torrent finished downloading",
+ "note": "state is stalledUP, qBittorrent's own spelling of finished and not currently uploading, not pausedUP: this transfer reached State::Seeding rather than State::Paused. On the original run this torrent had no top level folder inside it, so content_path was identical to save_path, and Sonarr's importer refused to pull files out of a directory it could not tell apart from the category's shared base folder. That fix (every torrent gets a folder of its own) shipped without ever being re-run against a real Sonarr. It has now been: this exact body, byte for byte, is what a real Sonarr 4.0.20.3014 was actually sent when it polled this same torrent after the fix, and this time Sonarr's queue accepted content_path as distinct from save_path and moved on to importing. See harness/README.md for the full end-to-end run, including the real 'downloadFolderImported' history event that followed. This is no longer a corrected guess; it is what was recorded.",
+ "request": {
+  "method": "GET",
+  "path": "/api/v2/torrents/info?category=tv-sonarr",
+  "authenticated": true
+ },
+ "response": {
+  "status": 200,
+  "content_type": "application/json",
+  "body": "[{\"added_on\": 1790338223, \"category\": \"tv-sonarr\", \"completion_on\": 1790338245, \"content_path\": \"/downloads/tv-sonarr/Big Buck Bunny\", \"dlspeed\": 0, \"eta\": 8640000, \"hash\": \"dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c\", \"name\": \"Big Buck Bunny\", \"num_leechs\": 0, \"num_seeds\": 0, \"progress\": 1.0, \"ratio\": 0.0, \"save_path\": \"/downloads/tv-sonarr\", \"size\": 276445467, \"state\": \"stalledUP\", \"tags\": \"\", \"upspeed\": 0}]"
+ }
+}

@@ -100,6 +100,25 @@ a dead link produce exactly one refresh.
 
 </td>
 </tr>
+
+<tr>
+<td width="50%" valign="top">
+
+### Runs on a server, in place of qBittorrent
+
+One container where most stacks run a torrent client plus a shell script with
+`curl` in it. Braid answers qBittorrent's own API, so Sonarr, Radarr and
+Prowlarr drive it by changing four fields in the client they already have.
+
+The direct-download half is the part that script never did properly: resume
+across restarts, a hash per chunk, and expiring links re-signed before they
+lapse.
+
+</td>
+<td width="50%" valign="top">
+<img src="assets/screenshots/server-web-ui.png" alt="The web UI, with a transfer selected and its detail panel open">
+</td>
+</tr>
 </table>
 
 ---
@@ -150,6 +169,43 @@ not match it did not come from us. Setup, pairing and troubleshooting are in the
 Checked on a Pixel 7 Pro against a real carrier: a socket bound to the cellular radio
 genuinely leaves by it, per-path session limits cut a lane when they are reached,
 sharing survives the screen locking and Doze, and pairing by code works end to end.
+
+---
+
+## Run it on a server
+
+<p align="center">
+  <img src="assets/screenshots/server-web-ui.png" alt="Braid's web UI" width="860">
+</p>
+
+`braid-server` is the same engine with no window: a container, a web UI, and an
+API. It exists because a media stack usually runs a torrent client **and**
+something else for direct downloads, and the something else is a shell script
+with `curl` in it.
+
+**It answers qBittorrent's API.** Point Sonarr, Radarr, Prowlarr or Lidarr at it
+by changing the host, port, username and password on the qBittorrent client they
+already have. Leave the category alone: that is how each app finds its own
+downloads again, and Braid keeps it across restarts.
+
+```yaml
+services:
+  braid:
+    image: ghcr.io/infodivelabs/braid:latest
+    ports: ["8080:8080", "6881:6881", "6881:6881/udp"]
+    volumes: ["./config:/config", "./downloads:/downloads"]
+    environment: [PUID=1000, PGID=1000]
+```
+
+The admin password is generated on first start and printed once to the log. Full
+instructions, including the migration, are in [`docker/README.md`](docker/README.md).
+
+Verified against a real Sonarr 4.0.20 and Radarr 6.4.4, from grab to library
+import. The API surface those clients need is covered;
+[`harness/README.md`](harness/README.md) lists what is not.
+
+To build it yourself: `cargo build --release -p dl-server`, or
+`docker build -f docker/Dockerfile .` for the image.
 
 ---
 

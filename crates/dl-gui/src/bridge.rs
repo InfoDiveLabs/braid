@@ -1675,8 +1675,7 @@ mod tests {
                 upload_bytes_per_sec: 512,
                 peers: 12,
                 files: files(&["a.bin", "b.bin"]),
-                peer_list: Vec::new(),
-                interface: None,
+                ..Default::default()
             },
         );
         let row = row_for(&snapshot, &[]);
@@ -2128,12 +2127,10 @@ mod tests {
         let mut snapshot = torrent_snapshot(
             State::Running,
             dl_core::TorrentStatus {
-                uploaded: 0,
-                upload_bytes_per_sec: 0,
                 peers: 20,
                 files: files(&["a.iso"]),
-                peer_list: Vec::new(),
                 interface: Some("en0".into()),
+                ..Default::default()
             },
         );
         snapshot.lanes = vec![LaneReport {

@@ -1,0 +1,15 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, testing its Braid download client (Radarr's own request is byte-identical apart from the category name: movies-radarr, sent under the same field name, category, not movieCategory)",
+  "note": "Sonarr's own settings screen calls this field tvCategory and Radarr's calls it movieCategory, but that is only each app's local field name for its own schema: on the wire both send the same qBittorrent form field, category, with no savePath at all. See sonarr_adds_a_magnet_with_a_category_and_no_save_path.json and harness/README.md for why an empty save path used to break every add.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v2/torrents/createCategory",
+    "content_type": "application/x-www-form-urlencoded",
+    "body": "category=tv-sonarr",
+    "authenticated": true
+  },
+  "response": {
+    "status": 200,
+    "body": ""
+  }
+}

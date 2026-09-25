@@ -1,0 +1,13 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, before it had created its own category",
+  "request": {
+    "method": "GET",
+    "path": "/api/v2/torrents/categories",
+    "authenticated": true
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{}"
+  }
+}

@@ -345,6 +345,11 @@ impl LibrqbitBackend {
                         uploaded: stats.uploaded_bytes,
                         upload_bytes_per_sec: sample.up,
                         peers: live_peers(&stats),
+                        // Known from the moment the handle exists: librqbit
+                        // parses it out of the magnet itself and only replaces
+                        // it once the real metadata resolves, so there is
+                        // never a tick where this is unknown.
+                        info_hash: Some(handle.info_hash().as_string()),
                         files,
                         peer_list: peer_list(handle),
                         interface: self.config.bind_device.clone(),

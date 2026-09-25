@@ -1,0 +1,15 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, immediately after torrents/add, with its own Initial State setting configured to Force Started",
+  "note": "Recorded as a 404: torrents/setForceStart was not implemented at all. Sonarr's own AddFromMagnetLink logged 'Failed to set ForceStart' and continued anyway, so this did not fail the grab, but Sonarr genuinely calls it on every add when this option is set, which is why it is implemented now rather than left as a stub nobody asked for. The response here is the corrected one; the request is exactly what was recorded.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v2/torrents/setForceStart",
+    "content_type": "application/x-www-form-urlencoded",
+    "body": "hashes=dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&value=true",
+    "authenticated": true
+  },
+  "response": {
+    "status": 200,
+    "body": ""
+  }
+}

@@ -227,6 +227,9 @@ struct Record {
     display_name: Option<String>,
     /// Peers, upload and file list, for a torrent. Stays `None` for HTTP.
     torrent: Option<TorrentStatus>,
+    /// See `Restorable::labels`. Held here only so a transfer restored with
+    /// some keeps them for the next time it is written back out.
+    labels: BTreeMap<String, String>,
 }
 
 /// How long the rate average takes to follow a step change.
@@ -452,6 +455,12 @@ pub struct Restorable {
     pub downloaded: u64,
     pub total: Option<u64>,
     pub name: Option<String>,
+    /// Whatever a front end wants attached to a transfer that the engine has
+    /// no business interpreting: a category, a pair of timestamps, anything
+    /// else in that vein. Carried through unread, so a compatibility detail
+    /// like a qBittorrent category never becomes something this crate has an
+    /// opinion about.
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A set of downloads with a shared bandwidth budget and a concurrency limit.
@@ -500,6 +509,52 @@ impl Engine {
     pub fn chunks(&self, id: DownloadId) -> Option<crate::chunks::ChunkReport> {
         let records = self.inner.records.lock().unwrap();
         records.get(&id)?.chunks.as_ref().map(|c| c.report())
+    }
+
+    /// Where one transfer writes its bytes, or `None` if there is no such
+    /// transfer.
+    ///
+    /// Nothing before this needed a destination back out of the engine: a
+    /// caller supplied it once, to [`Self::add`], and never had to ask again.
+    /// The qBittorrent-compatible API breaks that, because `save_path` and
+    /// `content_path` are fields somebody else's client polls for by hash.
+    pub fn destination(&self, id: DownloadId) -> Option<PathBuf> {
+        let records = self.inner.records.lock().unwrap();
+        records.get(&id).map(|r| r.spec.destination.clone())
+    }
+
+    /// The URL a transfer was asked for.
+    ///
+    /// For a magnet this is the only place the info hash exists until the
+    /// backend has joined the swarm, and a client that adds a torrent asks for
+    /// it by hash within the second. Without this the compatible API can only
+    /// answer once the backend reports, so the client sees nothing, concludes
+    /// its request was lost, and adds the same torrent again on every poll.
+    pub fn url(&self, id: DownloadId) -> Option<String> {
+        let records = self.inner.records.lock().unwrap();
+        records.get(&id).map(|r| r.spec.url.clone())
+    }
+
+    /// The labels attached to one transfer, or empty if there are none.
+    ///
+    /// [`Self::set_labels`] is write-only by design: nothing that wrote a
+    /// category needed to read it back, because the record it was attached to
+    /// carried it forward on its own. Listing transfers by category, the way
+    /// the compatible API's clients do, needs the other direction as well.
+    pub fn labels(&self, id: DownloadId) -> BTreeMap<String, String> {
+        let records = self.inner.records.lock().unwrap();
+        records.get(&id).map(|r| r.labels.clone()).unwrap_or_default()
+    }
+
+    /// The digest a transfer was asked to verify against, if any.
+    ///
+    /// Read off the spec rather than carried on the snapshot: only a caller
+    /// showing one transfer's detail wants this, and putting it on every row
+    /// of a list rebuilt ten times a second would cost every other reader a
+    /// clone of a digest nobody asked for.
+    pub fn expect(&self, id: DownloadId) -> Option<crate::integrity::Digest> {
+        let records = self.inner.records.lock().unwrap();
+        records.get(&id)?.spec.expect.clone()
     }
 
     pub fn budget(&self) -> &Arc<Budget> {
@@ -554,11 +609,33 @@ impl Engine {
                     cancel: Cancel::new(),
                     display_name,
                     torrent: None,
+                    labels: BTreeMap::new(),
                 },
             );
         }
         self.pump();
         id
+    }
+
+    /// Attach front-end metadata to a transfer that has already started.
+    ///
+    /// [`Self::add`] takes a spec and nothing else, because a spec is
+    /// everything the engine needs in order to fetch bytes. A category or a
+    /// timestamp is not that: it belongs to whoever is presenting the
+    /// transfer, and the engine's only duty is to keep it and hand it back
+    /// through [`Self::specs`] so it survives a restart with the rest of the
+    /// record.
+    ///
+    /// Without this the only way in was [`Self::restore`], which exists to put
+    /// history back at startup rather than to label something just added.
+    /// Anything a front end learned after a transfer had begun was therefore
+    /// lost at the next restart, and a category assigned by whoever asked for
+    /// the download would not be there when they came back looking for it.
+    pub fn set_labels(&self, id: DownloadId, labels: BTreeMap<String, String>) {
+        let mut records = self.inner.records.lock().unwrap();
+        if let Some(record) = records.get_mut(&id) {
+            record.labels = labels;
+        }
     }
 
     /// Stop a download, keeping everything already written.
@@ -660,6 +737,7 @@ impl Engine {
                 downloaded: r.progress.downloaded,
                 total: r.progress.total,
                 name: r.display_name.clone(),
+                labels: r.labels.clone(),
             })
             .collect()
     }
@@ -671,7 +749,7 @@ impl Engine {
     /// itself because the app restarted would be the opposite of a pause, and
     /// a finished one must not be fetched again.
     pub fn restore(&self, entry: Restorable) -> DownloadId {
-        let Restorable { spec, state, downloaded, total, name } = entry;
+        let Restorable { spec, state, downloaded, total, name, labels } = entry;
         let id = DownloadId(self.inner.next_id.fetch_add(1, Ordering::SeqCst));
         // A finished transfer with no size would render as "0 of 0 bytes", so
         // the figures come back with it rather than being rediscovered.
@@ -695,6 +773,7 @@ impl Engine {
                     display_name: name,
                     error: None,
                     cancel: Cancel::new(),
+                    labels,
                 },
             );
         }
@@ -1010,11 +1089,8 @@ impl Engine {
             };
             record.torrent = Some(TorrentStatus {
                 uploaded: outcome.uploaded,
-                upload_bytes_per_sec: 0,
-                peers: 0,
                 files: outcome.files,
-                peer_list: Vec::new(),
-                interface: None,
+                ..Default::default()
             });
         }
         Ok(())
@@ -1300,6 +1376,7 @@ mod tests {
             display_name: None,
             error: None,
             cancel: Cancel::new(),
+            labels: BTreeMap::new(),
         }
     }
 
@@ -1476,11 +1553,106 @@ mod tests {
             downloaded: 1024,
             total: Some(4096),
             name: None,
+            labels: BTreeMap::new(),
         });
         let row = engine.get(id).expect("restored");
         assert_eq!(row.state, State::Paused);
         assert_eq!(row.progress.downloaded, 1024);
         assert_eq!(row.progress.total, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn the_url_comes_back_out_so_a_magnet_can_be_identified_before_it_starts() {
+        // A magnet carries its own info hash. Until the backend has joined the
+        // swarm that URL is the only place it exists, and a client that just
+        // added a torrent asks for it by hash immediately.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let magnet = "magnet:?xt=urn:btih:2c6b6858d61da9543d4231a71db4b1c9264b0685";
+        let id = engine.add(DownloadSpec::new(magnet, "/tmp/x"));
+        assert_eq!(engine.url(id).as_deref(), Some(magnet));
+        assert_eq!(engine.url(DownloadId(9999)), None);
+    }
+
+    #[tokio::test]
+    async fn a_label_set_after_a_transfer_starts_reaches_the_record_that_is_saved() {
+        // A category is chosen by whoever asked for the download, which is
+        // after `add` has returned. Before this the only way in was `restore`,
+        // so a label learned later was dropped at the next restart: the very
+        // moment a client comes back looking for it by category.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let id = engine.add(DownloadSpec::new("http://x/a.iso", "/tmp/a.iso"));
+        engine.set_labels(id, BTreeMap::from([("category".to_string(), "tv-sonarr".to_string())]));
+
+        let saved = engine.specs();
+        let entry = saved.first().expect("the transfer should be in what gets written out");
+        assert_eq!(entry.labels.get("category").map(String::as_str), Some("tv-sonarr"));
+    }
+
+    #[tokio::test]
+    async fn the_expected_digest_comes_back_for_a_transfer_that_asked_for_one() {
+        // A server's detail panel wants to say what a download was asked to
+        // verify against, and the spec is the only place that survives to ask.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let digest =
+            crate::integrity::Digest::parse(crate::integrity::Algorithm::Sha256, &"a".repeat(64))
+                .unwrap();
+        let mut spec = DownloadSpec::new("http://x/a.iso", "/tmp/a.iso");
+        spec.expect = Some(digest.clone());
+        let id = engine.add(spec);
+
+        // `Digest` carries no `Debug`, so this is `assert!` on `==` rather
+        // than `assert_eq!`.
+        assert!(engine.expect(id) == Some(digest));
+    }
+
+    #[test]
+    fn a_transfer_with_no_expected_digest_reports_none_not_a_panic() {
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        assert!(engine.expect(DownloadId(9999)).is_none());
+    }
+
+    #[tokio::test]
+    async fn labelling_a_transfer_that_is_gone_is_ignored_rather_than_a_panic() {
+        // The caller races removal: a client can categorise something it has
+        // just deleted, and that is not an error worth taking the server down
+        // for.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        engine.set_labels(DownloadId(9999), BTreeMap::from([("a".to_string(), "b".to_string())]));
+        assert!(engine.specs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_label_written_can_be_read_back_by_id() {
+        // `set_labels` predates this and is write-only: a category survives a
+        // restart through `specs()`, which has no id to match one against.
+        // Reading one transfer's labels back by id is what the compatible
+        // API's listing needs in order to show the category it was given.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let id = engine.add(DownloadSpec::new("http://x/a.iso", "/tmp/a.iso"));
+        engine.set_labels(id, BTreeMap::from([("category".to_string(), "tv-sonarr".to_string())]));
+        assert_eq!(engine.labels(id).get("category").map(String::as_str), Some("tv-sonarr"));
+    }
+
+    #[test]
+    fn labels_for_an_unknown_transfer_are_empty_rather_than_a_panic() {
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        assert!(engine.labels(DownloadId(9999)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transfers_destination_can_be_read_back_by_id() {
+        // `save_path` and `content_path` in the compatible API are answers to
+        // a question nothing before it ever needed to ask: where a transfer,
+        // already running, is writing its bytes.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let id = engine.add(DownloadSpec::new("http://x/a.iso", "/tmp/somewhere/a.iso"));
+        assert_eq!(engine.destination(id), Some(PathBuf::from("/tmp/somewhere/a.iso")));
+    }
+
+    #[test]
+    fn the_destination_of_an_unknown_transfer_is_none() {
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        assert_eq!(engine.destination(DownloadId(9999)), None);
     }
 
     #[tokio::test]
@@ -1494,6 +1666,7 @@ mod tests {
             downloaded: 4096,
             total: None,
             name: None,
+            labels: BTreeMap::new(),
         });
         let row = engine.get(id).expect("restored");
         assert_eq!(row.progress.fraction(), Some(1.0));
@@ -1510,6 +1683,7 @@ mod tests {
             downloaded: 7,
             total: Some(9),
             name: Some("a.iso".into()),
+            labels: BTreeMap::new(),
         });
 
         let written = engine.specs();

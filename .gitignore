@@ -22,3 +22,10 @@ AGENTS.md
 /crates/dl-gui/wix/braid.ico
 /crates/dl-gui/wix/License.rtf
 /crates/dl-gui/wix/LICENSE.txt
+
+# harness/ runtime state: container volumes and one run's raw captures, both
+# specific to whichever machine ran the harness last. Nothing under
+# harness/recordings/ is source; the curated, sanitised subset of it lives in
+# crates/dl-server/tests/fixtures/ instead, and that is what is committed.
+/harness/data
+/harness/recordings

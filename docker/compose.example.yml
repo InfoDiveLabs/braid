@@ -1,0 +1,17 @@
+services:
+  braid:
+    image: braid:latest
+    container_name: braid
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - ./config:/config
+      - ./downloads:/downloads
+    environment:
+      - PUID=1000
+      - PGID=1000
+    # First start generates an admin password and prints it once, on its
+    # own line surrounded by blank lines: docker compose logs braid
