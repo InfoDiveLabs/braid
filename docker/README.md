@@ -16,12 +16,15 @@ client plus a shell script with curl in it.
   not do it, so most stacks run a torrent client plus a shell script with
   curl in it, and the script has no resume and no integrity check.
 
-**What has not been proven.** The compatible API is written against
-qBittorrent's documented surface and is covered by tests, but no real Sonarr
-or Radarr has yet driven this container end to end. What those clients
-actually require is defined by their source rather than by that
-documentation, so treat the compatibility as implemented and not yet
-witnessed. Two known gaps are listed under Limitations below.
+**How far this has been taken.** A real Sonarr 4.0.20 and Radarr 6.4.4 have
+driven this container: registered it as a qBittorrent client, pushed a
+release, and watched a real torrent download from dozens of peers to
+completion. The exchanges were recorded and replay as tests. See
+`harness/README.md` for what those clients actually ask for, which is a much
+smaller surface than qBittorrent's documented API.
+
+That run found two bugs that made the container unusable, both now fixed, and
+one limitation that is not: see Limitations below.
 
 ## Quick start
 
@@ -137,6 +140,16 @@ numbers, this will not suit you yet.
 
 **Queue priority is accepted and ignored.** `topPriority` and share limits
 are answered so clients do not error, but nothing acts on them.
+
+**A torrent whose files sit at its root, with no folder of its own, may not
+import.** Sonarr refuses it with "Path matches client base download
+directory", and it is right to: two such torrents in one category share a
+directory, and nothing tells an importer which files belong to which
+download. Real qBittorrent has a content layout setting for this and Braid
+does not implement it yet. Most torrents carry a top-level folder and are
+unaffected. This was found by pointing a real Sonarr at the container and
+watching an otherwise complete download fail to import, and it is recorded
+in `harness/README.md` with the evidence.
 
 **Nothing here is code signed or audited.** This is a beta.
 

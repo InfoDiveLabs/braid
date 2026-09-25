@@ -29,6 +29,17 @@ esac
 
 umask "$UMASK"
 
+# The image's HOME is /root, and the user we are about to become cannot write
+# there. That matters more than it sounds: the BitTorrent library keeps its
+# DHT routing cache under $HOME/.cache, so leaving HOME alone meant every
+# torrent added in this container failed for any non-root PUID, which is the
+# setup the documentation tells people to use. It was found by pointing a real
+# Sonarr at the container and watching every add fail.
+#
+# /config is the right home: it is a volume, it is already owned by PUID, and
+# anything cached there survives a restart the way a routing table should.
+export HOME=/config
+
 # setpriv rather than a user baked into the image at build time: PUID and
 # PGID are only known once the container starts, so a user created when the
 # image was built can never be the one that should own these files. setpriv
