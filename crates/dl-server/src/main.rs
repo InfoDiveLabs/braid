@@ -235,7 +235,11 @@ async fn main() -> Result<()> {
     // accepted and quietly ignored: authentication would stay on however the
     // setting was written, which is the wrong way round for a switch whose
     // whole purpose is turning it off.
-    let guarded = api::routes();
+    // The torrent half of the compatible surface goes behind the guard with
+    // Braid's own API. Its identity half does not, and must not: that is where
+    // `auth/login` lives, and a login endpoint behind a session check can
+    // never issue the session it exists to grant.
+    let guarded = api::routes().merge(qbit::torrents::routes());
     let guarded = if config.auth_required {
         guarded.layer(axum::middleware::from_fn(auth::require_auth))
     } else {

@@ -49,14 +49,26 @@ pub fn routes() -> Router<AppState> {
 
 /// A torrent's info hash, if it has one yet.
 ///
-/// A magnet or a `.torrent` URL is queued the moment it is pasted, long
-/// before the backend has anything to report; `Engine::snapshot` carries it
-/// as any other transfer until then. Everything in this module treats "has a
-/// torrent block with a hash" as the definition of "is a torrent Sonarr can
-/// see", so an HTTP download and a torrent still waiting on its metadata are
-/// both, correctly, absent from every endpoint here.
-fn torrent_hash(snapshot: &DownloadSnapshot) -> Option<String> {
-    snapshot.torrent.as_ref()?.info_hash.clone()
+/// The backend's answer when it has one, and the magnet's own when it does
+/// not. Both matter, and for different reasons.
+///
+/// A magnet carries its info hash in the URI, so the hash is knowable the
+/// instant one is pasted. Waiting for the backend to join a swarm and report
+/// back looks harmless and is not: a client adds a torrent and asks for it by
+/// hash within the second, and a listing that leaves it out until the swarm
+/// answers tells that client its request was lost. It adds the same torrent
+/// again, and again on every poll, because nothing it can see says otherwise.
+///
+/// A `.torrent` URL genuinely has no hash until the file behind it has been
+/// fetched and parsed, so those really are absent until the backend reports,
+/// and so is every HTTP download. That is correct: this endpoint exists for
+/// torrent clients, and a file download with an invented hash would be fed to
+/// a state machine we do not control.
+fn torrent_hash(engine: &Engine, snapshot: &DownloadSnapshot) -> Option<String> {
+    if let Some(hash) = snapshot.torrent.as_ref().and_then(|t| t.info_hash.clone()) {
+        return Some(hash);
+    }
+    dl_core::torrent::info_hash_of(&engine.url(snapshot.id)?)
 }
 
 fn parse_hash_list(raw: &str) -> Vec<String> {
@@ -70,12 +82,16 @@ fn parse_hash_list(raw: &str) -> Vec<String> {
 fn resolve_ids(engine: &Engine, hashes: &str) -> Vec<DownloadId> {
     let snapshots = engine.snapshot();
     if hashes.trim().eq_ignore_ascii_case("all") {
-        return snapshots.iter().filter(|s| torrent_hash(s).is_some()).map(|s| s.id).collect();
+        return snapshots
+            .iter()
+            .filter(|s| torrent_hash(engine, s).is_some())
+            .map(|s| s.id)
+            .collect();
     }
     let wanted = parse_hash_list(hashes);
     snapshots
         .iter()
-        .filter_map(|s| torrent_hash(s).map(|hash| (hash, s.id)))
+        .filter_map(|s| torrent_hash(engine, s).map(|hash| (hash, s.id)))
         .filter(|(hash, _)| wanted.contains(hash))
         .map(|(_, id)| id)
         .collect()
@@ -83,7 +99,10 @@ fn resolve_ids(engine: &Engine, hashes: &str) -> Vec<DownloadId> {
 
 fn find_by_hash(engine: &Engine, hash: &str) -> Option<DownloadSnapshot> {
     let wanted = hash.to_ascii_lowercase();
-    engine.snapshot().into_iter().find(|s| torrent_hash(s).as_deref() == Some(wanted.as_str()))
+    engine
+        .snapshot()
+        .into_iter()
+        .find(|s| torrent_hash(engine, s).as_deref() == Some(wanted.as_str()))
 }
 
 fn now_unix() -> i64 {
@@ -129,9 +148,15 @@ fn timestamps(
 /// single-file torrent, the folder for anything else. `destination` is
 /// always the folder; only a torrent naming exactly one file resolves to
 /// something more specific than that.
-fn content_path(destination: &Path, torrent: &TorrentStatus) -> PathBuf {
-    match torrent.files.as_slice() {
-        [only] => destination.join(&only.path),
+/// Where the client should look for what was downloaded.
+///
+/// A single file torrent points at the file, a multi file one at the folder.
+/// `None` means the backend has not reported yet, which is the same answer as
+/// a multi file torrent for this purpose: the folder is the honest thing to
+/// name, and it is where the contents will appear either way.
+fn content_path(destination: &Path, torrent: Option<&TorrentStatus>) -> PathBuf {
+    match torrent.map(|t| t.files.as_slice()) {
+        Some([only]) => destination.join(&only.path),
         _ => destination.to_path_buf(),
     }
 }
@@ -146,14 +171,19 @@ fn torrent_entry_json(
     let progress = &snapshot.progress;
     let complete = progress.total.is_some_and(|total| progress.downloaded >= total);
     let (added_on, completion_on) = timestamps(engine, snapshot.id, labels, complete);
-    // Filtered to entries that have one before this is ever called.
-    let torrent = snapshot.torrent.as_ref().expect("torrent_hash already checked this");
+    // A magnet is listed from the moment it is added, before the backend has
+    // joined a swarm and has anything to report: see `torrent_hash` for why
+    // that matters. So everything below is absent rather than zero until then,
+    // and absent has to read as "not yet" rather than as a measurement. This
+    // was an `expect` while the listing only ever saw torrents the backend had
+    // already reported on, and it panicked the first time one was listed
+    // before that.
+    let torrent = snapshot.torrent.as_ref();
+    let uploaded = torrent.map(|t| t.uploaded).unwrap_or(0);
+    let upload_rate = torrent.map(|t| t.upload_bytes_per_sec).unwrap_or(0);
 
-    let ratio = if progress.downloaded == 0 {
-        0.0
-    } else {
-        torrent.uploaded as f64 / progress.downloaded as f64
-    };
+    let ratio =
+        if progress.downloaded == 0 { 0.0 } else { uploaded as f64 / progress.downloaded as f64 };
 
     json!({
         "hash": hash,
@@ -164,7 +194,7 @@ fn torrent_entry_json(
         // percent complete.
         "progress": progress.fraction().unwrap_or(0.0) as f64,
         "dlspeed": progress.bytes_per_sec,
-        "upspeed": torrent.upload_bytes_per_sec,
+        "upspeed": upload_rate,
         "eta": eta_seconds(progress),
         "state": qbit_state(snapshot),
         "category": labels.get("category").cloned().unwrap_or_default(),
@@ -203,7 +233,7 @@ async fn list_torrents(
         .snapshot()
         .into_iter()
         .filter_map(|snapshot| {
-            let hash = torrent_hash(&snapshot)?;
+            let hash = torrent_hash(&state.engine, &snapshot)?;
             if let Some(wanted) = &wanted_hashes
                 && !wanted.contains(&hash)
             {
@@ -696,7 +726,7 @@ async fn sync_maindata(State(state): State<AppState>) -> Json<Value> {
 
     let mut torrents = Map::new();
     for snapshot in &snapshots {
-        let Some(hash) = torrent_hash(snapshot) else { continue };
+        let Some(hash) = torrent_hash(&state.engine, snapshot) else { continue };
         let labels = state.engine.labels(snapshot.id);
         let destination = state.engine.destination(snapshot.id).unwrap_or_default();
         let entry = torrent_entry_json(&state.engine, snapshot, &hash, &labels, &destination);

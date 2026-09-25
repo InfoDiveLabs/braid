@@ -10,13 +10,6 @@
 //! of its own states, not ours: they are what somebody else's parser expects
 //! to find, and are not free to be renamed or tidied to taste.
 
-//!
-//! Written before its caller, and allowed to be, which is the point. It was
-//! built and tested on its own precisely because it is the risky part, ahead
-//! of the listing endpoint that will be its only caller. Lift the allow below
-//! when that lands.
-
-#![allow(dead_code)]
-
 pub(crate) mod app;
 mod state;
+pub(crate) mod torrents;

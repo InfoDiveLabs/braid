@@ -523,6 +523,18 @@ impl Engine {
         records.get(&id).map(|r| r.spec.destination.clone())
     }
 
+    /// The URL a transfer was asked for.
+    ///
+    /// For a magnet this is the only place the info hash exists until the
+    /// backend has joined the swarm, and a client that adds a torrent asks for
+    /// it by hash within the second. Without this the compatible API can only
+    /// answer once the backend reports, so the client sees nothing, concludes
+    /// its request was lost, and adds the same torrent again on every poll.
+    pub fn url(&self, id: DownloadId) -> Option<String> {
+        let records = self.inner.records.lock().unwrap();
+        records.get(&id).map(|r| r.spec.url.clone())
+    }
+
     /// The labels attached to one transfer, or empty if there are none.
     ///
     /// [`Self::set_labels`] is write-only by design: nothing that wrote a
@@ -1536,6 +1548,18 @@ mod tests {
         assert_eq!(row.state, State::Paused);
         assert_eq!(row.progress.downloaded, 1024);
         assert_eq!(row.progress.total, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn the_url_comes_back_out_so_a_magnet_can_be_identified_before_it_starts() {
+        // A magnet carries its own info hash. Until the backend has joined the
+        // swarm that URL is the only place it exists, and a client that just
+        // added a torrent asks for it by hash immediately.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let magnet = "magnet:?xt=urn:btih:2c6b6858d61da9543d4231a71db4b1c9264b0685";
+        let id = engine.add(DownloadSpec::new(magnet, "/tmp/x"));
+        assert_eq!(engine.url(id).as_deref(), Some(magnet));
+        assert_eq!(engine.url(DownloadId(9999)), None);
     }
 
     #[tokio::test]
