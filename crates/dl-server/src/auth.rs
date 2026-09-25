@@ -397,7 +397,10 @@ mod tests {
         // Without this, any page the user visits can drive their download client.
         assert!(!origin_allowed(Some("https://evil.test"), "localhost:8080"));
         assert!(origin_allowed(Some("http://localhost:8080"), "localhost:8080"));
-        assert!(origin_allowed(None, "localhost:8080"), "a client that sends none is not a browser");
+        assert!(
+            origin_allowed(None, "localhost:8080"),
+            "a client that sends none is not a browser"
+        );
     }
 
     /// Send one request through a real socket rather than calling the router
@@ -415,8 +418,7 @@ mod tests {
         });
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let cookie_line =
-            session.map(|id| format!("Cookie: SID={id}\r\n")).unwrap_or_default();
+        let cookie_line = session.map(|id| format!("Cookie: SID={id}\r\n")).unwrap_or_default();
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{cookie_line}\r\n"
         );
@@ -461,4 +463,59 @@ mod tests {
             );
         }
     }
+}
+
+/// The way in.
+///
+/// Outside the middleware, necessarily: a client with no session cannot be
+/// asked for one in order to get one. These are the only two routes on the
+/// server that answer without a cookie, which is why they live here beside the
+/// check rather than among the transfer endpoints, where a reader would have
+/// to notice the exemption.
+///
+/// The qBittorrent-compatible API will grow its own login later. It issues
+/// into this same store rather than a second one, so a client that logged in
+/// one way is not mysteriously unauthenticated the other.
+pub fn routes() -> axum::Router<crate::state::AppState> {
+    axum::Router::new()
+        .route("/api/v1/login", axum::routing::post(login))
+        .route("/api/v1/logout", axum::routing::post(logout))
+}
+
+#[derive(serde::Deserialize)]
+struct Login {
+    username: String,
+    password: String,
+}
+
+async fn login(
+    Extension(sessions): Extension<std::sync::Arc<Sessions>>,
+    Extension(credentials): Extension<std::sync::Arc<Credentials>>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Login>,
+) -> Response {
+    if !credentials.verify(&body.username, &body.password) {
+        // Deliberately not distinguishing a wrong name from a wrong password,
+        // which would tell an attacker which half to keep guessing at.
+        return (StatusCode::FORBIDDEN, "wrong username or password").into_response();
+    }
+    let id = sessions.issue();
+    let cookie = session_cookie(&id, request_is_secure(&headers));
+    match header::HeaderValue::from_str(&cookie) {
+        Ok(value) => ([(header::SET_COOKIE, value)], StatusCode::NO_CONTENT).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn logout(
+    Extension(sessions): Extension<std::sync::Arc<Sessions>>,
+    headers: HeaderMap,
+) -> Response {
+    // Revoked rather than left to expire: somebody logging out on a shared
+    // machine means it now, and a session that outlives the request is exactly
+    // what they were trying to prevent.
+    if let Some(id) = cookie_value(&headers, SESSION_COOKIE) {
+        sessions.revoke(id);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }

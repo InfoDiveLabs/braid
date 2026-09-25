@@ -19,7 +19,10 @@
 //! wires up for a container: same engine, same network layer, same torrent
 //! backend, answering requests instead of drawing a UI.
 
+mod api;
+mod auth;
 mod config;
+mod qbit;
 mod state;
 
 use anyhow::Result;
@@ -175,15 +178,51 @@ async fn main() -> Result<()> {
         },
     )));
 
-    // `dl-gui` restores its transfer list here through `dl_core::persist`.
-    // That module does not exist in this worktree yet (another task is
-    // adding transfer persistence separately), so restoration is skipped
-    // rather than reimplemented: inventing a second, incompatible on-disk
-    // format for the same job would leave the project with two of them to
-    // reconcile later instead of one to finish.
+    // Put back whatever was running when this container was last stopped, and
+    // keep writing it out from here on. Two seconds of granularity is what
+    // `spawn_autosave` offers and it is enough: the journal already makes the
+    // bytes safe, so the most a hard kill costs is the list forgetting a
+    // transfer that was added in the last tick.
+    let restored = dl_core::persist::restore(&engine, &config.config_dir);
+    if restored > 0 {
+        tracing::info!(restored, "transfers put back from the last run");
+    }
+    dl_core::persist::spawn_autosave(engine.clone(), config.config_dir.clone());
+
+    // Read once and shared: the compatible API's login endpoint issues into
+    // the same store the rest of the server checks against, so a client that
+    // logs in one way is not mysteriously unauthenticated the other.
+    let (credentials, generated) = auth::Credentials::load_or_create(&config.config_dir)?;
+    if let Some(password) = generated {
+        auth::announce_generated_password(&password);
+    }
+    auth::warn_if_disabled(config.auth_required);
+    let sessions = Arc::new(auth::Sessions::default());
 
     let state = AppState { engine, config: config.clone() };
-    let app = axum::Router::new().route("/health", get(health)).with_state(state);
+
+    // `/health` stays outside the middleware deliberately. A container runtime
+    // polls it and has nowhere to put a password, so requiring one would mean
+    // the orchestrator declaring the container unhealthy forever.
+    // Applied by adding the layer or not, rather than by passing a flag the
+    // middleware checks. `require_auth` reads its session store from an
+    // extension and takes no state, so a flag handed to it here would be
+    // accepted and quietly ignored: authentication would stay on however the
+    // setting was written, which is the wrong way round for a switch whose
+    // whole purpose is turning it off.
+    let guarded = api::routes();
+    let guarded = if config.auth_required {
+        guarded.layer(axum::middleware::from_fn(auth::require_auth))
+    } else {
+        guarded
+    };
+    let app = axum::Router::new()
+        .route("/health", get(health))
+        .merge(auth::routes())
+        .merge(guarded)
+        .with_state(state)
+        .layer(axum::Extension(Arc::clone(&sessions)))
+        .layer(axum::Extension(Arc::new(credentials)));
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.web_port)).await?;
     tracing::info!(port = config.web_port, "listening");

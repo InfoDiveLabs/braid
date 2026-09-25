@@ -209,7 +209,7 @@ async fn add_transfer(State(state): State<AppState>, Json(body): Json<NewTransfe
 
     let id = state.engine.add(spec);
     if let Some(category) = body.category {
-        set_category(id, category);
+        set_category(&state.engine, id, category);
     }
 
     let snapshot = state.engine.get(id).expect("just added, cannot have vanished already");
@@ -296,35 +296,24 @@ async fn delete_transfer(
     if state.engine.get(id).is_none() {
         return not_found();
     }
+    // The labels go with the record when it does: nothing to clear.
     state.engine.remove_with_files(id, query.delete_files);
-    clear_category(id);
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Categories, by transfer id.
+/// Record which category a transfer was added under.
 ///
 /// A category is a qBittorrent idea and `DownloadSpec` must never learn it
-/// exists, which is why this is not a field on the spec. It belongs beside
-/// the persisted record's own label map (`dl_core::engine::Restorable::labels`,
-/// written out by `dl_core::persist`), but `Engine::add` has no hook for
-/// attaching a label at creation time: only `Engine::restore` takes one, and
-/// that path exists for putting history back at startup, not for a transfer
-/// just added over this endpoint. Held here, in memory, until the engine
-/// grows that hook, which is also why a category does not yet survive a
-/// restart the way the rest of a transfer does.
-static CATEGORIES: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<u64, String>>> =
-    std::sync::OnceLock::new();
-
-fn categories() -> &'static std::sync::Mutex<std::collections::BTreeMap<u64, String>> {
-    CATEGORIES.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
-}
-
-fn set_category(id: DownloadId, category: String) {
-    categories().lock().unwrap().insert(id.0, category);
-}
-
-fn clear_category(id: DownloadId) {
-    categories().lock().unwrap().remove(&id.0);
+/// exists, which is why it is not a field on the spec. It lives in the
+/// engine's label map instead, which the engine stores and hands back without
+/// ever reading: see `Engine::set_labels`.
+///
+/// It has to persist, and not merely for tidiness. A client polls for its own
+/// category to find the downloads it is waiting on, so a category lost at
+/// restart means that after any restart the client asks for its work, is told
+/// there is none, and quietly gives up on everything in flight.
+fn set_category(engine: &dl_core::engine::Engine, id: DownloadId, category: String) {
+    engine.set_labels(id, std::collections::BTreeMap::from([("category".to_string(), category)]));
 }
 
 #[cfg(test)]

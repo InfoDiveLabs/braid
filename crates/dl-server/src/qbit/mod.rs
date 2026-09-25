@@ -10,6 +10,12 @@
 //! of its own states, not ours: they are what somebody else's parser expects
 //! to find, and are not free to be renamed or tidied to taste.
 
-mod state;
+//!
+//! Written before its caller, and allowed to be, which is the point. It was
+//! built and tested on its own precisely because it is the risky part, ahead
+//! of the listing endpoint that will be its only caller. Lift the allow below
+//! when that lands.
 
-pub use state::{eta_seconds, qbit_state};
+#![allow(dead_code)]
+
+mod state;

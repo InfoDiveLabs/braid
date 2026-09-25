@@ -571,6 +571,27 @@ impl Engine {
         id
     }
 
+    /// Attach front-end metadata to a transfer that has already started.
+    ///
+    /// [`Self::add`] takes a spec and nothing else, because a spec is
+    /// everything the engine needs in order to fetch bytes. A category or a
+    /// timestamp is not that: it belongs to whoever is presenting the
+    /// transfer, and the engine's only duty is to keep it and hand it back
+    /// through [`Self::specs`] so it survives a restart with the rest of the
+    /// record.
+    ///
+    /// Without this the only way in was [`Self::restore`], which exists to put
+    /// history back at startup rather than to label something just added.
+    /// Anything a front end learned after a transfer had begun was therefore
+    /// lost at the next restart, and a category assigned by whoever asked for
+    /// the download would not be there when they came back looking for it.
+    pub fn set_labels(&self, id: DownloadId, labels: BTreeMap<String, String>) {
+        let mut records = self.inner.records.lock().unwrap();
+        if let Some(record) = records.get_mut(&id) {
+            record.labels = labels;
+        }
+    }
+
     /// Stop a download, keeping everything already written.
     pub fn pause(&self, id: DownloadId) {
         let mut records = self.inner.records.lock().unwrap();
@@ -1492,6 +1513,31 @@ mod tests {
         assert_eq!(row.state, State::Paused);
         assert_eq!(row.progress.downloaded, 1024);
         assert_eq!(row.progress.total, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn a_label_set_after_a_transfer_starts_reaches_the_record_that_is_saved() {
+        // A category is chosen by whoever asked for the download, which is
+        // after `add` has returned. Before this the only way in was `restore`,
+        // so a label learned later was dropped at the next restart: the very
+        // moment a client comes back looking for it by category.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        let id = engine.add(DownloadSpec::new("http://x/a.iso", "/tmp/a.iso"));
+        engine.set_labels(id, BTreeMap::from([("category".to_string(), "tv-sonarr".to_string())]));
+
+        let saved = engine.specs();
+        let entry = saved.first().expect("the transfer should be in what gets written out");
+        assert_eq!(entry.labels.get("category").map(String::as_str), Some("tv-sonarr"));
+    }
+
+    #[tokio::test]
+    async fn labelling_a_transfer_that_is_gone_is_ignored_rather_than_a_panic() {
+        // The caller races removal: a client can categorise something it has
+        // just deleted, and that is not an error worth taking the server down
+        // for.
+        let engine = Engine::new(Arc::new(NoFactory), EngineConfig::default(), Budget::unlimited());
+        engine.set_labels(DownloadId(9999), BTreeMap::from([("a".to_string(), "b".to_string())]));
+        assert!(engine.specs().is_empty());
     }
 
     #[tokio::test]
