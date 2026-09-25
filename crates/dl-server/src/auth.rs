@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// The only account this server knows about.
 ///
@@ -109,6 +109,15 @@ fn parse_hash(text: &str) -> Option<String> {
         .map(|(_, value)| value.to_string())
 }
 
+/// Write the credentials file through a temporary name and rename it into
+/// place, so a save that never finishes (a crash, a killed container) leaves
+/// whichever file was already there rather than half of the new one. A
+/// half-written credentials file means nobody can log in, and the only fix on
+/// record is deleting it and losing the account entirely; a change of
+/// password is exactly the moment that risk is easiest to hit, since it is
+/// the one write this file ever gets after the container has already been
+/// running a while. Mirrors `dl_core::persist`'s own write-then-rename for
+/// the transfer list, for the same reason.
 fn write_credentials_file(path: &Path, hash: &str) -> io::Result<()> {
     let contents = format!(
         "# Generated once, on first start. The password itself is never written\n\
@@ -116,20 +125,23 @@ fn write_credentials_file(path: &Path, hash: &str) -> io::Result<()> {
          # exactly once. Delete this file to have a new one generated.\n\
          {CREDENTIALS_KEY} = {hash}\n"
     );
-    fs::write(path, contents)?;
+    let temp = path.with_extension("conf.tmp");
+    fs::write(&temp, contents)?;
 
     // Nothing here is secret that the hash alone would give away quickly, but
     // a credentials file the rest of the container can read is one more thing
-    // an unrelated bug in some other process could leak.
+    // an unrelated bug in some other process could leak. Set on the temporary
+    // file before the rename, so the file that lands at `path` never spends
+    // even an instant with the default, more permissive mode.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)?.permissions();
+        let mut perms = fs::metadata(&temp)?.permissions();
         perms.set_mode(0o600);
-        fs::set_permissions(path, perms)?;
+        fs::set_permissions(&temp, perms)?;
     }
 
-    Ok(())
+    fs::rename(&temp, path)
 }
 
 fn hash_password(password: &str) -> io::Result<String> {
@@ -139,10 +151,38 @@ fn hash_password(password: &str) -> io::Result<String> {
         .map_err(|e| io::Error::other(format!("could not hash the generated password: {e}")))
 }
 
+/// The shortest a chosen password may be.
+///
+/// The generated one is 26 characters, so this only ever refuses somebody
+/// deliberately picking something weaker than what they were handed.
+pub(crate) const MIN_PASSWORD_LEN: usize = 12;
+
+/// Why a password change was refused.
+#[derive(Debug)]
+pub(crate) enum PasswordChangeError {
+    /// Deliberately carries nothing about which half of the attempt was
+    /// wrong: there is only one field to get wrong here, but the reasoning is
+    /// the same as `Credentials::verify`'s.
+    WrongCurrentPassword,
+    /// Carries the limit so the caller can say it: it is not a secret, and
+    /// refusing silently would leave someone guessing what "too short" means.
+    TooShort,
+    Io(io::Error),
+}
+
 /// The one account this server has, and what it takes to prove you are it.
+///
+/// The hash lives behind an `Arc<Mutex<_>>` rather than a plain `String`
+/// because it is no longer fixed for the life of the process once a password
+/// can be changed: a login and a change racing each other have to agree on
+/// one hash at a time, not read a half-updated one. `Arc` keeps `Credentials`
+/// itself cheap to hand out by value (see the qBittorrent-compatible layer's
+/// own tests, which build a fresh router per request from one), and a clone
+/// still means the same account rather than a fork of it, which is exactly
+/// what changing the password through either handle has to guarantee.
 #[derive(Clone, Debug)]
 pub struct Credentials {
-    hash: String,
+    hash: Arc<Mutex<String>>,
 }
 
 impl Credentials {
@@ -160,7 +200,7 @@ impl Credentials {
 
         if let Ok(text) = fs::read_to_string(&path) {
             return match parse_hash(&text) {
-                Some(hash) => Ok((Credentials { hash }, None)),
+                Some(hash) => Ok((Credentials { hash: Arc::new(Mutex::new(hash)) }, None)),
                 // The file exists but does not parse. Generating a new
                 // password and silently overwriting it would throw away
                 // whatever an operator meant by editing it; better to fail
@@ -176,7 +216,7 @@ impl Credentials {
         let password = generate_password();
         let hash = hash_password(&password)?;
         write_credentials_file(&path, &hash)?;
-        Ok((Credentials { hash }, Some(password)))
+        Ok((Credentials { hash: Arc::new(Mutex::new(hash)) }, Some(password)))
     }
 
     /// Check a login attempt. Only `admin` exists, so any other name is
@@ -186,8 +226,40 @@ impl Credentials {
         if username != USERNAME {
             return false;
         }
-        let Ok(parsed) = PasswordHash::new(&self.hash) else { return false };
+        let hash = self.hash.lock().unwrap();
+        let Ok(parsed) = PasswordHash::new(&hash) else { return false };
         argon2::Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+    }
+
+    /// Replace the password, having first proven the caller already knows the
+    /// current one.
+    ///
+    /// The current password is required even though a caller reaching this at
+    /// all has already passed the session check: a session cookie left open
+    /// on a shared machine is exactly the case that check cannot catch, and
+    /// asking again costs the legitimate user one field. `config_dir` is the
+    /// directory `credentials.conf` lives in, the same one `load_or_create`
+    /// was given at startup.
+    pub(crate) fn change_password(
+        &self,
+        config_dir: &Path,
+        current: &str,
+        new: &str,
+    ) -> Result<(), PasswordChangeError> {
+        if !self.verify(USERNAME, current) {
+            return Err(PasswordChangeError::WrongCurrentPassword);
+        }
+        if new.len() < MIN_PASSWORD_LEN {
+            return Err(PasswordChangeError::TooShort);
+        }
+        let hash = hash_password(new).map_err(PasswordChangeError::Io)?;
+        write_credentials_file(&config_dir.join("credentials.conf"), &hash)
+            .map_err(PasswordChangeError::Io)?;
+        // Only after the file is safely down: a login racing this call has to
+        // see one consistent story, and disk is the copy that survives a
+        // restart, so it has to be the one that changes first.
+        *self.hash.lock().unwrap() = hash;
+        Ok(())
     }
 }
 
@@ -246,6 +318,18 @@ impl Sessions {
     /// for anyone who had it, for as long as that countdown ran.
     pub fn revoke(&self, id: &str) {
         self.active.lock().unwrap().remove(id);
+    }
+
+    /// End every session except `keep`.
+    ///
+    /// A password change is exactly what somebody does when they suspect a
+    /// session is loose somewhere else, so leaving those alive would defeat
+    /// the point of changing it. `keep` is spared on purpose: logging someone
+    /// out of the page they are standing on, as a reward for the good
+    /// security hygiene of changing their password, is hostile rather than
+    /// safe.
+    pub fn revoke_all_except(&self, keep: &str) {
+        self.active.lock().unwrap().retain(|id| id == keep);
     }
 }
 
@@ -390,6 +474,50 @@ mod tests {
         assert!(s.valid(&id));
         s.revoke(&id);
         assert!(!s.valid(&id), "logging out must end the session, not expire it later");
+    }
+
+    #[test]
+    fn revoke_all_except_spares_only_the_one_session_named() {
+        let s = Sessions::default();
+        let keep = s.issue();
+        let other_one = s.issue();
+        let other_two = s.issue();
+        s.revoke_all_except(&keep);
+        assert!(s.valid(&keep), "the caller's own session must survive its own request");
+        assert!(!s.valid(&other_one));
+        assert!(!s.valid(&other_two));
+    }
+
+    #[test]
+    fn a_crash_midway_through_saving_cannot_leave_an_unusable_file() {
+        // A save is a write to a temporary file followed by a rename. The
+        // only two places a crash can land are inside that write, before the
+        // temporary file even exists in a readable form, or after the rename,
+        // once the new file is already published; either way the file a
+        // restart actually reads is never a half-written one.
+        let dir = tempfile::tempdir().unwrap();
+        let (credentials, old_password) = Credentials::load_or_create(dir.path()).unwrap();
+        let old_password = old_password.unwrap();
+
+        let path = dir.path().join("credentials.conf");
+        let temp = path.with_extension("conf.tmp");
+
+        // Stand in for a crash after the temporary file was written but
+        // before the rename that would have published it: leave garbage
+        // sitting at the temporary path and touch nothing else.
+        std::fs::write(&temp, b"not a credentials line at all").unwrap();
+        let untouched = std::fs::read_to_string(&path).unwrap();
+        assert!(parse_hash(&untouched).is_some(), "the real file must still parse");
+        assert!(credentials.verify("admin", &old_password), "and still hold the old password");
+
+        // Now let a real change complete, the same write-then-rename the
+        // interrupted one above never reached the end of.
+        let new_password = "a-fresh-password-of-plenty-of-length";
+        credentials.change_password(dir.path(), &old_password, new_password).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(parse_hash(&after).is_some(), "the file left behind must still parse");
+        assert!(credentials.verify("admin", new_password));
+        assert!(!credentials.verify("admin", &old_password));
     }
 
     #[test]

@@ -147,6 +147,7 @@ async function boot() {
   wireAddForm();
   wireDetailPanel();
   wireSettingsForm();
+  wirePasswordForm();
   wireDropZone();
   wireFilterBar();
   wireSortableHeaders();
@@ -1160,6 +1161,72 @@ async function saveSettings() {
   } else {
     status.textContent = body.error || "Could not save settings.";
   }
+}
+
+/* ================================================================ password */
+
+function wirePasswordForm() {
+  const form = document.getElementById("password-form");
+  const errorBox = document.getElementById("password-error");
+  const successBox = document.getElementById("password-success");
+  const status = document.getElementById("password-status");
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    errorBox.hidden = true;
+    successBox.hidden = true;
+
+    const current = document.getElementById("password-current").value;
+    const next = document.getElementById("password-new").value;
+    const confirm = document.getElementById("password-confirm").value;
+
+    // Caught here rather than left for the server: a mismatch is a typo, not
+    // something worth a round trip to find out about.
+    if (next !== confirm) {
+      errorBox.textContent = "The new password and its confirmation do not match.";
+      errorBox.hidden = false;
+      return;
+    }
+
+    status.textContent = "Saving…";
+    // A plain `fetch` here, not the shared `api()`/`apiJson()` helpers: those
+    // treat every 403 as a session that has expired and send the whole page
+    // back to the login screen, which is right for every other endpoint but
+    // wrong for this one. Here a 403 means the current password typed above
+    // was wrong, not that the session looking at this page is no longer any
+    // good, and it must not be treated as the same thing.
+    let response;
+    try {
+      response = await fetch("/api/v1/password", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ current_password: current, new_password: next }),
+      });
+    } catch (err) {
+      status.textContent = "";
+      errorBox.textContent = "Could not reach the server.";
+      errorBox.hidden = false;
+      return;
+    }
+    status.textContent = "";
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      errorBox.textContent =
+        response.status === 403
+          ? "The current password was not correct."
+          : body.error || "Could not change the password.";
+      errorBox.hidden = false;
+      return;
+    }
+
+    // Cleared rather than left sitting in the fields: nothing about this
+    // page needs any of the three values a moment after they were sent.
+    form.reset();
+    successBox.textContent = "Password changed. Every other session was signed out; this one was not.";
+    successBox.hidden = false;
+  });
 }
 
 /* =================================================================== go */

@@ -261,6 +261,33 @@
               <span id="settings-status" class="muted" role="status"></span>
             </div>
           </form>
+
+          <form id="password-form">
+            <div class="group">
+              <h3 class="group-title">PASSWORD</h3>
+              <div class="row">
+                <span class="row-label">Current password</span>
+                <input id="password-current" type="password" class="row-input" autocomplete="current-password" required>
+              </div>
+              <div class="row">
+                <span class="row-label">New password</span>
+                <input id="password-new" type="password" class="row-input" autocomplete="new-password" minlength="12" required>
+              </div>
+              <div class="row">
+                <span class="row-label">Confirm new password</span>
+                <input id="password-confirm" type="password" class="row-input" autocomplete="new-password" required>
+              </div>
+              <p class="group-note">At least 12 characters. Changing it signs out every other
+                session on this account, but not this one.</p>
+              <p id="password-error" class="error-text" hidden></p>
+              <p id="password-success" class="success-text" hidden></p>
+            </div>
+
+            <div class="settings-actions">
+              <button type="submit" class="btn btn-primary">Change password</button>
+              <span id="password-status" class="muted" role="status"></span>
+            </div>
+          </form>
         </div>
       </section>
 
