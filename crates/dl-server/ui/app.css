@@ -68,6 +68,13 @@
   }
 }
 
+/* The `hidden` attribute is only a user-agent default of `display: none`,
+ * which any author rule for the same element (`display: flex`, `display:
+ * grid`, ...) silently overrides. Every `el.hidden = true/false` toggle in
+ * app.js depends on `hidden` actually winning, so this has to sit ahead of
+ * every other display rule in the file and carry !important to do it. */
+[hidden] { display: none !important; }
+
 * { box-sizing: border-box; }
 
 html, body {
