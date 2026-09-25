@@ -146,6 +146,9 @@ the `*arr` apps do not use them.
 
 **Nothing here is code signed or audited.** This is a beta.
 
+Each of these is tracked under
+[qBittorrent API compatibility](https://github.com/InfoDiveLabs/braid/issues/12).
+
 ## If something does not work
 
 The most useful thing you can send is what the client actually asked for
