@@ -1,0 +1,13 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, immediately after creating tv-sonarr",
+  "request": {
+    "method": "GET",
+    "path": "/api/v2/torrents/categories",
+    "authenticated": true
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"tv-sonarr\":{\"name\":\"tv-sonarr\",\"savePath\":\"\"}}"
+  }
+}

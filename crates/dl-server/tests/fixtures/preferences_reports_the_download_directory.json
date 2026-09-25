@@ -1,0 +1,13 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, once per test/save cycle, download_dir was /downloads",
+  "request": {
+    "method": "GET",
+    "path": "/api/v2/app/preferences",
+    "authenticated": true
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"save_path\":\"/downloads\",\"max_ratio_enabled\":false,\"max_ratio\":-1.0,\"max_seeding_time_enabled\":false,\"max_seeding_time\":-1,\"dl_limit\":0,\"up_limit\":0}"
+  }
+}

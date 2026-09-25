@@ -1,0 +1,13 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, the last call of its test-the-download-client cycle",
+  "request": {
+    "method": "GET",
+    "path": "/api/v2/torrents/info?category=tv-sonarr",
+    "authenticated": true
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "[]"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, first thing it sends when testing a new download client, before any login attempt",
+  "note": "Real qBittorrent clients probe a version endpoint unauthenticated before logging in. Sonarr sends an HTTP Basic Authorization header on this and every later request too, which the fixture keeps as evidence, but Braid answers on the SID cookie alone and ignores Basic entirely: the 403 here comes from having no cookie, not from a bad Basic header.",
+  "request": {
+    "method": "GET",
+    "path": "/api/v2/app/webapiVersion",
+    "authenticated": false
+  },
+  "response": {
+    "status": 403,
+    "body": ""
+  }
+}

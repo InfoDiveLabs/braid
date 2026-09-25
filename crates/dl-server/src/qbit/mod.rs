@@ -11,5 +11,7 @@
 //! to find, and are not free to be renamed or tidied to taste.
 
 pub(crate) mod app;
+#[cfg(test)]
+mod fixture_tests;
 mod state;
 pub(crate) mod torrents;
