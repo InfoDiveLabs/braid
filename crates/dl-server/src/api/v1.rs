@@ -14,12 +14,17 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use dl_core::chunks::ChunkReport;
-use dl_core::engine::{DownloadId, DownloadSnapshot, DownloadSpec};
+use dl_core::engine::{
+    DownloadId, DownloadSnapshot, DownloadSpec, EngineConfig, State as TransferState,
+};
 use dl_core::integrity::{Algorithm, Digest};
 use dl_core::lane::LaneReport;
-use dl_core::torrent::{TorrentFile, TorrentStatus, TransferKind, classify};
+use dl_core::store::Durability;
+use dl_core::torrent::{TorrentFile, TorrentPeer, TorrentStatus, TransferKind, classify};
+use dl_net::iface::InterfaceProvider as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub(super) fn routes() -> Router<AppState> {
@@ -29,6 +34,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/api/v1/transfers/{id}/pieces", get(get_pieces))
         .route("/api/v1/transfers/{id}/pause", post(pause_transfer))
         .route("/api/v1/transfers/{id}/resume", post(resume_transfer))
+        .route("/api/v1/settings", get(get_settings).post(update_settings))
 }
 
 /// One transfer, as the web UI reads it.
@@ -79,11 +85,26 @@ fn torrent_json(torrent: &TorrentStatus) -> Value {
         "upload_bytes_per_sec": torrent.upload_bytes_per_sec,
         "peers": torrent.peers,
         "files": torrent.files.iter().map(torrent_file_json).collect::<Vec<_>>(),
+        // For the detail panel's Connections tab, which draws this list the
+        // same way the desktop Inspector draws its Peers tab. The backend
+        // already caps how many come back, so there is no separate limit to
+        // apply here.
+        "peer_list": torrent.peer_list.iter().map(torrent_peer_json).collect::<Vec<_>>(),
     })
 }
 
 fn torrent_file_json(file: &TorrentFile) -> Value {
     json!({ "path": file.path, "len": file.len, "downloaded": file.downloaded })
+}
+
+fn torrent_peer_json(peer: &TorrentPeer) -> Value {
+    json!({
+        "address": peer.address,
+        "client": peer.client,
+        "downloaded": peer.downloaded,
+        "uploaded": peer.uploaded,
+        "state": peer.state,
+    })
 }
 
 /// The chunk bitmap of one transfer, base64 encoded.
@@ -135,6 +156,52 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// The other half of [`base64_encode`], for the one other place base64
+/// crosses this file's boundary: a dropped `.torrent` file arrives as JSON,
+/// which has no way to carry raw bytes directly. Rejects anything that is not
+/// a clean multiple of four characters from the standard alphabet rather than
+/// guessing at what a malformed upload meant.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some((byte - b'A') as u32),
+            b'a'..=b'z' => Some((byte - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((byte - b'0') as u32 + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    for chunk in text.as_bytes().chunks(4) {
+        let pad = chunk.iter().filter(|&&b| b == b'=').count();
+        if pad > 2 || chunk[..4 - pad].contains(&b'=') {
+            return None;
+        }
+        let mut n: u32 = 0;
+        for &byte in chunk {
+            n = (n << 6) | if byte == b'=' { 0 } else { value(byte)? };
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 async fn list_transfers(State(state): State<AppState>) -> Json<Value> {
     let snapshots = state.engine.snapshot();
     Json(json!({
@@ -147,10 +214,55 @@ async fn list_transfers(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn get_transfer(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
-    match state.engine.get(DownloadId(id)) {
-        Some(snapshot) => Json(transfer_json(&snapshot)).into_response(),
+    let id = DownloadId(id);
+    match state.engine.get(id) {
+        Some(snapshot) => {
+            let mut body = transfer_json(&snapshot);
+            // Only the detail view pays for this, not the list or the event
+            // stream: a digest is checked once per transfer, not ten times a
+            // second, and `checksum_json` has to walk `error` to say whether
+            // it passed.
+            if let Some(digest) = state.engine.expect(id) {
+                body["checksum"] = checksum_json(&digest, &snapshot);
+            }
+            Json(body).into_response()
+        }
         None => not_found(),
     }
+}
+
+/// What a caller wants to know about a requested checksum: what was asked
+/// for, and whether it held up.
+///
+/// The HTTP path is the one this project can do that a bare torrent client
+/// cannot, so this is not a footnote: a client that finished with the wrong
+/// bytes and never said so is worse than one that never checked.
+fn checksum_json(digest: &Digest, snapshot: &DownloadSnapshot) -> Value {
+    // The engine has nowhere else to put "verified": a transfer that reaches
+    // `Complete` with an `expect` set has already passed the comparison in
+    // `dl_core::resume`, since a mismatch there aborts the transfer instead of
+    // finishing it. A mismatch instead lands in `Failed` with the message
+    // `error::Error::IntegrityMismatch` formats, so that text is the only
+    // signal available without teaching the engine a new field for one bit of
+    // information the state and the error string already carry between them.
+    let verified = match snapshot.state {
+        TransferState::Complete => Some(true),
+        // A failure unrelated to the checksum, such as the network dropping
+        // partway through, is not a "no" here: the file never reached the
+        // comparison at all, and saying it failed verification would blame
+        // the wrong half of the transfer for what went wrong.
+        TransferState::Failed => snapshot
+            .error
+            .as_deref()
+            .filter(|error| error.contains("integrity check failed"))
+            .map(|_| false),
+        _ => None,
+    };
+    json!({
+        "algorithm": digest.algorithm().as_str(),
+        "hex": digest.to_hex(),
+        "verified": verified,
+    })
 }
 
 async fn get_pieces(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
@@ -171,13 +283,25 @@ fn bad_request(field: &str, message: impl std::fmt::Display) -> Response {
 
 /// What a caller sends to start a transfer.
 ///
-/// One shape for a magnet and a URL alike: the caller has one box to paste
-/// into and no reason to know which kind of link it holds, and
-/// `dl_core::torrent::classify` already answers that question for whichever
-/// one arrives.
+/// One shape for a magnet, a URL and a dropped `.torrent` file alike: the
+/// caller has one box to paste or drop into and no reason to know which kind
+/// of thing it holds. `url` covers the first two, because
+/// `dl_core::torrent::classify` already tells them apart; a browser cannot
+/// hand this server a path on its own disk for the third, so `torrent_data`
+/// exists to carry the file's bytes instead. Exactly one of the two is
+/// expected.
 #[derive(Deserialize)]
 struct NewTransfer {
-    url: String,
+    url: Option<String>,
+    /// A dropped `.torrent` file's contents, base64 encoded. Staged to a file
+    /// under the server's own config directory and then handed to
+    /// `classify` exactly like a path the desktop app's "Open Torrent File"
+    /// picks: one parser for a local `.torrent`, not two.
+    torrent_data: Option<String>,
+    /// The dropped file's own name, so the staged copy keeps something
+    /// recognisable rather than a bare timestamp. Cosmetic only: nothing
+    /// downstream keys anything on it.
+    filename: Option<String>,
     /// A path, absolute or relative to the server's download directory.
     /// Left to the server to pick when absent.
     destination: Option<String>,
@@ -197,13 +321,34 @@ async fn add_transfer(State(state): State<AppState>, Json(body): Json<NewTransfe
         None => None,
     };
 
-    let kind = classify(&body.url);
-    let destination = match &body.destination {
-        Some(raw) => resolve_destination(&state.config.download_dir, raw),
-        None => default_destination(&state.config.download_dir, &body.url, &kind),
+    let non_empty_url = body.url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let url = match (non_empty_url, &body.torrent_data) {
+        (Some(url), _) => url.to_string(),
+        (None, Some(data)) => {
+            let bytes = match base64_decode(data) {
+                Some(bytes) => bytes,
+                None => return bad_request("torrent_data", "not valid base64"),
+            };
+            let name = sanitize_torrent_filename(body.filename.as_deref().unwrap_or("upload"));
+            let staged = staged_torrent_path(&state.config.config_dir, &name);
+            if let Err(error) = std::fs::create_dir_all(staged.parent().unwrap())
+                .and_then(|()| std::fs::write(&staged, &bytes))
+            {
+                tracing::warn!(%error, "could not stage an uploaded torrent file");
+                return bad_request("torrent_data", "could not save the uploaded file");
+            }
+            staged.display().to_string()
+        }
+        (None, None) => return bad_request("url", "give a URL, a magnet, or a .torrent file"),
     };
 
-    let mut spec = DownloadSpec::new(body.url, destination);
+    let kind = classify(&url);
+    let destination = match &body.destination {
+        Some(raw) => resolve_destination(&state.config.download_dir, raw),
+        None => default_destination(&state.config.download_dir, &url, &kind),
+    };
+
+    let mut spec = DownloadSpec::new(url, destination);
     spec.connections = body.connections.unwrap_or(state.config.connections).max(1);
     spec.expect = expect;
 
@@ -214,6 +359,35 @@ async fn add_transfer(State(state): State<AppState>, Json(body): Json<NewTransfe
 
     let snapshot = state.engine.get(id).expect("just added, cannot have vanished already");
     (StatusCode::CREATED, Json(transfer_json(&snapshot))).into_response()
+}
+
+/// Where an uploaded `.torrent` file's bytes land, so the backend has
+/// something on disk to read once the transfer actually starts: it opens
+/// this path lazily, not at the moment this request returns.
+///
+/// A timestamp plus a counter rather than the transfer's own id: the id does
+/// not exist until `Engine::add` returns, one line after this path is needed.
+fn staged_torrent_path(config_dir: &std::path::Path, filename: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    config_dir.join("torrents").join(format!("{nanos}-{seq}-{filename}"))
+}
+
+/// A safe, `.torrent`-suffixed name for a staged upload: no directory
+/// separators from whatever the browser reported, and the extension
+/// `classify` looks for, since a name that lost it along the way would
+/// otherwise stage a file `classify` reads straight past as an HTTP download.
+fn sanitize_torrent_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or("upload");
+    if base.to_ascii_lowercase().ends_with(".torrent") {
+        base.to_string()
+    } else {
+        format!("{base}.torrent")
+    }
 }
 
 /// Read a pasted digest the way a person actually writes one down: an
@@ -314,6 +488,160 @@ async fn delete_transfer(
 /// there is none, and quietly gives up on everything in flight.
 fn set_category(engine: &dl_core::engine::Engine, id: DownloadId, category: String) {
     engine.set_labels(id, std::collections::BTreeMap::from([("category".to_string(), category)]));
+}
+
+/// `GET /api/v1/settings`: what the settings screen loads before it can offer
+/// anything to change.
+///
+/// `interface_limits` and `durability` come straight off the engine's live
+/// `EngineConfig`, which is the truth for both: `Engine::set_config`'s own
+/// doc comment is explicit that a change there reaches queued and future
+/// transfers, not ones already running, so echoing anything else back would
+/// have the settings screen disagree with what the engine will actually do
+/// next. `download_dir` and `connections` have no such live copy: `Config` is
+/// read once at start into an `Arc` every request shares, and giving it
+/// interior mutability so one settings save could reach into that would mean
+/// every other handler in this crate now has to reason about a config that
+/// can change under it mid-request. Both are still real settings, just ones
+/// that take effect for the process that starts after the one holding this
+/// request, which is why `update_settings` persists them unconditionally
+/// even though it cannot apply them here and now.
+async fn get_settings(State(state): State<AppState>) -> Json<Value> {
+    Json(settings_json(&state, &state.config.download_dir, state.config.connections))
+}
+
+fn settings_json(state: &AppState, download_dir: &std::path::Path, connections: usize) -> Value {
+    let engine_config = state.engine.config();
+    json!({
+        "download_limit": rate_or_unlimited(state.engine.budget().rate()),
+        "upload_limit": rate_or_unlimited(state.engine.upload_budget().rate()),
+        "interface_limits": engine_config.interface_limits,
+        "durability": engine_config.durability.as_str(),
+        "download_dir": download_dir,
+        "connections": connections,
+        "interfaces": usable_interfaces(),
+    })
+}
+
+/// `Budget::rate` uses zero for unlimited internally; the settings screen
+/// draws "Unlimited" for `null` rather than for the number zero, the same
+/// convention `parse_limit` already applies to the config file.
+fn rate_or_unlimited(rate: u64) -> Value {
+    if rate == 0 { Value::Null } else { json!(rate) }
+}
+
+/// The interfaces a per-interface limit could name, so the settings screen
+/// can offer a real list rather than a free-text field a typo silently does
+/// nothing in. Not cached: this is read once per settings-page load, not on
+/// every tick of the event stream.
+fn usable_interfaces() -> Value {
+    dl_net::SystemInterfaces
+        .usable()
+        .into_iter()
+        .map(|iface| json!({ "name": iface.name, "up": iface.is_up, "has_gateway": iface.has_gateway }))
+        .collect()
+}
+
+/// What a caller sends to change a setting. Every field optional: a caller
+/// changing one limit on the Bandwidth page has no reason to also resend the
+/// download directory, and a `PATCH`-shaped `POST` that required the whole
+/// object would make every settings page write out fields it never showed the
+/// user.
+#[derive(Deserialize, Default)]
+struct SettingsPatch {
+    /// Bytes per second; zero (or, from a form, an empty field turned into
+    /// zero by the page) means unlimited. Absent means leave it alone.
+    download_limit: Option<u64>,
+    upload_limit: Option<u64>,
+    /// Replaces the whole map when present, the same way saving the Network
+    /// page on the desktop app writes every row at once rather than one
+    /// interface at a time.
+    interface_limits: Option<BTreeMap<String, u64>>,
+    /// `"safe"`, `"balanced"` or `"fast"`.
+    durability: Option<String>,
+    download_dir: Option<String>,
+    connections: Option<usize>,
+}
+
+/// `POST /api/v1/settings`.
+///
+/// Two independent things happen here, because the fields split cleanly along
+/// exactly that line: a bandwidth limit and the per-interface ceilings are
+/// applied to the running engine immediately, through `Budget::set_rate` and
+/// `Engine::set_config`; `download_dir` and `connections` cannot be, for the
+/// reason `get_settings` explains, and are written to disk only. Everything
+/// supplied is written to disk regardless, so a value that could not be
+/// applied live is not also lost at the next restart.
+async fn update_settings(
+    State(state): State<AppState>,
+    Json(patch): Json<SettingsPatch>,
+) -> Response {
+    let durability = match patch.durability.as_deref().map(Durability::parse) {
+        Some(None) => {
+            return bad_request("durability", "expected one of: safe, balanced, fast");
+        }
+        Some(Some(d)) => Some(d),
+        None => None,
+    };
+
+    if let Some(rate) = patch.download_limit {
+        state.engine.budget().set_rate(rate);
+    }
+    if let Some(rate) = patch.upload_limit {
+        state.engine.upload_budget().set_rate(rate);
+    }
+
+    if patch.interface_limits.is_some() || durability.is_some() {
+        let mut engine_config: EngineConfig = (*state.engine.config()).clone();
+        if let Some(limits) = &patch.interface_limits {
+            engine_config.interface_limits = drop_zero_limits(limits);
+        }
+        if let Some(d) = durability {
+            engine_config.durability = d;
+        }
+        state.engine.set_config(engine_config);
+    }
+
+    let download_dir = patch
+        .download_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.config.download_dir.clone());
+    let connections = patch.connections.unwrap_or(state.config.connections).max(1);
+
+    let mut persisted = (*state.config).clone();
+    if let Some(rate) = patch.download_limit {
+        persisted.download_limit = (rate != 0).then_some(rate);
+    }
+    if let Some(rate) = patch.upload_limit {
+        persisted.upload_limit = (rate != 0).then_some(rate);
+    }
+    if let Some(limits) = &patch.interface_limits {
+        persisted.interface_limits = drop_zero_limits(limits);
+    }
+    if let Some(d) = durability {
+        persisted.durability = d;
+    }
+    persisted.download_dir = download_dir.clone();
+    persisted.connections = connections;
+
+    // A settings save that took live effect but failed to reach disk should
+    // still say so to whoever is running this container, not fail the
+    // request: the engine already has the new limits, and the next restart is
+    // the only thing at risk.
+    if let Err(error) = persisted.write(&state.config.config_dir) {
+        tracing::warn!(%error, "could not persist settings to disk");
+    }
+
+    Json(settings_json(&state, &download_dir, connections)).into_response()
+}
+
+fn drop_zero_limits(limits: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    limits
+        .iter()
+        .filter(|&(_, &rate)| rate != 0)
+        .map(|(name, rate)| (name.clone(), *rate))
+        .collect()
 }
 
 #[cfg(test)]
@@ -432,6 +760,29 @@ mod tests {
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
+    #[test]
+    fn base64_decode_reverses_base64_encode_for_every_padding_length() {
+        for sample in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            b"a .torrent file's bytes",
+        ] {
+            assert_eq!(base64_decode(&base64_encode(sample)).unwrap(), sample);
+        }
+    }
+
+    #[test]
+    fn base64_decode_refuses_what_is_not_base64_rather_than_guessing() {
+        assert!(base64_decode("not valid base64!!").is_none());
+        assert!(base64_decode("AB").is_none(), "not a multiple of four characters");
+        assert!(base64_decode("A=AA").is_none(), "padding in the middle of a chunk");
+    }
+
     /// A factory whose lanes are never opened: every test here keeps
     /// `max_concurrent` at zero, so nothing ever leaves the queue to ask for
     /// one.
@@ -531,6 +882,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dropped_torrent_file_is_staged_and_added_by_the_same_endpoint() {
+        // A browser can hand this server bytes but never a path on its own
+        // disk, so a drop has to travel as `torrent_data` rather than `url`.
+        // Once staged it is meant to look exactly like a `.torrent` the
+        // desktop app opened from a local path: one parser, not two.
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            crate::config::Config { config_dir: dir.path().to_path_buf(), ..Default::default() };
+        let state = AppState { engine: test_state().engine, config: Arc::new(config) };
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(post(
+                "/api/v1/transfers",
+                json!({
+                    "torrent_data": base64_encode(b"pretend this is bencoded"),
+                    "filename": "ubuntu.torrent",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = body_json(response).await;
+        assert_eq!(body["state"], "queued");
+        // Named from the staged file, the same way a local `.torrent` is:
+        // proof this actually went down the torrent path and not the HTTP
+        // one. The staged name carries a uniqueness prefix, so this checks
+        // the meaningful suffix rather than an exact match.
+        assert!(body["filename"].as_str().unwrap().ends_with("ubuntu.torrent"));
+
+        let staged: Vec<_> = std::fs::read_dir(dir.path().join("torrents"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(std::fs::read(&staged[0]).unwrap(), b"pretend this is bencoded");
+    }
+
+    #[tokio::test]
+    async fn neither_a_url_nor_a_torrent_file_is_a_bad_request_not_an_empty_transfer() {
+        let response = routes()
+            .with_state(test_state())
+            .oneshot(post("/api/v1/transfers", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_base64_in_a_dropped_file_is_refused_before_anything_is_staged() {
+        let response = routes()
+            .with_state(test_state())
+            .oneshot(post("/api/v1/transfers", json!({"torrent_data": "not base64!!"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn a_bad_digest_is_refused_before_anything_is_started() {
         // Starting a six gigabyte download and failing it at the end over a
         // typo in the checksum field is a bad way to find out.
@@ -626,6 +1036,180 @@ mod tests {
             .unwrap();
         assert_eq!(paused.status(), StatusCode::OK);
         assert_eq!(body_json(paused).await["state"], "paused");
+    }
+
+    fn a_digest() -> Digest {
+        Digest::parse(Algorithm::Sha256, &"ab".repeat(32)).unwrap()
+    }
+
+    #[test]
+    fn a_completed_transfer_with_a_requested_digest_reports_verified() {
+        // `dl_core::resume` aborts rather than finishes a transfer whose bytes
+        // do not match, so reaching `Complete` at all is the proof.
+        let snapshot = snapshot_with(TransferState::Complete, 1000, Some(1000), 0);
+        assert_eq!(checksum_json(&a_digest(), &snapshot)["verified"], true);
+    }
+
+    #[test]
+    fn a_transfer_still_running_reports_verified_as_unknown_not_false() {
+        let snapshot = snapshot_with(TransferState::Running, 500, Some(1000), 100);
+        assert!(checksum_json(&a_digest(), &snapshot)["verified"].is_null());
+    }
+
+    #[test]
+    fn a_mismatch_is_the_only_failure_that_reports_verified_false() {
+        let mut mismatched = snapshot_with(TransferState::Failed, 1000, Some(1000), 0);
+        mismatched.error = Some("integrity check failed: expected ab, computed cd".into());
+        assert_eq!(checksum_json(&a_digest(), &mismatched)["verified"], false);
+
+        // A failure that never reached the comparison, such as the connection
+        // dropping, must not be reported as a checksum failure: the checksum
+        // was never actually wrong, there was simply nothing left to check.
+        let mut unrelated = snapshot_with(TransferState::Failed, 200, Some(1000), 0);
+        unrelated.error = Some("connection reset by peer".into());
+        assert!(checksum_json(&a_digest(), &unrelated)["verified"].is_null());
+    }
+
+    #[tokio::test]
+    async fn the_detail_view_carries_a_checksum_the_list_does_not() {
+        // `transfer_json` alone drives both the list and the event stream, so
+        // keeping the digest out of it keeps it out of both; only the
+        // single-transfer endpoint pays to look it up.
+        let state = test_state();
+        let router = routes().with_state(state.clone());
+        let added = router
+            .clone()
+            .oneshot(post(
+                "/api/v1/transfers",
+                json!({"url": "https://example.test/a.iso", "expect": format!("sha256:{}", "ab".repeat(32))}),
+            ))
+            .await
+            .unwrap();
+        let id = body_json(added).await["id"].as_u64().unwrap();
+
+        let listed =
+            body_json(router.clone().oneshot(get("/api/v1/transfers")).await.unwrap()).await;
+        assert!(listed["transfers"][0].get("checksum").is_none());
+
+        let detail =
+            body_json(router.oneshot(get(&format!("/api/v1/transfers/{id}"))).await.unwrap()).await;
+        assert_eq!(detail["checksum"]["algorithm"], "sha256");
+        assert_eq!(detail["checksum"]["hex"], "ab".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn settings_reports_the_unlimited_defaults_a_fresh_engine_starts_with() {
+        let response =
+            routes().with_state(test_state()).oneshot(get("/api/v1/settings")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(body["download_limit"].is_null());
+        assert!(body["upload_limit"].is_null());
+        assert_eq!(body["durability"], "balanced");
+        assert_eq!(body["interface_limits"], json!({}));
+        assert!(body["interfaces"].is_array());
+    }
+
+    #[tokio::test]
+    async fn a_bandwidth_limit_reaches_the_live_budget_immediately() {
+        // This is the half of a settings change that has to work without a
+        // restart: a transfer already running reads this same `Budget` on
+        // every chunk.
+        let state = test_state();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(post("/api/v1/settings", json!({"download_limit": 5_000_000})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.engine.budget().rate(), 5_000_000);
+        assert_eq!(body_json(response).await["download_limit"], 5_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_download_limit_of_zero_clears_back_to_unlimited() {
+        let state = test_state();
+        state.engine.budget().set_rate(5_000_000);
+        let router = routes().with_state(state.clone());
+        router.oneshot(post("/api/v1/settings", json!({"download_limit": 0}))).await.unwrap();
+        assert!(state.engine.budget().is_unlimited());
+    }
+
+    #[tokio::test]
+    async fn interface_limits_and_durability_reach_the_engines_live_config() {
+        // `Engine::set_config` only reaches transfers that have not started
+        // yet, unlike the bandwidth budget above; this still has to be true
+        // for the next one the engine picks up.
+        let state = test_state();
+        let router = routes().with_state(state.clone());
+        let response = router
+            .oneshot(post(
+                "/api/v1/settings",
+                json!({"interface_limits": {"en0": 2_000_000}, "durability": "safe"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let config = state.engine.config();
+        assert_eq!(config.interface_limits.get("en0"), Some(&2_000_000));
+        assert_eq!(config.durability, dl_core::store::Durability::Safe);
+    }
+
+    #[tokio::test]
+    async fn an_interface_limit_of_zero_is_dropped_rather_than_kept_as_a_zero_rate() {
+        let state = test_state();
+        let router = routes().with_state(state.clone());
+        router
+            .oneshot(post(
+                "/api/v1/settings",
+                json!({"interface_limits": {"en0": 2_000_000, "en1": 0}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.engine.config().interface_limits,
+            BTreeMap::from([("en0".to_string(), 2_000_000)])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_durability_is_refused_before_it_touches_anything() {
+        let state = test_state();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(post("/api/v1/settings", json!({"durability": "ludicrous"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Nothing else in the same request should have taken effect either.
+        assert_eq!(state.engine.config().durability, dl_core::store::Durability::default());
+    }
+
+    #[tokio::test]
+    async fn a_settings_save_persists_the_download_directory_and_connection_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            crate::config::Config { config_dir: dir.path().to_path_buf(), ..Default::default() };
+        let state = AppState { engine: test_state().engine, config: Arc::new(config) };
+
+        let new_dir = dir.path().join("movies");
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(post(
+                "/api/v1/settings",
+                json!({"download_dir": new_dir.to_str().unwrap(), "connections": 6}),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(body["download_dir"], new_dir.to_str().unwrap());
+        assert_eq!(body["connections"], 6);
+
+        // And it must actually be on disk, for the process that starts next.
+        let reloaded = crate::config::Config::read(dir.path(), |_| None);
+        assert_eq!(reloaded.download_dir, new_dir);
+        assert_eq!(reloaded.connections, 6);
     }
 
     fn delete(uri: &str) -> axum::http::Request<axum::body::Body> {

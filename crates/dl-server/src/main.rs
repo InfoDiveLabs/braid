@@ -24,6 +24,7 @@ mod auth;
 mod config;
 mod qbit;
 mod state;
+mod ui;
 
 use anyhow::Result;
 use axum::Json;
@@ -253,6 +254,10 @@ async fn main() -> Result<()> {
         // answers 403 from inside the handler because that is the code
         // qBittorrent returns and the code its clients are written to expect.
         .merge(qbit::app::routes())
+        // The page and its assets load before anyone has a session, because
+        // the login form is on that page. Putting it behind the guard would
+        // mean needing a session in order to reach the thing that grants one.
+        .merge(ui::routes())
         .merge(guarded)
         .with_state(state)
         .layer(axum::Extension(Arc::clone(&sessions)))

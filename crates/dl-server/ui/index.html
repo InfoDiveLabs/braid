@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Braid</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/app.css?v={{VERSION}}">
+</head>
+<body>
+<div id="app">
+
+  <!-- ==================================================== login screen -->
+  <section id="login-screen" class="screen">
+    <form id="login-form" class="login-card">
+      <h1 class="brand-mark">Braid</h1>
+      <p class="muted">Sign in to manage transfers on this server.</p>
+      <label class="field">
+        <span>Username</span>
+        <input type="text" name="username" value="admin" autocomplete="username" required>
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input type="password" name="password" autocomplete="current-password" required autofocus>
+      </label>
+      <p id="login-error" class="error-text" hidden></p>
+      <button type="submit" class="btn btn-primary">Sign in</button>
+      <p class="muted small">The password was printed once in the server's log when it first started.</p>
+    </form>
+  </section>
+
+  <!-- ======================================================= main app -->
+  <div id="main-screen" class="screen">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">Braid</span>
+      </div>
+      <div class="total-rate" id="total-rate" title="Combined throughput">0 B/s</div>
+      <nav class="view-tabs" id="view-tabs">
+        <button type="button" class="view-tab active" data-view="transfers">Transfers</button>
+        <button type="button" class="view-tab" data-view="settings">Settings</button>
+      </nav>
+      <button type="button" id="logout-btn" class="btn btn-ghost">Sign out</button>
+    </header>
+
+    <main class="content">
+
+      <!-- ------------------------------------------------ transfers view -->
+      <section id="transfers-view" class="view">
+        <div class="pane pane-list">
+          <form id="add-form" class="add-card">
+            <div class="add-row">
+              <input
+                id="add-url"
+                type="text"
+                class="add-input"
+                placeholder="Paste a URL, a magnet link, or drop a .torrent file here"
+                autocomplete="off"
+              >
+              <button type="submit" class="btn btn-primary">Add</button>
+            </div>
+            <button type="button" id="add-disclosure" class="disclosure-btn" aria-expanded="false">
+              <span class="chevron">&#9656;</span> Destination, connections, checksum, category
+            </button>
+            <div id="add-more" class="add-more" hidden>
+              <label class="field">
+                <span>Destination</span>
+                <input id="add-destination" type="text" placeholder="Default download folder">
+              </label>
+              <label class="field">
+                <span>Connections</span>
+                <input id="add-connections" type="number" min="1" max="64" placeholder="Server default">
+              </label>
+              <label class="field">
+                <span>Checksum</span>
+                <input id="add-expect" type="text" placeholder="sha256:&hellip; or bare hex">
+              </label>
+              <label class="field">
+                <span>Category</span>
+                <input id="add-category" type="text" placeholder="Optional">
+              </label>
+            </div>
+            <input id="add-file" type="file" accept=".torrent" hidden>
+            <p id="add-error" class="error-text" hidden></p>
+          </form>
+
+          <div id="drop-overlay" class="drop-overlay" hidden>
+            <div class="drop-overlay-inner">Drop the .torrent file to add it</div>
+          </div>
+
+          <div class="table-wrap">
+            <table id="transfers-table" class="transfers-table">
+              <thead>
+                <tr>
+                  <th class="col-name">Name</th>
+                  <th class="col-size">Size</th>
+                  <th class="col-progress">Progress</th>
+                  <th class="col-speed">Speed</th>
+                  <th class="col-state">State</th>
+                  <th class="col-actions"></th>
+                </tr>
+              </thead>
+              <tbody id="transfers-body"></tbody>
+            </table>
+            <p id="empty-note" class="muted empty-note" hidden>
+              Nothing here yet. Paste a link, a magnet, or drop a .torrent file above.
+            </p>
+          </div>
+        </div>
+
+        <!-- ------------------------------------------------- detail panel -->
+        <aside id="detail-panel" class="detail-panel" hidden>
+          <button type="button" id="detail-close" class="btn btn-ghost detail-close">&times;</button>
+          <h2 id="detail-title" class="detail-title"></h2>
+          <p id="detail-subtitle" class="muted detail-subtitle"></p>
+
+          <div id="detail-tabs" class="segmented"></div>
+
+          <div id="detail-info" class="detail-tab-content">
+            <div id="detail-checksum" class="checksum-card" hidden></div>
+            <dl id="detail-stats" class="stat-list"></dl>
+            <div id="detail-interfaces" class="interface-list"></div>
+          </div>
+
+          <div id="detail-pieces" class="detail-tab-content" hidden>
+            <div id="pieces-grid" class="pieces-grid"></div>
+            <div class="pieces-legend">
+              <span class="legend-key"><i class="swatch swatch-have"></i>Have</span>
+              <span class="legend-key"><i class="swatch swatch-downloading"></i>Downloading</span>
+              <span class="legend-key"><i class="swatch swatch-missing"></i>Missing</span>
+            </div>
+            <p id="pieces-bucket-note" class="faint" hidden></p>
+          </div>
+
+          <div id="detail-connections" class="detail-tab-content" hidden>
+            <p id="connections-empty" class="muted" hidden></p>
+            <div id="connections-list" class="connections-list"></div>
+          </div>
+
+          <div id="detail-files" class="detail-tab-content" hidden>
+            <div id="files-list" class="files-list"></div>
+          </div>
+        </aside>
+      </section>
+
+      <!-- ------------------------------------------------- settings view -->
+      <section id="settings-view" class="view" hidden>
+        <div class="pane pane-settings">
+          <form id="settings-form">
+
+            <div class="group">
+              <h3 class="group-title">BANDWIDTH</h3>
+              <div class="row">
+                <span class="row-label">Download limit</span>
+                <label class="unit-field">
+                  <input id="settings-download-limit" type="number" min="0" step="1" placeholder="Unlimited">
+                  <span class="unit">MB/s</span>
+                </label>
+              </div>
+              <div class="row">
+                <span class="row-label">Upload limit</span>
+                <label class="unit-field">
+                  <input id="settings-upload-limit" type="number" min="0" step="1" placeholder="Unlimited">
+                  <span class="unit">MB/s</span>
+                </label>
+              </div>
+              <p class="group-note">A limit of zero, or an empty field, means unlimited. Takes effect
+                immediately, on transfers already running.</p>
+            </div>
+
+            <div class="group">
+              <h3 class="group-title">PER-INTERFACE LIMITS</h3>
+              <div id="interface-limits-list" class="interface-limits-list"></div>
+              <p id="interface-limits-empty" class="group-note" hidden>
+                No usable network interfaces were reported by the server.
+              </p>
+              <p class="group-note">Applies to transfers started after this is saved, not ones already
+                running.</p>
+            </div>
+
+            <div class="group">
+              <h3 class="group-title">DOWNLOADS</h3>
+              <div class="row">
+                <span class="row-label">Download directory</span>
+                <input id="settings-download-dir" type="text" class="row-input">
+              </div>
+              <div class="row">
+                <span class="row-label">Default connections</span>
+                <input id="settings-connections" type="number" min="1" max="64" class="row-input-narrow">
+              </div>
+              <p class="group-note">Take effect the next time this server starts.</p>
+            </div>
+
+            <div class="group">
+              <h3 class="group-title">DURABILITY</h3>
+              <div id="durability-segmented" class="segmented segmented-block">
+                <button type="button" data-value="safe">Safe</button>
+                <button type="button" data-value="balanced">Balanced</button>
+                <button type="button" data-value="fast">Fast</button>
+              </div>
+              <p id="durability-note" class="group-note"></p>
+            </div>
+
+            <div class="settings-actions">
+              <button type="submit" class="btn btn-primary">Save settings</button>
+              <span id="settings-status" class="muted" role="status"></span>
+            </div>
+          </form>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+<script src="/app.js?v={{VERSION}}" defer></script>
+</body>
+</html>
