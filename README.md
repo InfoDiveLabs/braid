@@ -201,19 +201,21 @@ The admin password is generated on first start and printed once to the log. Full
 instructions, including the migration, are in [`docker/README.md`](docker/README.md).
 
 **Driven by the real thing.** A real Sonarr 4.0.20 and Radarr 6.4.4 registered it
-as a qBittorrent client, pushed a release, and took a torrent from dozens of peers
-to completion. Those exchanges were recorded and now replay as tests, so what
-those clients actually need is pinned rather than assumed. The findings, including
-what they never ask for, are in [`harness/README.md`](harness/README.md).
+as a qBittorrent client, pushed a release, took a torrent from dozens of peers to
+completion, and imported the finished file into its library from the path Braid
+wrote it to. Those exchanges were recorded and now replay as tests, so what those
+clients actually need is pinned rather than assumed.
 
-> **Not in a release yet.** The server is on `develop` and is not part of
-> **0.1.0 beta 3**. Build it with `cargo build --release -p dl-server`, or the
-> image with `docker build -f docker/Dockerfile .`
+That is also the only way some of it could have been found. Sonarr asks for
+`torrents/topPrio`, not the `topPriority` that reads more naturally, and it asks
+for `torrents/setForceStart` the moment its Initial State is set to Force Started
+— both were a 404 until a real client asked. Calling `torrents/properties` in the
+second between a magnet being accepted and the swarm being joined crashed the
+process outright. The findings, including what these clients never ask for and so
+is deliberately absent, are in [`harness/README.md`](harness/README.md).
 
-> **One known gap.** A torrent whose files sit at its root with no folder of its
-> own lands directly in the category directory, and Sonarr declines to import it,
-> correctly: nothing distinguishes it from anything else there. Most torrents
-> carry a top-level folder and are unaffected.
+Building it yourself: `cargo build --release -p dl-server`, or
+`docker build -f docker/Dockerfile .` for the image.
 
 ---
 

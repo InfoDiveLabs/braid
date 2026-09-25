@@ -17,14 +17,17 @@ client plus a shell script with curl in it.
   curl in it, and the script has no resume and no integrity check.
 
 **How far this has been taken.** A real Sonarr 4.0.20 and Radarr 6.4.4 have
-driven this container: registered it as a qBittorrent client, pushed a
-release, and watched a real torrent download from dozens of peers to
-completion. The exchanges were recorded and replay as tests. See
-`harness/README.md` for what those clients actually ask for, which is a much
-smaller surface than qBittorrent's documented API.
+driven this container twice: registered it as a qBittorrent client, pushed a
+release, watched a real torrent download from dozens of peers to completion,
+and imported the finished file into the library. The exchanges were recorded
+and replay as tests. See `harness/README.md` for what those clients actually
+ask for, which is a much smaller surface than qBittorrent's documented API.
 
-That run found two bugs that made the container unusable, both now fixed, and
-one limitation that is not: see Limitations below.
+Those runs found four bugs that made the container unusable, all now fixed:
+two wrong endpoint names, a crash on `torrents/properties`, and a duplicate
+info hash that reported a finished download at an empty path. A finished
+torrent now imports into Sonarr's library from the path Braid wrote it to.
+What is still missing is in Limitations below.
 
 ## Quick start
 
@@ -138,18 +141,20 @@ tracker's own counts, so these genuinely cannot be reported. Everything
 else in the listing is measured. If a client of yours gates on those
 numbers, this will not suit you yet.
 
-**Queue priority is accepted and ignored.** `topPriority` and share limits
-are answered so clients do not error, but nothing acts on them.
+**Queue priority is accepted and ignored.** `torrents/topPrio` and share
+limits are answered so clients do not error, but there is no queue for
+"top" to mean anything about. `setForceStart` is the exception: asking for
+a torrent to be force started genuinely starts it.
 
-**A torrent whose files sit at its root, with no folder of its own, may not
-import.** Sonarr refuses it with "Path matches client base download
-directory", and it is right to: two such torrents in one category share a
-directory, and nothing tells an importer which files belong to which
-download. Real qBittorrent has a content layout setting for this and Braid
-does not implement it yet. Most torrents carry a top-level folder and are
-unaffected. This was found by pointing a real Sonarr at the container and
-watching an otherwise complete download fail to import, and it is recorded
-in `harness/README.md` with the evidence.
+**There is no content layout setting.** Real qBittorrent can be told to
+create a subfolder, use the torrent's own layout, or keep files at the root.
+Braid always gives a torrent a folder of its own, which is what an importer
+needs; if you rely on the original layout for something else, it is not
+configurable here.
+
+**Bandwidth limits cannot be set over the API.** `transfer/setDownloadLimit`
+and its siblings are absent. Neither Sonarr nor Radarr ever calls them, so
+they were left out rather than guessed at; set limits in Braid's own web UI.
 
 **Nothing here is code signed or audited.** This is a beta.
 
