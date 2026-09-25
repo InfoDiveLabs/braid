@@ -6,13 +6,22 @@ client plus a shell script with curl in it.
 
 ## What works today
 
-This image builds and runs `braid-server`, which currently answers
-`GET /health` and nothing else. The qBittorrent-compatible API and the
-embedded web UI described in the rest of this document are being built in
-parallel and are not finished. Do not point Sonarr, Radarr, or anything else
-at this container expecting the qBittorrent API to be there yet: it is not,
-and claiming otherwise here would just move the surprise to whoever tries it
-first. Once that work lands this file should be the first thing updated.
+- The web UI, on the same port.
+- Braid's own API at `/api/v1`: both kinds of transfer, live progress,
+  checksums, per lane throughput.
+- A qBittorrent-compatible API at `/api/v2`, enough for Sonarr, Radarr,
+  Prowlarr and Lidarr to drive it as a download client.
+- BitTorrent, and HTTP downloads with resume, per chunk hashing and link
+  refreshing. That second half is the reason this exists: qBittorrent does
+  not do it, so most stacks run a torrent client plus a shell script with
+  curl in it, and the script has no resume and no integrity check.
+
+**What has not been proven.** The compatible API is written against
+qBittorrent's documented surface and is covered by tests, but no real Sonarr
+or Radarr has yet driven this container end to end. What those clients
+actually require is defined by their source rather than by that
+documentation, so treat the compatibility as implemented and not yet
+witnessed. Two known gaps are listed under Limitations below.
 
 ## Quick start
 
@@ -64,14 +73,75 @@ it is easy to spot in a scrolling log:
 docker compose logs braid
 ```
 
-It is not printed again on later starts. If you lose it before writing it
-down, the current recovery path is whatever the auth work documents; check
-there once it lands.
+It is not printed again on later starts. If you lose it, delete
+`credentials.conf` from `/config` and restart: a new password is generated
+and printed the same way. Nothing else in `/config` is touched, so the
+transfer list and settings survive.
 
-## Migrating from qBittorrent
+## Replacing a qBittorrent container
 
-Not yet possible in the way that phrase usually means: pointing the same
-`*arr` app config at this container instead. The qBittorrent-compatible
-`/api/v2` surface is still being built. What you can do today is run this
-container alongside the one you have, pointed at the same `/downloads`, and
-switch the `*arr` apps over once that API exists and this file says so.
+Braid answers the same API, on the same kind of port, with the same
+username and password shape. The migration is a settings change in each
+`*arr` app, not a re-import.
+
+**1. Run it beside the container you have**, pointed at the same
+`/downloads`. Nothing is moved and nothing is shared: both can be up while
+you switch over, and you can switch back by reversing step 3.
+
+```
+cp docker/compose.example.yml compose.yml
+# edit PUID/PGID to your user, and point ./downloads at the directory your
+# existing client already writes into
+docker compose up -d
+docker compose logs braid    # the admin password is here, printed once
+```
+
+**2. Stop the old client from taking new work.** Pause its queue, or set
+its `*arr` download client to disabled. Leave it running until whatever it
+is mid-download has finished: Braid does not adopt another client's
+in-flight torrents, and killing them loses that progress.
+
+**3. Point each `*arr` app at Braid.** Settings, then Download Clients, then
+the qBittorrent entry you already have. Change:
+
+| field | value |
+|---|---|
+| Host | the container name, `braid`, or the host's address |
+| Port | `8080` |
+| Username | `admin` |
+| Password | the one printed in the log at first start |
+| Category | leave exactly as it is, for example `tv-sonarr` |
+| Use SSL | off, unless you have put a reverse proxy in front |
+
+Press Test. It logs in, reads the version, and asks for its category. Then
+Save.
+
+**Leave the category alone.** It is how each app finds its own downloads
+again, and Braid stores it against the transfer and keeps it across
+restarts. Changing it here means the app stops recognising anything it
+asked for before the change.
+
+**4. Check one download all the way through** before removing the old
+container. Grab something small, watch it appear in Braid's web UI, and
+confirm the `*arr` app imports it when it finishes. That last step is the
+one that proves the state mapping is right, and it is the part most likely
+to be wrong.
+
+## Limitations worth knowing before you switch
+
+**Seed and leecher counts are always zero.** The BitTorrent library Braid
+uses keeps peer completeness behind a private type and discards the
+tracker's own counts, so these genuinely cannot be reported. Everything
+else in the listing is measured. If a client of yours gates on those
+numbers, this will not suit you yet.
+
+**Queue priority is accepted and ignored.** `topPriority` and share limits
+are answered so clients do not error, but nothing acts on them.
+
+**Nothing here is code signed or audited.** This is a beta.
+
+## If something does not work
+
+The most useful thing you can send is what the client actually asked for
+and what it got back. Braid logs at `RUST_LOG=debug`, and the exchange with
+an `*arr` app is small enough to read.
