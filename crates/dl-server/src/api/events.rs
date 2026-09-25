@@ -43,7 +43,10 @@ pub(super) fn routes() -> Router<AppState> {
 fn frame_json(engine: &Engine) -> serde_json::Value {
     let snapshots = engine.snapshot();
     json!({
-        "transfers": snapshots.iter().map(super::v1::transfer_json).collect::<Vec<_>>(),
+        "transfers": snapshots
+            .iter()
+            .map(|s| super::v1::transfer_json(s, engine.labels(s.id).get("category").map(String::as_str)))
+            .collect::<Vec<_>>(),
         "total_bytes_per_sec": engine.total_bytes_per_sec(),
     })
 }

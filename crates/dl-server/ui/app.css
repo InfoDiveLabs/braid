@@ -38,10 +38,34 @@
   --radius-sm: 6px;
   --pad: 14px;
 
+  /* A small spacing grid rather than one-off numbers scattered through the
+   * file: every gap and padding below is one of these five, so the page
+   * reads as built to a grid instead of eyeballed per element. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+
+  /* A real type scale: a table row, a card label and a screen title are
+   * three different jobs and used to all be set in the same 12px, which is
+   * exactly what made the page read as a wireframe instead of a product. */
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-base: 12px;
+  --fs-md: 13px;
+  --fs-lg: 15px;
+  --fs-xl: 19px;
+
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
 
   --shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+
+  /* Time constants for the few things worth animating: long enough to read
+   * as motion, short enough that nothing feels like it is waiting on the UI. */
+  --fast: 120ms ease-out;
+  --med: 200ms ease-out;
 }
 
 @media (prefers-color-scheme: light) {
@@ -67,6 +91,13 @@
     --shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
   }
 }
+
+/* The `hidden` attribute is only a user-agent default of `display: none`,
+ * which any author rule for the same element (`display: flex`, `display:
+ * grid`, ...) silently overrides. Every `el.hidden = true/false` toggle in
+ * app.js depends on `hidden` actually winning, so this has to sit ahead of
+ * every other display rule in the file and carry !important to do it. */
+[hidden] { display: none !important; }
 
 * { box-sizing: border-box; }
 
@@ -131,33 +162,71 @@ button {
 
 input[type="text"],
 input[type="password"],
-input[type="number"] {
+input[type="number"],
+input[type="search"],
+select {
   font-family: var(--font);
-  font-size: 12px;
+  font-size: var(--fs-base);
   background: var(--field);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 6px 9px;
+  transition: border-color var(--fast);
 }
-input:focus {
+input:focus, select:focus {
   outline: none;
   border-color: var(--accent);
 }
+/* Firefox and Chrome each draw their own default clear-button for a search
+ * field; the field already sits in a toolbar dense enough without one. */
+input[type="search"]::-webkit-search-cancel-button { display: none; }
 
 .field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  font-size: 11px;
+  gap: var(--space-1);
+  font-size: var(--fs-sm);
   color: var(--text-muted);
 }
 .field input { color: var(--text); }
+
+.field-checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-2);
+  justify-content: flex-start;
+}
+.field-checkbox input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+}
+.field-checkbox span { color: var(--text); font-size: var(--fs-base); }
 
 .error-text {
   color: var(--danger);
   font-size: 12px;
   margin: 0;
+}
+
+/* =============================================================== brand */
+
+/* Braid's mark, embedded rather than served: the project has no static file
+ * pipeline by design (see ui.rs), and a brand mark is worth the couple of
+ * kilobytes of base64 that a separate route is not worth building for. Taken
+ * from crates/dl-gui/ui/brand/mark-64.png, the same file the desktop app's
+ * own window icon comes from, so the two front ends share one mark rather
+ * than the web UI inventing its own.
+ */
+.brand-icon {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  background-image: url("data:image/png;base64,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");
+  background-size: contain;
+  background-repeat: no-repeat;
 }
 
 /* ================================================================ login */
@@ -167,23 +236,30 @@ input:focus {
   align-items: center;
   justify-content: center;
 }
-#login-screen.hidden-screen { display: none; }
 
 .login-card {
-  width: 300px;
+  width: 320px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 24px;
+  padding: var(--space-5);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
   box-shadow: var(--shadow);
 }
 
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
+}
+.login-brand .brand-icon { width: 28px; height: 28px; }
+
 .brand-mark {
   margin: 0;
-  font-size: 20px;
+  font-size: var(--fs-xl);
   font-weight: 700;
   letter-spacing: -0.02em;
   color: var(--accent);
@@ -200,26 +276,20 @@ input:focus {
 .topbar {
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: var(--space-4);
   padding: 0 var(--pad);
-  height: 48px;
+  height: 52px;
   flex: 0 0 auto;
   background: var(--sidebar);
   border-bottom: 1px solid var(--border);
 }
 
-.brand { display: flex; align-items: center; }
-.brand .brand-mark { font-size: 16px; }
-
-.total-rate {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--text-muted);
-}
+.brand { display: flex; align-items: center; gap: var(--space-2); }
+.brand .brand-mark { font-size: var(--fs-lg); }
 
 .view-tabs {
   display: flex;
-  gap: 4px;
+  gap: var(--space-1);
   margin-left: auto;
 }
 .view-tab {
@@ -227,11 +297,12 @@ input:focus {
   border: none;
   background: transparent;
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: var(--fs-base);
   font-weight: 500;
   padding: 6px 12px;
   border-radius: var(--radius-sm);
   cursor: pointer;
+  transition: background var(--fast), color var(--fast);
 }
 .view-tab:hover { background: var(--border); }
 .view-tab.active { background: var(--accent); color: var(--on-accent); }
@@ -257,7 +328,7 @@ input:focus {
   display: flex;
   flex-direction: column;
   padding: var(--pad);
-  gap: 12px;
+  gap: var(--space-3);
   overflow: auto;
 }
 
@@ -332,6 +403,121 @@ input:focus {
   box-shadow: var(--shadow);
 }
 
+/* ============================================================= stats bar */
+
+.stats-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--pad);
+}
+
+.stat-chip {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  font-family: var(--mono);
+  font-size: var(--fs-md);
+  color: var(--text);
+  white-space: nowrap;
+}
+.stat-chip-label {
+  font-family: var(--font);
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+}
+.stat-icon {
+  width: 13px;
+  height: 13px;
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}
+
+.stats-bar-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+/* =============================================================== bulk bar */
+
+/* Shares the add card's slot in the flow rather than floating: a bar that
+ * overlays the table would cover the very rows it is about to act on. */
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--pad);
+}
+.bulk-count {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.bulk-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+.bulk-bar .btn-ghost {
+  margin-left: auto;
+}
+
+/* ============================================================== filter bar */
+
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.state-tabs {
+  display: flex;
+  gap: var(--space-1);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+}
+.state-tab {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  transition: background var(--fast), color var(--fast);
+  white-space: nowrap;
+}
+.state-tab:hover { color: var(--text); }
+.state-tab.active { background: var(--accent); color: var(--on-accent); }
+.state-tab .count {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  opacity: 0.75;
+}
+.state-tab .count:empty { display: none; }
+
+.category-filter { min-width: 140px; }
+
+.search-input {
+  flex: 1 1 160px;
+  min-width: 140px;
+  max-width: 260px;
+}
+
 /* ================================================================= table */
 
 .table-wrap {
@@ -356,12 +542,28 @@ input:focus {
   text-align: left;
   font-weight: 600;
   color: var(--text-faint);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  padding: 8px 10px;
+  padding: 9px 10px;
   border-bottom: 1px solid var(--border);
+  user-select: none;
 }
+.transfers-table thead th[data-sort] {
+  cursor: pointer;
+  transition: color var(--fast);
+}
+.transfers-table thead th[data-sort]:hover { color: var(--text); }
+.transfers-table thead th.sort-active { color: var(--accent); }
+.sort-arrow {
+  display: inline-block;
+  width: 8px;
+  margin-left: 2px;
+  opacity: 0;
+}
+th.sort-active .sort-arrow { opacity: 1; }
+th.sort-asc .sort-arrow::after { content: "\25B2"; }
+th.sort-desc .sort-arrow::after { content: "\25BC"; }
 
 .transfers-table .col-size,
 .transfers-table .col-speed { text-align: right; }
@@ -369,10 +571,12 @@ input:focus {
 .transfers-table tbody tr {
   cursor: pointer;
   border-bottom: 1px solid var(--border);
+  transition: background var(--fast);
 }
 .transfers-table tbody tr:last-child { border-bottom: none; }
 .transfers-table tbody tr:hover { background: var(--field); }
 .transfers-table tbody tr.selected { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.transfers-table tbody tr.selected:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
 
 .transfers-table td {
   padding: 8px 10px;
@@ -382,20 +586,39 @@ input:focus {
 .row-name {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  max-width: 320px;
+  gap: 3px;
+  max-width: 340px;
+}
+.row-name .name-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
 }
 .row-name .name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: var(--fs-md);
 }
 .row-name .host {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.category-pill {
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--field);
+  color: var(--text-muted);
+  border: 1px solid var(--border-strong);
 }
 
 .col-size, .col-speed {
@@ -428,34 +651,62 @@ input:focus {
 }
 
 .state-badge {
-  display: inline-block;
-  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
   border-radius: 999px;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.03em;
   background: var(--field);
   color: var(--text-muted);
 }
+.state-badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
 .state-badge.state-running { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent); }
 .state-badge.state-done,
 .state-badge.state-seeding { background: color-mix(in srgb, var(--success) 22%, transparent); color: var(--success); }
 .state-badge.state-error { background: color-mix(in srgb, var(--danger) 22%, transparent); color: var(--danger); }
-.state-badge.state-paused { color: var(--text-faint); }
+.state-badge.state-paused,
+.state-badge.state-queued { color: var(--text-faint); }
 
 .row-actions {
   display: flex;
-  gap: 4px;
+  gap: var(--space-1);
   justify-content: flex-end;
 }
-.row-actions .btn {
-  padding: 4px 8px;
-  font-size: 11px;
+
+/* Icons rather than words on a row: a table already reads left to right, and
+ * "Pause"/"Resume"/"Remove" spelled out on every row of a busy list was
+ * exactly the kind of noise that made the page feel unfinished. */
+.icon-btn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--fast), color var(--fast), border-color var(--fast);
 }
+.icon-btn svg { width: 14px; height: 14px; }
+.icon-btn:hover { background: var(--field); border-color: var(--border-strong); color: var(--text); }
+.icon-btn.icon-btn-danger:hover { color: var(--danger); border-color: var(--danger); }
 
 .empty-note {
-  padding: 32px;
+  padding: 48px 32px;
   text-align: center;
 }
 

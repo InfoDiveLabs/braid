@@ -50,6 +50,25 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+/* ==================================================================== icons */
+
+// Inline rather than an icon font or a sprite sheet fetched separately: the
+// whole point of this file is that nothing it draws needs a network request
+// beyond itself. `currentColor` lets each button's own CSS decide the tint.
+const ICONS = {
+  pause:
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="3" width="3" height="10" rx="1" fill="currentColor"/><rect x="9" y="3" width="3" height="10" rx="1" fill="currentColor"/></svg>',
+  resume:
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3v10l8-5-8-5z" fill="currentColor"/></svg>',
+  remove:
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 5h8M6.5 5V3.4h3V5M5 5l.6 8a1 1 0 0 0 1 .9h2.8a1 1 0 0 0 1-.9L11 5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+};
+
+function iconButton(action, title, danger) {
+  const icon = ICONS[action] || "";
+  return `<button type="button" class="icon-btn${danger ? " icon-btn-danger" : ""}" data-action="${action}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}">${icon}</button>`;
+}
+
 /* =================================================================== api */
 
 // Every call to the server's own API goes through here, so a 403 is caught
@@ -80,11 +99,23 @@ async function apiJson(path, options) {
 const state = {
   transfers: new Map(),
   totalBytesPerSec: 0,
+  // The set of rows highlighted for bulk action. A plain click replaces it
+  // with one id; ctrl/cmd-click toggles a member; shift-click replaces it
+  // with a range. The detail panel opens only when it holds exactly one id,
+  // tracked separately in `selectedId` so a two-row selection can still say
+  // plainly "no single transfer to show details for".
+  selection: new Set(),
   selectedId: null,
+  anchorId: null,
   detailTab: "info",
   eventSource: null,
   piecesTimer: null,
   settingsInterfaces: [],
+  filterState: "all",
+  filterCategory: "",
+  searchQuery: "",
+  sortKey: "name",
+  sortDir: "asc",
 };
 
 /* ================================================================ screens */
@@ -117,6 +148,10 @@ async function boot() {
   wireDetailPanel();
   wireSettingsForm();
   wireDropZone();
+  wireFilterBar();
+  wireSortableHeaders();
+  wireBulkBar();
+  wireStatsBarActions();
 
   // The only way to know whether a cookie already proves a session: ask for
   // something that requires one and see whether it is refused.
@@ -217,7 +252,6 @@ function stopEvents() {
 
 function applyFrame(frame) {
   state.totalBytesPerSec = frame.total_bytes_per_sec || 0;
-  document.getElementById("total-rate").textContent = formatSpeed(state.totalBytesPerSec);
 
   const seen = new Set();
   for (const transfer of frame.transfers) {
@@ -227,8 +261,16 @@ function applyFrame(frame) {
   for (const id of Array.from(state.transfers.keys())) {
     if (!seen.has(id)) state.transfers.delete(id);
   }
+  // A vanished transfer (removed from another tab, or finished and pruned)
+  // cannot stay in a selection nobody can act on any more.
+  for (const id of Array.from(state.selection)) {
+    if (!seen.has(id)) state.selection.delete(id);
+  }
 
+  renderStatsBar();
+  renderCategoryOptions();
   renderTable();
+  renderBulkBar();
 
   if (state.selectedId !== null) {
     if (!seen.has(state.selectedId)) {
@@ -239,13 +281,201 @@ function applyFrame(frame) {
   }
 }
 
+/* ============================================================= stats bar */
+
+function renderStatsBar() {
+  document.getElementById("stat-down").textContent = formatSpeed(state.totalBytesPerSec);
+
+  let upload = 0;
+  let active = 0;
+  for (const t of state.transfers.values()) {
+    if (t.torrent && t.torrent.upload_bytes_per_sec) upload += t.torrent.upload_bytes_per_sec;
+    if (t.state === "running") active += 1;
+  }
+  document.getElementById("stat-up").textContent = formatSpeed(upload);
+  document.getElementById("stat-active").textContent = String(active);
+  document.getElementById("stat-total").textContent = String(state.transfers.size);
+}
+
+function wireStatsBarActions() {
+  document.getElementById("pause-all-btn").addEventListener("click", async () => {
+    const ids = [];
+    for (const t of state.transfers.values()) {
+      if (t.state === "running" || t.state === "queued") ids.push(t.id);
+    }
+    await Promise.all(ids.map((id) => api(`/api/v1/transfers/${id}/pause`, { method: "POST" })));
+  });
+  document.getElementById("resume-all-btn").addEventListener("click", async () => {
+    const ids = [];
+    for (const t of state.transfers.values()) {
+      if (t.state === "paused" || t.state === "error") ids.push(t.id);
+    }
+    await Promise.all(ids.map((id) => api(`/api/v1/transfers/${id}/resume`, { method: "POST" })));
+  });
+}
+
+/* ============================================================= filter bar */
+
+// One place both the table and a shift-click range read the current row
+// order from, so "the eleventh visible row" means the same thing to each.
+function viewRows() {
+  const query = state.searchQuery.trim().toLowerCase();
+  const rows = Array.from(state.transfers.values()).filter((t) => {
+    if (!matchesStateFilter(t, state.filterState)) return false;
+    if (state.filterCategory === "__none__" && t.category) return false;
+    if (state.filterCategory && state.filterCategory !== "__none__" && t.category !== state.filterCategory) {
+      return false;
+    }
+    if (query && !t.filename.toLowerCase().includes(query)) return false;
+    return true;
+  });
+  rows.sort((a, b) => compareTransfers(a, b, state.sortKey));
+  if (state.sortDir === "desc") rows.reverse();
+  return rows;
+}
+
+function matchesStateFilter(t, group) {
+  switch (group) {
+    case "downloading":
+      return t.state === "running" || t.state === "queued";
+    case "seeding":
+      return t.state === "seeding";
+    case "completed":
+      return t.state === "done";
+    case "paused":
+      return t.state === "paused";
+    case "failed":
+      return t.state === "error";
+    default:
+      return true;
+  }
+}
+
+function sortValue(t, key) {
+  switch (key) {
+    case "size":
+      return t.total != null ? t.total : t.downloaded;
+    case "progress":
+      return t.percent != null ? t.percent : 0;
+    case "speed":
+      return t.state === "running" ? t.bytes_per_sec || 0 : 0;
+    case "state":
+      return stateLabel(t.state).toLowerCase();
+    case "name":
+    default:
+      return (t.filename || "").toLowerCase();
+  }
+}
+
+function compareTransfers(a, b, key) {
+  const va = sortValue(a, key);
+  const vb = sortValue(b, key);
+  if (typeof va === "string") return va.localeCompare(vb);
+  return va - vb;
+}
+
+function computeStateCounts() {
+  const counts = { all: 0, downloading: 0, seeding: 0, completed: 0, paused: 0, failed: 0 };
+  for (const t of state.transfers.values()) {
+    counts.all += 1;
+    if (t.state === "running" || t.state === "queued") counts.downloading += 1;
+    else if (t.state === "seeding") counts.seeding += 1;
+    else if (t.state === "done") counts.completed += 1;
+    else if (t.state === "paused") counts.paused += 1;
+    else if (t.state === "error") counts.failed += 1;
+  }
+  return counts;
+}
+
+function renderStateCounts() {
+  const counts = computeStateCounts();
+  for (const [key, value] of Object.entries(counts)) {
+    const el = document.getElementById(`count-${key}`);
+    if (el) el.textContent = value > 0 ? String(value) : "";
+  }
+}
+
+function renderCategoryOptions() {
+  const select = document.getElementById("category-filter");
+  const datalist = document.getElementById("category-options");
+  const categories = new Set();
+  let hasUncategorized = false;
+  for (const t of state.transfers.values()) {
+    if (t.category) categories.add(t.category);
+    else hasUncategorized = true;
+  }
+  const sorted = Array.from(categories).sort((a, b) => a.localeCompare(b));
+
+  const previous = select.value;
+  select.innerHTML =
+    '<option value="">All categories</option>' +
+    sorted.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("") +
+    (hasUncategorized ? '<option value="__none__">Uncategorized</option>' : "");
+  const stillValid = Array.from(select.options).some((o) => o.value === previous);
+  select.value = stillValid ? previous : "";
+  state.filterCategory = select.value;
+
+  datalist.innerHTML = sorted.map((c) => `<option value="${escapeHtml(c)}"></option>`).join("");
+}
+
+function wireFilterBar() {
+  const tabs = document.getElementById("state-tabs");
+  tabs.addEventListener("click", (event) => {
+    const button = event.target.closest(".state-tab");
+    if (!button) return;
+    for (const tab of tabs.querySelectorAll(".state-tab")) tab.classList.toggle("active", tab === button);
+    state.filterState = button.dataset.state;
+    renderTable();
+  });
+
+  document.getElementById("category-filter").addEventListener("change", (event) => {
+    state.filterCategory = event.target.value;
+    renderTable();
+  });
+
+  document.getElementById("search-input").addEventListener("input", (event) => {
+    state.searchQuery = event.target.value;
+    renderTable();
+  });
+}
+
+function wireSortableHeaders() {
+  document.getElementById("transfers-table").querySelector("thead").addEventListener("click", (event) => {
+    const th = event.target.closest("th[data-sort]");
+    if (!th) return;
+    const key = th.dataset.sort;
+    if (state.sortKey === key) {
+      state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+    } else {
+      state.sortKey = key;
+      state.sortDir = "asc";
+    }
+    renderTable();
+  });
+}
+
+function renderSortIndicators() {
+  for (const th of document.querySelectorAll("#transfers-table thead th[data-sort]")) {
+    const active = th.dataset.sort === state.sortKey;
+    th.classList.toggle("sort-active", active);
+    th.classList.toggle("sort-asc", active && state.sortDir === "asc");
+    th.classList.toggle("sort-desc", active && state.sortDir === "desc");
+  }
+}
+
 /* ================================================================== table */
 
 function renderTable() {
+  renderStateCounts();
+  renderSortIndicators();
+
   const body = document.getElementById("transfers-body");
   const emptyNote = document.getElementById("empty-note");
-  const rows = Array.from(state.transfers.values());
-  emptyNote.hidden = rows.length > 0;
+  const noMatchNote = document.getElementById("no-match-note");
+  const rows = viewRows();
+
+  emptyNote.hidden = state.transfers.size > 0;
+  noMatchNote.hidden = state.transfers.size === 0 || rows.length > 0;
 
   body.innerHTML = rows.map(rowHtml).join("");
 
@@ -253,7 +483,7 @@ function renderTable() {
     const id = Number(tr.dataset.id);
     tr.addEventListener("click", (event) => {
       if (event.target.closest("button")) return;
-      selectTransfer(id);
+      handleRowClick(id, event);
     });
   }
   for (const button of body.querySelectorAll("[data-action]")) {
@@ -264,23 +494,83 @@ function renderTable() {
       if (action === "pause") await api(`/api/v1/transfers/${id}/pause`, { method: "POST" });
       if (action === "resume") await api(`/api/v1/transfers/${id}/resume`, { method: "POST" });
       if (action === "remove") {
-        if (!confirm("Remove this transfer? Files already on disk are kept.")) return;
+        // No confirmation: this leaves files on disk untouched, the same
+        // contract the bulk "Remove" action makes. Only "remove with files",
+        // reachable from the bulk bar once something is selected, asks first.
         await api(`/api/v1/transfers/${id}`, { method: "DELETE" });
-        if (state.selectedId === id) closeDetail();
+        const wasDetail = state.selectedId === id;
+        state.selection.delete(id);
+        if (wasDetail) closeDetail();
+        else {
+          renderTable();
+          renderBulkBar();
+        }
       }
     });
   }
 }
 
+function handleRowClick(id, event) {
+  if (event.shiftKey && state.anchorId !== null) {
+    const ids = viewRows().map((t) => t.id);
+    const a = ids.indexOf(state.anchorId);
+    const b = ids.indexOf(id);
+    if (a === -1 || b === -1) {
+      selectSingle(id);
+    } else {
+      const [lo, hi] = a < b ? [a, b] : [b, a];
+      state.selection = new Set(ids.slice(lo, hi + 1));
+      syncSelectedId();
+    }
+  } else if (event.metaKey || event.ctrlKey) {
+    if (state.selection.has(id)) {
+      state.selection.delete(id);
+    } else {
+      state.selection.add(id);
+    }
+    state.anchorId = id;
+    syncSelectedId();
+  } else {
+    selectSingle(id);
+  }
+
+  renderTable();
+  renderBulkBar();
+
+  if (state.selectedId !== null) {
+    document.getElementById("detail-panel").hidden = false;
+    state.detailTab = "info";
+    renderDetailFromState();
+    loadChecksum(state.selectedId);
+  } else {
+    document.getElementById("detail-panel").hidden = true;
+    stopPiecesPolling();
+  }
+}
+
+function selectSingle(id) {
+  state.selection = new Set([id]);
+  state.anchorId = id;
+  state.selectedId = id;
+}
+
+function syncSelectedId() {
+  state.selectedId = state.selection.size === 1 ? Array.from(state.selection)[0] : null;
+}
+
 function rowHtml(t) {
   const percent = t.percent;
   const pct = percent === null || percent === undefined ? 0 : percent;
-  const selected = t.id === state.selectedId ? " selected" : "";
+  const selected = state.selection.has(t.id) ? " selected" : "";
+  const categoryPill = t.category ? `<span class="category-pill">${escapeHtml(t.category)}</span>` : "";
   return `
     <tr data-id="${t.id}" class="${selected.trim()}">
       <td>
         <div class="row-name">
-          <span class="name">${escapeHtml(t.filename)}</span>
+          <div class="name-line">
+            <span class="name">${escapeHtml(t.filename)}</span>
+            ${categoryPill}
+          </div>
           <span class="host">${escapeHtml(t.host || "")}</span>
         </div>
       </td>
@@ -295,13 +585,83 @@ function rowHtml(t) {
       <td class="col-state"><span class="state-badge state-${t.state}">${stateLabel(t.state)}</span></td>
       <td class="col-actions">
         <div class="row-actions">
-          ${t.state === "running" ? `<button class="btn" data-action="pause">Pause</button>` : ""}
-          ${t.state === "paused" || t.state === "queued" ? `<button class="btn" data-action="resume">Resume</button>` : ""}
-          ${t.state === "error" ? `<button class="btn" data-action="resume">Retry</button>` : ""}
-          <button class="btn btn-danger" data-action="remove">Remove</button>
+          ${t.state === "running" ? iconButton("pause", "Pause") : ""}
+          ${t.state === "paused" || t.state === "queued" ? iconButton("resume", "Resume") : ""}
+          ${t.state === "error" ? iconButton("resume", "Retry") : ""}
+          ${iconButton("remove", "Remove", true)}
         </div>
       </td>
     </tr>`;
+}
+
+/* ================================================================ bulk bar */
+
+function renderBulkBar() {
+  const bar = document.getElementById("bulk-bar");
+  const count = state.selection.size;
+  // Shown for a selection of one, not just several: "remove with files" has
+  // no per-row equivalent (see the row actions' own comment), so the bulk
+  // bar is the only place that action exists at all, and it has to reach a
+  // single torrent's files just as well as a batch of them.
+  bar.hidden = count === 0;
+  if (count > 0) {
+    document.getElementById("bulk-count").textContent = count === 1 ? "1 selected" : `${count} selected`;
+  }
+}
+
+function wireBulkBar() {
+  document.getElementById("bulk-clear").addEventListener("click", () => {
+    state.selection.clear();
+    state.selectedId = null;
+    state.anchorId = null;
+    renderTable();
+    renderBulkBar();
+  });
+
+  document.querySelector("#bulk-bar .bulk-actions").addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-bulk]");
+    if (!button) return;
+    const ids = Array.from(state.selection);
+    const action = button.dataset.bulk;
+
+    if (action === "pause") {
+      const targets = ids.filter((id) => {
+        const t = state.transfers.get(id);
+        return t && (t.state === "running" || t.state === "queued");
+      });
+      await Promise.all(targets.map((id) => api(`/api/v1/transfers/${id}/pause`, { method: "POST" })));
+    } else if (action === "resume") {
+      const targets = ids.filter((id) => {
+        const t = state.transfers.get(id);
+        return t && (t.state === "paused" || t.state === "error");
+      });
+      await Promise.all(targets.map((id) => api(`/api/v1/transfers/${id}/resume`, { method: "POST" })));
+    } else if (action === "remove") {
+      // Files are kept: the same contract a single row's Remove button
+      // makes, so this needs no confirmation either.
+      await Promise.all(ids.map((id) => api(`/api/v1/transfers/${id}`, { method: "DELETE" })));
+      clearSelectionAfterRemoval(ids);
+    } else if (action === "remove-files") {
+      // Deleting several people's... several downloads' worth of data on one
+      // click is exactly the situation that gets a tool uninstalled.
+      const warning =
+        ids.length === 1
+          ? "Permanently delete this transfer's files from disk? This cannot be undone."
+          : `Permanently delete the files for all ${ids.length} selected transfers? This cannot be undone.`;
+      if (!confirm(warning)) return;
+      await Promise.all(
+        ids.map((id) => api(`/api/v1/transfers/${id}?delete_files=true`, { method: "DELETE" })),
+      );
+      clearSelectionAfterRemoval(ids);
+    }
+  });
+}
+
+function clearSelectionAfterRemoval(ids) {
+  for (const id of ids) state.selection.delete(id);
+  if (state.selectedId !== null && ids.includes(state.selectedId)) closeDetail();
+  renderTable();
+  renderBulkBar();
 }
 
 /* ================================================================= add box */
@@ -333,12 +693,14 @@ async function submitNewTransfer(payload) {
   const connections = document.getElementById("add-connections").value.trim();
   const expect = document.getElementById("add-expect").value.trim();
   const category = document.getElementById("add-category").value.trim();
+  const startPaused = document.getElementById("add-start-paused").checked;
 
   const body = { ...payload };
   if (destination) body.destination = destination;
   if (connections) body.connections = Number(connections);
   if (expect) body.expect = expect;
   if (category) body.category = category;
+  if (startPaused) body.start_paused = true;
 
   const { ok, body: result } = await apiJson("/api/v1/transfers", {
     method: "POST",
@@ -352,6 +714,7 @@ async function submitNewTransfer(payload) {
   }
 
   document.getElementById("add-url").value = "";
+  document.getElementById("add-start-paused").checked = false;
 }
 
 /* ============================================================== drag/drop */
@@ -402,20 +765,14 @@ function fileToBase64(file) {
 
 /* =============================================================== detail */
 
-function selectTransfer(id) {
-  state.selectedId = id;
-  state.detailTab = "info";
-  document.getElementById("detail-panel").hidden = false;
-  renderTable();
-  renderDetailFromState();
-  loadChecksum(id);
-}
-
 function closeDetail() {
+  state.selection.clear();
   state.selectedId = null;
+  state.anchorId = null;
   document.getElementById("detail-panel").hidden = true;
   stopPiecesPolling();
   renderTable();
+  renderBulkBar();
 }
 
 function wireDetailPanel() {
@@ -499,6 +856,7 @@ function renderInfoTab(t) {
 
   const stats = [];
   stats.push(["State", stateLabel(t.state)]);
+  if (t.category) stats.push(["Category", t.category]);
   stats.push(["Downloaded", formatBytes(t.downloaded) + (t.total != null ? ` of ${formatBytes(t.total)}` : "")]);
   if (t.state === "running") {
     stats.push(["Speed", formatSpeed(t.bytes_per_sec)]);
@@ -507,7 +865,6 @@ function renderInfoTab(t) {
   if (t.phase) stats.push(["Phase", t.phase]);
   if (t.torrent) {
     if (t.torrent.info_hash) stats.push(["Info hash", t.torrent.info_hash]);
-    stats.push(["Peers", String(t.torrent.peers)]);
     stats.push(["Uploaded", formatBytes(t.torrent.uploaded)]);
     if (t.torrent.upload_bytes_per_sec) stats.push(["Upload speed", formatSpeed(t.torrent.upload_bytes_per_sec)]);
   }
@@ -662,6 +1019,10 @@ async function refreshPieces(id) {
   const grid = document.getElementById("pieces-grid");
   const note = document.getElementById("pieces-bucket-note");
   if (!ok || body.chunk_count == null) {
+    // `.pieces-grid` is a grid with a fixed 18 columns for the piece cells;
+    // without this, a single <p> dropped in as its only child is forced into
+    // one of those columns and wraps to a single word per line.
+    grid.style.display = "block";
     grid.innerHTML = '<p class="muted">No piece data right now: this transfer is not currently running.</p>';
     note.hidden = true;
     return;
@@ -670,6 +1031,7 @@ async function refreshPieces(id) {
   const bitmap = base64ToBytes(body.complete || "");
   const { cells, bucket } = cellsFor(body.chunk_count, bitmap, body.inflight || []);
 
+  grid.style.display = "grid";
   grid.style.gridTemplateColumns = `repeat(${GRID_COLUMNS}, 1fr)`;
   grid.innerHTML = cells
     .map((cell) => {
