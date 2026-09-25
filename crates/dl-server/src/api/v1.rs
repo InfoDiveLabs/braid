@@ -1,4 +1,4 @@
-//! `/api/v1/transfers`: Braid's own read surface over the engine.
+//! `/api/v1/transfers`: Braid's own read and write surface over the engine.
 //!
 //! One shape for a torrent and an HTTP download alike, because the web UI
 //! draws one row type and only needs the torrent-only fields once it knows
@@ -9,21 +9,26 @@
 use crate::state::AppState;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use dl_core::chunks::ChunkReport;
-use dl_core::engine::{DownloadId, DownloadSnapshot};
+use dl_core::engine::{DownloadId, DownloadSnapshot, DownloadSpec};
+use dl_core::integrity::{Algorithm, Digest};
 use dl_core::lane::LaneReport;
-use dl_core::torrent::{TorrentFile, TorrentStatus};
+use dl_core::torrent::{TorrentFile, TorrentStatus, TransferKind, classify};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/v1/transfers", get(list_transfers))
-        .route("/api/v1/transfers/{id}", get(get_transfer))
+        .route("/api/v1/transfers", get(list_transfers).post(add_transfer))
+        .route("/api/v1/transfers/{id}", get(get_transfer).delete(delete_transfer))
         .route("/api/v1/transfers/{id}/pieces", get(get_pieces))
+        .route("/api/v1/transfers/{id}/pause", post(pause_transfer))
+        .route("/api/v1/transfers/{id}/resume", post(resume_transfer))
 }
 
 /// One transfer, as the web UI reads it.
@@ -159,13 +164,174 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "no such transfer" }))).into_response()
 }
 
+fn bad_request(field: &str, message: impl std::fmt::Display) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "field": field, "error": message.to_string() })))
+        .into_response()
+}
+
+/// What a caller sends to start a transfer.
+///
+/// One shape for a magnet and a URL alike: the caller has one box to paste
+/// into and no reason to know which kind of link it holds, and
+/// `dl_core::torrent::classify` already answers that question for whichever
+/// one arrives.
+#[derive(Deserialize)]
+struct NewTransfer {
+    url: String,
+    /// A path, absolute or relative to the server's download directory.
+    /// Left to the server to pick when absent.
+    destination: Option<String>,
+    connections: Option<usize>,
+    /// A pasted digest: `sha256:<hex>`, or bare hex when the algorithm is
+    /// unambiguous. See [`parse_expect`].
+    expect: Option<String>,
+    /// A qBittorrent idea, kept out of `DownloadSpec` on purpose: see
+    /// `set_category`.
+    category: Option<String>,
+}
+
+async fn add_transfer(State(state): State<AppState>, Json(body): Json<NewTransfer>) -> Response {
+    let expect = match body.expect.as_deref().map(parse_expect) {
+        Some(Err(message)) => return bad_request("expect", message),
+        Some(Ok(digest)) => Some(digest),
+        None => None,
+    };
+
+    let kind = classify(&body.url);
+    let destination = match &body.destination {
+        Some(raw) => resolve_destination(&state.config.download_dir, raw),
+        None => default_destination(&state.config.download_dir, &body.url, &kind),
+    };
+
+    let mut spec = DownloadSpec::new(body.url, destination);
+    spec.connections = body.connections.unwrap_or(state.config.connections).max(1);
+    spec.expect = expect;
+
+    let id = state.engine.add(spec);
+    if let Some(category) = body.category {
+        set_category(id, category);
+    }
+
+    let snapshot = state.engine.get(id).expect("just added, cannot have vanished already");
+    (StatusCode::CREATED, Json(transfer_json(&snapshot))).into_response()
+}
+
+/// Read a pasted digest the way a person actually writes one down: an
+/// `algorithm:` prefix, or bare hex when the length alone says which
+/// algorithm it must be. Mirrors `dl-cli`'s own `human::parse_digest`, which
+/// this crate cannot call directly (a server has no business depending on the
+/// CLI binary to read one string), but the two front ends must still agree on
+/// what a person is allowed to paste.
+fn parse_expect(text: &str) -> Result<Digest, String> {
+    let text = text.trim();
+    let (algorithm, hex) = match text.split_once(':') {
+        Some((name, hex)) => (
+            Algorithm::parse(name).ok_or_else(|| format!("unknown digest algorithm '{name}'"))?,
+            hex.trim(),
+        ),
+        None => (Algorithm::guess_from_hex(text).unwrap_or_default(), text),
+    };
+    Digest::parse(algorithm, hex).ok_or_else(|| {
+        format!("expected a {}-character {} digest", algorithm.hex_len(), algorithm.label())
+    })
+}
+
+fn resolve_destination(download_dir: &std::path::Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() { path } else { download_dir.join(path) }
+}
+
+/// Where a transfer lands when the caller did not say.
+///
+/// A torrent's destination is the folder its own files are written under, so
+/// the download directory itself is already the right answer; an HTTP
+/// transfer needs a filename, which the URL is the only source for.
+fn default_destination(download_dir: &std::path::Path, url: &str, kind: &TransferKind) -> PathBuf {
+    match kind {
+        TransferKind::Torrent(_) | TransferKind::IncompleteMagnet => download_dir.to_path_buf(),
+        TransferKind::Http => download_dir.join(filename_from_url(url)),
+    }
+}
+
+fn filename_from_url(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("download").to_string()
+}
+
+async fn pause_transfer(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
+    let id = DownloadId(id);
+    if state.engine.get(id).is_none() {
+        return not_found();
+    }
+    state.engine.pause(id);
+    Json(transfer_json(&state.engine.get(id).expect("still here, we hold no lock across this")))
+        .into_response()
+}
+
+async fn resume_transfer(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
+    let id = DownloadId(id);
+    if state.engine.get(id).is_none() {
+        return not_found();
+    }
+    state.engine.resume(id);
+    Json(transfer_json(&state.engine.get(id).expect("still here, we hold no lock across this")))
+        .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct DeleteQuery {
+    /// Defaults to `false`. Deleting somebody's data on the default path of a
+    /// `DELETE` is the kind of thing that gets a tool uninstalled, so a
+    /// caller has to ask for it by name rather than by omission.
+    #[serde(default)]
+    delete_files: bool,
+}
+
+async fn delete_transfer(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+    Query(query): Query<DeleteQuery>,
+) -> Response {
+    let id = DownloadId(id);
+    if state.engine.get(id).is_none() {
+        return not_found();
+    }
+    state.engine.remove_with_files(id, query.delete_files);
+    clear_category(id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Categories, by transfer id.
+///
+/// A category is a qBittorrent idea and `DownloadSpec` must never learn it
+/// exists, which is why this is not a field on the spec. It belongs beside
+/// the persisted record's own label map (`dl_core::engine::Restorable::labels`,
+/// written out by `dl_core::persist`), but `Engine::add` has no hook for
+/// attaching a label at creation time: only `Engine::restore` takes one, and
+/// that path exists for putting history back at startup, not for a transfer
+/// just added over this endpoint. Held here, in memory, until the engine
+/// grows that hook, which is also why a category does not yet survive a
+/// restart the way the rest of a transfer does.
+static CATEGORIES: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<u64, String>>> =
+    std::sync::OnceLock::new();
+
+fn categories() -> &'static std::sync::Mutex<std::collections::BTreeMap<u64, String>> {
+    CATEGORIES.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+fn set_category(id: DownloadId, category: String) {
+    categories().lock().unwrap().insert(id.0, category);
+}
+
+fn clear_category(id: DownloadId) {
+    categories().lock().unwrap().remove(&id.0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use dl_core::budget::Budget;
-    use dl_core::engine::{
-        DownloadSpec, Engine, EngineConfig, SourceFactory, State as TransferState,
-    };
+    use dl_core::engine::{Engine, EngineConfig, SourceFactory, State as TransferState};
     use dl_core::lane::LaneSet;
     use http_body_util::BodyExt;
     use std::sync::Arc;
@@ -291,8 +457,9 @@ mod tests {
     fn test_state() -> AppState {
         let engine = Engine::new(
             Arc::new(NoSources),
-            // Zero concurrency: nothing added in these tests should ever
-            // leave the queue to ask `NoSources` for a lane.
+            // Zero concurrency: a transfer added in these tests must stay
+            // queued, never spawn the task that would call `NoSources`, and
+            // never touch the network these tests have no business reaching.
             EngineConfig { max_concurrent: 0, ..Default::default() },
             Budget::unlimited(),
         );
@@ -301,6 +468,15 @@ mod tests {
 
     fn app() -> axum::Router {
         routes().with_state(test_state())
+    }
+
+    fn post(uri: &str, body: Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
     }
 
     fn get(uri: &str) -> axum::http::Request<axum::body::Body> {
@@ -314,9 +490,13 @@ mod tests {
 
     #[tokio::test]
     async fn listing_reaches_every_transfer_the_engine_knows_about() {
-        let state = test_state();
-        state.engine.add(DownloadSpec::new("https://example.test/a.iso", "/tmp/a.iso"));
-        let router = routes().with_state(state);
+        let router = app();
+        let response = router
+            .clone()
+            .oneshot(post("/api/v1/transfers", json!({"url": "https://example.test/a.iso"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
 
         let listed = body_json(router.oneshot(get("/api/v1/transfers")).await.unwrap()).await;
         assert_eq!(listed["transfers"].as_array().unwrap().len(), 1);
@@ -326,5 +506,144 @@ mod tests {
     async fn a_transfer_that_does_not_exist_is_a_404_not_an_empty_row() {
         let response = app().oneshot(get("/api/v1/transfers/999")).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn adding_a_magnet_and_a_url_both_work_through_one_endpoint() {
+        // The UI has one box. Making the caller say which kind it is would
+        // push a decision onto a user who pasted a link, when `classify`
+        // already knows.
+        let state = test_state();
+        let router = routes().with_state(state.clone());
+
+        let hash = "cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Some+Release");
+        let magnet_response = router
+            .clone()
+            .oneshot(post("/api/v1/transfers", json!({"url": magnet})))
+            .await
+            .unwrap();
+        assert_eq!(magnet_response.status(), StatusCode::CREATED);
+        let magnet_json = body_json(magnet_response).await;
+        assert_eq!(magnet_json["state"], "queued");
+        // The magnet's own `dn=` names the row before any metadata exists;
+        // an HTTP transfer has no such thing, so seeing it here is also proof
+        // the request actually reached the torrent path.
+        assert_eq!(magnet_json["filename"], "Some Release");
+
+        let url_response = router
+            .oneshot(post("/api/v1/transfers", json!({"url": "https://example.test/x.iso"})))
+            .await
+            .unwrap();
+        assert_eq!(url_response.status(), StatusCode::CREATED);
+        assert_eq!(body_json(url_response).await["state"], "queued");
+
+        assert_eq!(state.engine.snapshot().len(), 2, "one endpoint, both requests landed");
+    }
+
+    #[tokio::test]
+    async fn a_bad_digest_is_refused_before_anything_is_started() {
+        // Starting a six gigabyte download and failing it at the end over a
+        // typo in the checksum field is a bad way to find out.
+        let state = test_state();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(post(
+                "/api/v1/transfers",
+                json!({"url": "https://example.test/a.iso", "expect": "sha256:not-hex"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["field"], "expect");
+        assert!(state.engine.snapshot().is_empty(), "nothing should have been queued");
+    }
+
+    #[tokio::test]
+    async fn removing_a_transfer_keeps_the_files_unless_asked() {
+        // Deleting somebody's data on the default path of a DELETE is the
+        // kind of thing that gets a tool uninstalled.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a.iso");
+        std::fs::write(&dest, b"already on disk").unwrap();
+
+        let state = test_state();
+        let router = routes().with_state(state.clone());
+        let added = router
+            .clone()
+            .oneshot(post(
+                "/api/v1/transfers",
+                json!({"url": "https://example.test/a.iso", "destination": dest.to_str().unwrap()}),
+            ))
+            .await
+            .unwrap();
+        let id = body_json(added).await["id"].as_u64().unwrap();
+
+        let deleted =
+            router.clone().oneshot(delete(&format!("/api/v1/transfers/{id}"))).await.unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert!(dest.exists(), "a bare DELETE must not have touched the file");
+        assert!(state.engine.get(DownloadId(id)).is_none(), "the row itself is gone");
+    }
+
+    #[tokio::test]
+    async fn asking_for_delete_files_actually_removes_them() {
+        // The other half of the story above: the flag has to do something,
+        // or the guarantee it is checked against is untested.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a.iso");
+        std::fs::write(&dest, b"already on disk").unwrap();
+
+        let router = routes().with_state(test_state());
+        let added = router
+            .clone()
+            .oneshot(post(
+                "/api/v1/transfers",
+                json!({"url": "https://example.test/a.iso", "destination": dest.to_str().unwrap()}),
+            ))
+            .await
+            .unwrap();
+        let id = body_json(added).await["id"].as_u64().unwrap();
+
+        router.oneshot(delete(&format!("/api/v1/transfers/{id}?delete_files=true"))).await.unwrap();
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn pausing_and_resuming_an_unknown_transfer_is_a_404() {
+        let router = routes().with_state(test_state());
+        let paused =
+            router.clone().oneshot(post("/api/v1/transfers/1/pause", json!({}))).await.unwrap();
+        assert_eq!(paused.status(), StatusCode::NOT_FOUND);
+        let resumed = router.oneshot(post("/api/v1/transfers/1/resume", json!({}))).await.unwrap();
+        assert_eq!(resumed.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_paused_transfer_reports_as_paused_not_as_stalled() {
+        let state = test_state();
+        let router = routes().with_state(state.clone());
+        let added = router
+            .clone()
+            .oneshot(post("/api/v1/transfers", json!({"url": "https://example.test/a.iso"})))
+            .await
+            .unwrap();
+        let id = body_json(added).await["id"].as_u64().unwrap();
+
+        let paused = router
+            .oneshot(post(&format!("/api/v1/transfers/{id}/pause"), json!({})))
+            .await
+            .unwrap();
+        assert_eq!(paused.status(), StatusCode::OK);
+        assert_eq!(body_json(paused).await["state"], "paused");
+    }
+
+    fn delete(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
     }
 }
