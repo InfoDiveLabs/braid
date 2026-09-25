@@ -248,6 +248,16 @@ async fn body_text(response: axum::http::Response<axum::body::Body>) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+/// The fixtures are recordings from a Linux container, so they carry `/`
+/// while a native Windows run renders the same path with `\`.
+fn normalise_separators(entry: &mut Value, fields: &[&str]) {
+    for field in fields {
+        if let Some(s) = entry[*field].as_str() {
+            entry[*field] = Value::from(s.replace('\\', "/"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn version_probe_before_login_is_refused() {
     let fixture = fixture!("version_probe_before_login_is_refused");
@@ -398,7 +408,8 @@ async fn sonarr_adds_a_magnet_with_a_category_and_no_save_path() {
     .await;
     let list: Value = serde_json::from_str(&body_text(list_response).await).unwrap();
     assert_eq!(
-        list[0]["save_path"], "/downloads/tv-sonarr",
+        list[0]["save_path"],
+        app.state.config.download_dir.join("tv-sonarr").display().to_string(),
         "an empty category save path must resolve under the download directory, not to it literally"
     );
 }
@@ -427,10 +438,9 @@ async fn torrents_info_while_downloading() {
     let session = app.login().await;
     app.create_tv_sonarr_category(&session).await;
     let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Big+Buck+Bunny");
-    let id = app.state.engine.add(DownloadSpec::new(
-        magnet,
-        app.state.config.download_dir.join("tv-sonarr/Big Buck Bunny"),
-    ));
+    let save_path = app.state.config.download_dir.join("tv-sonarr");
+    let destination = save_path.join("Big Buck Bunny");
+    let id = app.state.engine.add(DownloadSpec::new(magnet, destination.clone()));
     // `engine.add` alone is not the same request Sonarr sent: the real
     // `torrents/add` handler is what attaches a category label, and that
     // label, not the destination passed here, is what `torrents/info`
@@ -440,7 +450,7 @@ async fn torrents_info_while_downloading() {
         id,
         std::collections::BTreeMap::from([
             ("category".to_string(), "tv-sonarr".to_string()),
-            ("save_path".to_string(), "/downloads/tv-sonarr".to_string()),
+            ("save_path".to_string(), save_path.display().to_string()),
         ]),
     );
     for _ in 0..200 {
@@ -475,8 +485,8 @@ async fn torrents_info_while_downloading() {
     // finished download whose content was reported as sitting at the category
     // directory itself, and refused to import it, which is what the recording
     // beside this test caught.
-    assert_eq!(entry["save_path"], "/downloads/tv-sonarr");
-    assert_eq!(entry["content_path"], "/downloads/tv-sonarr/Big Buck Bunny");
+    assert_eq!(entry["save_path"], save_path.display().to_string());
+    assert_eq!(entry["content_path"], destination.display().to_string());
 }
 
 /// `torrents/topPrio`, recorded as a 404 the first time this harness ran a
@@ -583,10 +593,9 @@ async fn torrents_info_after_completion() {
     let session = app.login().await;
     app.create_tv_sonarr_category(&session).await;
     let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Big+Buck+Bunny");
-    let id = app.state.engine.add(DownloadSpec::new(
-        magnet,
-        app.state.config.download_dir.join("tv-sonarr/Big Buck Bunny"),
-    ));
+    let save_path = app.state.config.download_dir.join("tv-sonarr");
+    let destination = save_path.join("Big Buck Bunny");
+    let id = app.state.engine.add(DownloadSpec::new(magnet, destination));
     // `engine.add` alone is not the same request Sonarr sent: the real
     // `torrents/add` handler is what attaches a category label, and that
     // label, not the destination passed here, is what `torrents/info`
@@ -596,7 +605,7 @@ async fn torrents_info_after_completion() {
         id,
         std::collections::BTreeMap::from([
             ("category".to_string(), "tv-sonarr".to_string()),
-            ("save_path".to_string(), "/downloads/tv-sonarr".to_string()),
+            ("save_path".to_string(), save_path.display().to_string()),
         ]),
     );
     for _ in 0..200 {
@@ -609,12 +618,14 @@ async fn torrents_info_after_completion() {
     let fixture = fixture!("torrents_info_after_completion");
     let response = send(&app.router(), &fixture.request, Some(&session)).await;
     assert_eq!(response.status().as_u16(), fixture.response.status);
-    let actual: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let mut actual: Value = serde_json::from_str(&body_text(response).await).unwrap();
     let mut expected: Value = serde_json::from_str(&fixture.response.body.unwrap()).unwrap();
 
     for field in ["added_on", "completion_on"] {
         actual.as_array().unwrap()[0].as_object().unwrap().get(field).unwrap();
         expected[0][field] = actual[0][field].clone();
     }
+    normalise_separators(&mut actual[0], &["save_path", "content_path"]);
+    normalise_separators(&mut expected[0], &["save_path", "content_path"]);
     assert_eq!(actual, expected);
 }

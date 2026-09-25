@@ -1498,6 +1498,12 @@ mod tests {
         let app = TestApp::with_default_backend();
         let router = app.router();
         let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Show");
+        // Absolute on whatever platform this runs on, rather than a bare
+        // `/...` literal: an explicit `savepath` is only honoured verbatim
+        // when it is absolute, and a Unix-style leading `/` is not absolute
+        // on Windows without a drive letter, so a literal that is unambiguous
+        // on one platform is not a fair input on the other.
+        let savepath = app.state.config.download_dir.join("tv").display().to_string();
 
         let response = post_form(
             &router,
@@ -1505,7 +1511,7 @@ mod tests {
             &[
                 ("urls", &magnet),
                 ("category", "tv-sonarr"),
-                ("savepath", "/downloads/tv"),
+                ("savepath", &savepath),
                 ("paused", "false"),
             ],
         )
@@ -1521,7 +1527,7 @@ mod tests {
 
         let list = list_json(&router, "").await;
         assert_eq!(list[0]["category"], "tv-sonarr");
-        assert_eq!(list[0]["save_path"], "/downloads/tv");
+        assert_eq!(list[0]["save_path"], savepath);
     }
 
     #[tokio::test]
