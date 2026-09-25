@@ -95,6 +95,11 @@ pub struct TorrentStatus {
     pub upload_bytes_per_sec: u64,
     /// Peers actually connected, not peers seen.
     pub peers: u32,
+    /// The torrent's info hash, lowercased hex, once it is known.
+    ///
+    /// Known immediately for a magnet and only after the file is fetched for a
+    /// `.torrent` URL, which is why it is optional rather than assumed.
+    pub info_hash: Option<String>,
     pub files: Vec<TorrentFile>,
     /// The connected peers themselves, for the Inspector.
     ///
@@ -270,22 +275,76 @@ fn starts_with_scheme(input: &str, scheme: &str) -> bool {
     input.len() >= scheme.len() && input[..scheme.len()].eq_ignore_ascii_case(scheme)
 }
 
-/// Whether the magnet names a BitTorrent info hash.
+/// The text of the magnet's `xt=urn:btih:` topic, if it has one.
 ///
 /// `xt=urn:btih:` is the only topic this engine can act on. A magnet carrying
 /// only `xs=` or `as=` web seeds, or a `urn:ed2k:` topic, describes something
-/// we cannot join.
-fn has_btih_topic(uri: &str) -> bool {
-    let Some((_, query)) = uri.split_once('?') else { return false };
-    query.split('&').any(|pair| {
-        let Some((key, value)) = pair.split_once('=') else { return false };
-        // `xt.1=` and `xt.2=` are how a multi-topic magnet is written.
+/// we cannot join. Multi-topic magnets write it as `xt.1=`/`xt.2=`, so both
+/// forms of the key are scanned.
+fn btih_topic(uri: &str) -> Option<&str> {
+    let (_, query) = uri.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
         let is_topic =
             key.eq_ignore_ascii_case("xt") || key.len() > 3 && key[..3].eq_ignore_ascii_case("xt.");
-        is_topic
-            && value.len() > "urn:btih:".len()
-            && value[.."urn:btih:".len()].eq_ignore_ascii_case("urn:btih:")
+        if !is_topic {
+            return None;
+        }
+        if value.len() <= "urn:btih:".len() {
+            return None;
+        }
+        value.get(.."urn:btih:".len()).filter(|prefix| prefix.eq_ignore_ascii_case("urn:btih:"))?;
+        value.get("urn:btih:".len()..)
     })
+}
+
+/// Whether the magnet names a BitTorrent info hash.
+fn has_btih_topic(uri: &str) -> bool {
+    btih_topic(uri).is_some()
+}
+
+/// The torrent's info hash, lowercased hex, if the magnet names one Sonarr
+/// can compare against a qBittorrent-style API.
+///
+/// A topic is only usable if it is exactly a 40-character hex hash or a
+/// 32-character base32 hash: BitTorrent's info hash is always 20 bytes, so
+/// anything else, including a topic that merely starts with one of those
+/// forms, is not a hash this engine can act on.
+pub fn info_hash_of(uri: &str) -> Option<String> {
+    let topic = btih_topic(uri)?;
+    if topic.len() == 40 && topic.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(topic.to_ascii_lowercase());
+    }
+    if topic.len() == 32 {
+        let bytes = base32_decode(topic)?;
+        if bytes.len() == 20 {
+            return Some(bytes.iter().map(|b| format!("{b:02x}")).collect());
+        }
+    }
+    None
+}
+
+/// RFC 4648 base32 decoding, upper or lower case, no padding expected.
+///
+/// Not pulled in as a dependency: a magnet's base32 topic is the only place
+/// this engine ever meets the encoding, and decoding twenty bytes by hand is
+/// shorter than the crate it would otherwise need.
+fn base32_decode(input: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut bits: u64 = 0;
+    let mut bit_count = 0u32;
+    let mut out = Vec::with_capacity(input.len() * 5 / 8);
+    for ch in input.chars() {
+        let upper = ch.to_ascii_uppercase();
+        let value = ALPHABET.iter().position(|&c| c == upper as u8)? as u64;
+        bits = (bits << 5) | value;
+        bit_count += 5;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            out.push((bits >> bit_count) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Whether the **path** ends in `.torrent`, ignoring query and fragment.
@@ -458,6 +517,33 @@ mod tests {
         assert_eq!(percent_decode("a%"), "a%");
         assert_eq!(percent_decode("a%2"), "a%2");
         assert_eq!(percent_decode("a%zz"), "a%zz");
+    }
+
+    #[test]
+    fn the_info_hash_is_read_from_a_magnet_before_any_metadata_arrives() {
+        // Sonarr adds a magnet and polls for its hash immediately. Waiting for
+        // the swarm to hand over metadata would mean answering "not yet" to the
+        // question that identifies the download.
+        let uri = "magnet:?xt=urn:btih:2C6B6858D61DA9543D4231A71DB4B1C9264B0685&dn=x";
+        assert_eq!(
+            info_hash_of(uri).as_deref(),
+            Some("2c6b6858d61da9543d4231a71db4b1c9264b0685"),
+            "a hash must come back lowercased, because that is what the API compares"
+        );
+    }
+
+    #[test]
+    fn a_base32_magnet_hash_is_read_as_well_as_hex() {
+        // Older trackers still hand out the 32-character base32 form.
+        let uri = "magnet:?xt=urn:btih:FRVWQWGWDWUVIPKCGGTR3NFRZETEWBUF";
+        assert_eq!(info_hash_of(uri).unwrap().len(), 40);
+    }
+
+    #[test]
+    fn something_that_is_not_a_magnet_has_no_hash() {
+        assert_eq!(info_hash_of("https://example.test/x.torrent"), None);
+        assert_eq!(info_hash_of("magnet:?xt=urn:ed2k:abc"), None);
+        assert_eq!(info_hash_of("magnet:?dn=no-topic"), None);
     }
 
     #[test]
