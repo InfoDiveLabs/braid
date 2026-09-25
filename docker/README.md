@@ -16,18 +16,10 @@ client plus a shell script with curl in it.
   not do it, so most stacks run a torrent client plus a shell script with
   curl in it, and the script has no resume and no integrity check.
 
-**How far this has been taken.** A real Sonarr 4.0.20 and Radarr 6.4.4 have
-driven this container twice: registered it as a qBittorrent client, pushed a
-release, watched a real torrent download from dozens of peers to completion,
-and imported the finished file into the library. The exchanges were recorded
-and replay as tests. See `harness/README.md` for what those clients actually
-ask for, which is a much smaller surface than qBittorrent's documented API.
-
-Those runs found four bugs that made the container unusable, all now fixed:
-two wrong endpoint names, a crash on `torrents/properties`, and a duplicate
-info hash that reported a finished download at an empty path. A finished
-torrent now imports into Sonarr's library from the path Braid wrote it to.
-What is still missing is in Limitations below.
+Verified against a real Sonarr 4.0.20 and Radarr 6.4.4, from grab to library
+import, with those exchanges replaying as tests. The API surface those clients
+need is covered; `harness/README.md` lists what is not, and Limitations below
+covers what will bite you.
 
 ## Quick start
 
@@ -129,32 +121,28 @@ asked for before the change.
 
 **4. Check one download all the way through** before removing the old
 container. Grab something small, watch it appear in Braid's web UI, and
-confirm the `*arr` app imports it when it finishes. That last step is the
-one that proves the state mapping is right, and it is the part most likely
-to be wrong.
+confirm the `*arr` app imports it when it finishes.
 
 ## Limitations worth knowing before you switch
 
-**Seed and leecher counts are always zero.** The BitTorrent library Braid
-uses keeps peer completeness behind a private type and discards the
-tracker's own counts, so these genuinely cannot be reported. Everything
-else in the listing is measured. If a client of yours gates on those
-numbers, this will not suit you yet.
+**Seed and leecher counts are always zero.** Everything else in the
+listing is measured. If a client of yours gates on those numbers, this will
+not suit you yet.
 
-**Queue priority is accepted and ignored.** `torrents/topPrio` and share
-limits are answered so clients do not error, but there is no queue for
-"top" to mean anything about. `setForceStart` is the exception: asking for
-a torrent to be force started genuinely starts it.
+**Queue priority and share limits are accepted and ignored.** There is no
+queue, so `torrents/topPrio` does nothing. `setForceStart` is the exception
+and genuinely starts a torrent.
 
-**There is no content layout setting.** Real qBittorrent can be told to
-create a subfolder, use the torrent's own layout, or keep files at the root.
-Braid always gives a torrent a folder of its own, which is what an importer
-needs; if you rely on the original layout for something else, it is not
-configurable here.
+**Content layout is not configurable.** Every torrent gets a folder of its
+own. qBittorrent's "original layout" and "don't create subfolder" modes have
+no equivalent.
 
-**Bandwidth limits cannot be set over the API.** `transfer/setDownloadLimit`
-and its siblings are absent. Neither Sonarr nor Radarr ever calls them, so
-they were left out rather than guessed at; set limits in Braid's own web UI.
+**Bandwidth limits cannot be set over the API.** Set them in Braid's own web
+UI instead.
+
+**Trackers, peers, per-file priority, recheck, rename and set-location are
+not implemented.** Generic qBittorrent clients and mobile apps expect these;
+the `*arr` apps do not use them.
 
 **Nothing here is code signed or audited.** This is a beta.
 

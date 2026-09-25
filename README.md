@@ -200,21 +200,11 @@ services:
 The admin password is generated on first start and printed once to the log. Full
 instructions, including the migration, are in [`docker/README.md`](docker/README.md).
 
-**Driven by the real thing.** A real Sonarr 4.0.20 and Radarr 6.4.4 registered it
-as a qBittorrent client, pushed a release, took a torrent from dozens of peers to
-completion, and imported the finished file into its library from the path Braid
-wrote it to. Those exchanges were recorded and now replay as tests, so what those
-clients actually need is pinned rather than assumed.
+Verified against a real Sonarr 4.0.20 and Radarr 6.4.4, from grab to library
+import. The API surface those clients need is covered;
+[`harness/README.md`](harness/README.md) lists what is not.
 
-That is also the only way some of it could have been found. Sonarr asks for
-`torrents/topPrio`, not the `topPriority` that reads more naturally, and it asks
-for `torrents/setForceStart` the moment its Initial State is set to Force Started
-— both were a 404 until a real client asked. Calling `torrents/properties` in the
-second between a magnet being accepted and the swarm being joined crashed the
-process outright. The findings, including what these clients never ask for and so
-is deliberately absent, are in [`harness/README.md`](harness/README.md).
-
-Building it yourself: `cargo build --release -p dl-server`, or
+To build it yourself: `cargo build --release -p dl-server`, or
 `docker build -f docker/Dockerfile .` for the image.
 
 ---
