@@ -1,0 +1,16 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, release/push into a real series it had matched, grabbed for real through the registered Braid client",
+  "note": "No savepath field at all: Sonarr relies entirely on the category to say where a download lands. paused arrives as the literal string False, capital F, which is not the literal true our handler checks for and so is correctly read as not paused. The magnet is a real, permanently-seeded public domain torrent (WebTorrent's Big Buck Bunny demo) used here only because it downloads for real against the open internet; it has nothing to do with either arr application.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v2/torrents/add",
+    "content_type": "application/x-www-form-urlencoded",
+    "body": "urls=magnet%3A%3Fxt%3Durn%3Abtih%3Add8255ecdc7ca55fb0bbf81323d87062db1f6d1c%26dn%3DBig%2BBuck%2BBunny%26tr%3Dudp%253A%252F%252Ftracker.leechers-paradise.org%253A6969%26tr%3Dudp%253A%252F%252Ftracker.opentrackr.org%253A1337&category=tv-sonarr&paused=False",
+    "authenticated": true
+  },
+  "response": {
+    "status": 200,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "Ok."
+  }
+}

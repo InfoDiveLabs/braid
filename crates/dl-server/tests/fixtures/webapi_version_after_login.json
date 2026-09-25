@@ -1,0 +1,14 @@
+{
+  "recorded_from": "Sonarr 4.0.20.3014, repeated many times per test/save cycle",
+  "note": "Sonarr never called GET /api/v2/app/version in the whole recorded session, only webapiVersion, and it called this endpoint roughly a dozen times per client test rather than caching the answer. See harness/README.md.",
+  "request": {
+    "method": "GET",
+    "path": "/api/v2/app/webapiVersion",
+    "authenticated": true
+  },
+  "response": {
+    "status": 200,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "2.9.2"
+  }
+}

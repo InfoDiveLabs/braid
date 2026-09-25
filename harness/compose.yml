@@ -1,0 +1,98 @@
+# Development harness only. Not run in CI, and not something a release ever
+# depends on: this exists so a human, or record.sh, can point a real Sonarr
+# and a real Radarr at braid-server built from the working tree and watch
+# what they actually send it, rather than trusting a reading of
+# qBittorrent's documentation.
+#
+# record.sh drives this file. Running docker compose up here by hand works
+# too, but the API keys and the download client registration are fiddly
+# enough that the script is the documented path.
+
+services:
+  braid:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: harness-braid
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - BRAID_CONFIG_DIR=/config
+      - BRAID_DOWNLOAD_DIR=/downloads
+      # Without this, librqbit's DHT persistence tries to write under
+      # /root/.cache: the image's baked-in HOME, which entrypoint.sh's
+      # setpriv never changes even though it does drop to PUID. The first
+      # torrent add then fails outright with a permission error, on every
+      # container that sets PUID to anything but 0. See harness/README.md.
+      # This is a harness-only workaround; the real fix belongs in
+      # docker/entrypoint.sh or dl-torrent, not here.
+      - HOME=/config
+    volumes:
+      - ./data/braid/config:/config
+      - ./data/braid/downloads:/downloads
+    networks:
+      - harness
+    # Published so record.sh and a human on the host can both reach the real
+    # server directly, for anything that is not part of what is being
+    # recorded. Sonarr and Radarr themselves are pointed at braid-proxy, not
+    # at this port, so their traffic goes through the recorder.
+    ports:
+      - "8080:8080"
+
+  # The recorder. Sonarr and Radarr are configured to use this host as their
+  # download client, not braid directly, so every request either of them
+  # makes and every response it gets back passes through here and is written
+  # to disk before being forwarded on. No change to braid-server was needed
+  # to get this: the proxy is what makes the recording possible without
+  # instrumenting the server itself, and it also captures requests to
+  # endpoints Braid does not implement at all, which is exactly what Task 15
+  # exists to find.
+  braid-proxy:
+    image: python:3-slim
+    container_name: harness-braid-proxy
+    working_dir: /harness
+    volumes:
+      - ./proxy.py:/harness/proxy.py:ro
+      - ./recordings:/harness/recordings
+    environment:
+      - UPSTREAM_HOST=braid
+      - UPSTREAM_PORT=8080
+    command: ["python3", "/harness/proxy.py"]
+    depends_on:
+      - braid
+    networks:
+      - harness
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: harness-sonarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - ./data/sonarr/config:/config
+      - ./data/sonarr/downloads:/downloads
+    ports:
+      - "8989:8989"
+    networks:
+      - harness
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: harness-radarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - ./data/radarr/config:/config
+      - ./data/radarr/downloads:/downloads
+    ports:
+      - "7878:7878"
+    networks:
+      - harness
+
+networks:
+  harness:
+    driver: bridge

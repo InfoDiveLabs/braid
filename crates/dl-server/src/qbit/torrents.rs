@@ -439,14 +439,26 @@ fn resolve_path(download_dir: &Path, raw: &str) -> PathBuf {
 /// Where a newly added torrent's files land, in order of what was actually
 /// asked for: an explicit `savepath` first, then the destination recorded
 /// against its category, and only then the plain download directory.
+///
+/// Sonarr and Radarr both call `createCategory` with no `savePath` at all:
+/// see `harness/README.md`. Real qBittorrent's own rule for that case is to
+/// use `<default save path>/<category name>`, and a category recorded here
+/// with an empty path has to follow the same rule rather than being taken
+/// literally: `PathBuf::from("")` resolves to the server's working
+/// directory, which is not writable, and every torrent either of them adds
+/// failed with a permission error the first time this was tried against a
+/// real client instead of a guess at what one would send.
 fn destination_for(state: &AppState, savepath: Option<&str>, category: Option<&str>) -> PathBuf {
     if let Some(raw) = savepath.filter(|s| !s.is_empty()) {
         return resolve_path(&state.config.download_dir, raw);
     }
-    if let Some(category) = category {
+    if let Some(category) = category.filter(|c| !c.is_empty()) {
         let categories = load_categories(&state.config.config_dir);
         if let Some(path) = categories.get(category) {
-            return PathBuf::from(path);
+            if !path.is_empty() {
+                return resolve_path(&state.config.download_dir, path);
+            }
+            return state.config.download_dir.join(category);
         }
     }
     state.config.download_dir.clone()
@@ -1331,5 +1343,36 @@ mod tests {
             .await;
         let after = json_body(get(&router, "/api/v2/torrents/categories").await).await;
         assert!(after.get("tv-sonarr").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_category_created_with_no_save_path_still_lands_somewhere_writable() {
+        // Sonarr and Radarr both call createCategory with no savePath at all:
+        // see harness/README.md. `destination_for` used to take that recorded
+        // empty string literally, which resolves to the server's own working
+        // directory rather than anywhere under the download directory, and
+        // the first real add through either client failed with a permission
+        // error rather than landing in the download directory the way real
+        // qBittorrent's own "no save path set" category does.
+        let hash = hash_n(14);
+        let app = TestApp::with_default_backend();
+        let router = app.router();
+        let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Show");
+
+        post_form(&router, "/api/v2/torrents/createCategory", &[("category", "tv-sonarr")]).await;
+        post_form(&router, "/api/v2/torrents/add", &[("urls", &magnet), ("category", "tv-sonarr")])
+            .await;
+
+        for _ in 0..200 {
+            if find_by_hash(&app.state.engine, &hash).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let list = list_json(&router, "").await;
+        assert_eq!(
+            list[0]["save_path"],
+            app.state.config.download_dir.join("tv-sonarr").display().to_string()
+        );
     }
 }
